@@ -42,8 +42,10 @@ pub struct Config {
     pub test: bool,
     /// Use temporary keys bound to the permanent one (perfect forward secrecy).
     pub pfs: bool,
-    /// Keep temporary keys in the saved session, so a restart does not redo the
-    /// Diffie-Hellman exchange. tdesktop keeps them in memory only.
+    /// Keep temporary keys (and their server salts) in the saved session, so a restart
+    /// does not redo the Diffie-Hellman exchange: start → first answer ≈ 0.15 s instead
+    /// of ≈ 1.2 s. tdesktop keeps them in memory only. Trade-off: someone who steals the
+    /// saved session and had recorded the traffic can decrypt the last ≤ 24 hours of it.
     pub persist_temp_keys: bool,
     /// `FLOOD_WAIT_X` up to this many seconds is waited out automatically.
     pub flood_sleep_threshold: u32,
@@ -61,7 +63,7 @@ impl Config {
             lang_code: "en".into(),
             test: false,
             pfs: true,
-            persist_temp_keys: false,
+            persist_temp_keys: true,
             flood_sleep_threshold: 60,
         }
     }

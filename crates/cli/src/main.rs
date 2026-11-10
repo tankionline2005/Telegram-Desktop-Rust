@@ -1,7 +1,8 @@
 //! `tdr` — console client for exercising the protocol stack.
 //!
 //! The session lives in `data/session.bin` (git-ignored). Environment:
-//! `TDR_KEEP_TEMP_KEYS=1` keeps temporary (PFS) keys across runs; `TDR_LOG=info` logs.
+//! `TDR_KEEP_TEMP_KEYS=0` forgets temporary (PFS) keys on exit, as tdesktop does;
+//! `TDR_LOG=info` logs.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -24,7 +25,7 @@ usage:
   tdr logout          log out and delete the local session
 
 environment:
-  TDR_KEEP_TEMP_KEYS=1   keep temporary (PFS) keys between runs: no key exchange on start
+  TDR_KEEP_TEMP_KEYS=0   forget temporary (PFS) keys on exit, as tdesktop does (slower start)
   TDR_LOG=info           show connection logs";
 
 fn data_dir() -> PathBuf {
@@ -43,7 +44,9 @@ fn config() -> Result<Config> {
         );
     };
     let mut c = Config::new(id.parse().context("TDR_API_ID must be a number")?, hash);
-    c.persist_temp_keys = std::env::var("TDR_KEEP_TEMP_KEYS").is_ok_and(|v| v == "1");
+    if std::env::var("TDR_KEEP_TEMP_KEYS").is_ok_and(|v| v == "0") {
+        c.persist_temp_keys = false;
+    }
     Ok(c)
 }
 
