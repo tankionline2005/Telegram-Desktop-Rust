@@ -1,0 +1,19 @@
+[package]
+name = "tdr-api"
+version = "0.1.0"
+description = "Telegram client core: connections to several DCs, auth keys, migrations, flood waits"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tdr-tl.workspace = true
+tdr-crypto.workspace = true
+tdr-mtproto.workspace = true
+tokio = { version = "1.54.1", features = ["sync", "time", "rt"] }
+tracing = "0.1.44"
+bytes = "1.12.1"
+
+[lints]
+workspace = true

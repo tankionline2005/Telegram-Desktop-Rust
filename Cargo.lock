@@ -868,12 +868,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "tdr-api"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "tdr-crypto",
+ "tdr-mtproto",
+ "tdr-tl",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "tdr-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "qrcode",
  "rpassword",
+ "tdr-api",
  "tdr-crypto",
  "tdr-mtproto",
  "tdr-tl",

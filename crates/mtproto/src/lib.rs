@@ -12,7 +12,8 @@ pub mod transport;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub use sender::{Sender, Update};
+pub use sender::{Connected, Event, KeySpec, Sender, Update};
+pub use transport::TransportError;
 
 /// Production DC addresses built into tdesktop (`mtproto_dc_options.cpp`).
 pub const PRODUCTION_DCS: &[(i32, &str)] = &[
@@ -41,6 +42,9 @@ pub enum Error {
     Rpc(RpcError),
     /// The connection was closed while the request was pending.
     Disconnected,
+    /// The server does not know the auth key (a temporary key expired or was destroyed,
+    /// or the permanent key was revoked). The key must be recreated.
+    AuthKeyUnknown,
 }
 
 impl std::fmt::Display for Error {
@@ -52,6 +56,7 @@ impl std::fmt::Display for Error {
             Self::Security(e) => write!(f, "security check failed: {e}"),
             Self::Rpc(e) => write!(f, "{e}"),
             Self::Disconnected => f.write_str("disconnected"),
+            Self::AuthKeyUnknown => f.write_str("the server does not know the auth key"),
         }
     }
 }

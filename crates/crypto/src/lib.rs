@@ -225,6 +225,41 @@ impl AuthKey {
         }
         Ok(plain)
     }
+
+    /// MTProto 1.0 key derivation (SHA1-based), still used for `bind_auth_key_inner`.
+    fn aes_key_iv_v1(&self, msg_key: &[u8; 16]) -> ([u8; 32], [u8; 32]) {
+        let k = &self.data;
+        let a = sha1(&[msg_key, &k[..32]]);
+        let b = sha1(&[&k[32..48], msg_key, &k[48..64]]);
+        let c = sha1(&[&k[64..96], msg_key]);
+        let d = sha1(&[msg_key, &k[96..128]]);
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&a[..8]);
+        key[8..20].copy_from_slice(&b[8..20]);
+        key[20..].copy_from_slice(&c[4..16]);
+        let mut iv = [0u8; 32];
+        iv[..12].copy_from_slice(&a[8..20]);
+        iv[12..20].copy_from_slice(&b[..8]);
+        iv[20..24].copy_from_slice(&c[16..20]);
+        iv[24..].copy_from_slice(&d[..8]);
+        (key, iv)
+    }
+
+    /// MTProto 1.0 encryption, only for the `encrypted_message` of `auth.bindTempAuthKey`.
+    /// `plaintext` is the full inner message without padding.
+    pub fn encrypt_message_v1(&self, mut plaintext: Vec<u8>) -> Vec<u8> {
+        let msg_key: [u8; 16] = sha1(&[&plaintext])[4..20].try_into().unwrap();
+        let start = plaintext.len();
+        plaintext.resize(start.next_multiple_of(16), 0);
+        fill_random(&mut plaintext[start..]);
+        let (key, iv) = self.aes_key_iv_v1(&msg_key);
+        aes_ige_encrypt(&mut plaintext, &key, &iv);
+        let mut out = Vec::with_capacity(24 + plaintext.len());
+        out.extend_from_slice(&self.id);
+        out.extend_from_slice(&msg_key);
+        out.extend_from_slice(&plaintext);
+        out
+    }
 }
 
 fn gcd(mut a: u64, mut b: u64) -> u64 {

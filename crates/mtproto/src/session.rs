@@ -45,7 +45,15 @@ pub enum Incoming {
     NewSession,
     /// An update (`Updates` and friends), raw.
     Update(Bytes),
+    /// The answer to a ping.
+    Pong { msg_id: i64 },
 }
+
+/// `(msg_id, seq_no)` assigned to a sent message.
+pub type MsgSlot = (i64, i32);
+
+/// A request body and the slot it was sent with before (for resends), if any.
+pub type Outbound<'a> = (&'a [u8], Option<MsgSlot>);
 
 pub struct Session {
     auth_key: AuthKey,
@@ -109,10 +117,24 @@ impl Session {
         }
     }
 
+    /// A message id assigned earlier is still usable for a resend if it is not too old
+    /// (the server rejects ids more than 300 s in the past).
+    pub fn is_fresh(&self, msg_id: i64) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + self.ids.time_offset as i64;
+        now - (msg_id >> 32) < 240
+    }
+
     /// Packs as many `requests` as fit into one encrypted frame (plus pending acks).
-    /// Returns the frame and the msg_id given to each packed request, in order; requests
-    /// beyond the returned count were not packed and must be passed again.
-    pub fn pack(&mut self, requests: &[&[u8]]) -> (Vec<u8>, Vec<i64>) {
+    ///
+    /// Each request is `(body, previous (msg_id, seq_no))`: a request resent after a
+    /// reconnect keeps its id, so the server answers from its cache instead of executing
+    /// it twice. Returns the frame and the `(msg_id, seq_no)` of each packed request, in
+    /// order; requests beyond the returned count were not packed and must be passed again.
+    pub fn pack(&mut self, requests: &[Outbound<'_>]) -> (Vec<u8>, Vec<MsgSlot>) {
         let mut messages = Vec::new();
         if !self.pending_acks.is_empty() {
             let ack = enums::MsgsAck::MsgsAck(Box::new(tdr_tl::mtproto::types::MsgsAck {
@@ -122,7 +144,7 @@ impl Session {
         }
         let mut ids = Vec::new();
         let mut size = 0;
-        for body in requests {
+        for (body, previous) in requests {
             if !ids.is_empty()
                 && (size + body.len() > MAX_CONTAINER_BYTES
                     || messages.len() >= MAX_CONTAINER_MESSAGES)
@@ -130,8 +152,15 @@ impl Session {
                 break;
             }
             size += body.len();
-            let m = self.outgoing(body.to_vec(), true);
-            ids.push(m.msg_id);
+            let m = match previous {
+                Some((msg_id, seq_no)) => Outgoing {
+                    msg_id: *msg_id,
+                    seq_no: *seq_no,
+                    body: body.to_vec(),
+                },
+                None => self.outgoing(body.to_vec(), true),
+            };
+            ids.push((m.msg_id, m.seq_no));
             messages.push(m);
         }
 
@@ -153,15 +182,51 @@ impl Session {
             let c = self.outgoing(body, false);
             (c.msg_id, c.seq_no, c.body)
         };
+        (self.encrypt(msg_id, seq_no, &body), ids)
+    }
 
+    fn encrypt(&self, msg_id: i64, seq_no: i32, body: &[u8]) -> Vec<u8> {
         let mut plain = Vec::with_capacity(32 + body.len() + 1024);
         plain.extend_from_slice(&self.salt.to_le_bytes());
         plain.extend_from_slice(&self.session_id.to_le_bytes());
         plain.extend_from_slice(&msg_id.to_le_bytes());
         plain.extend_from_slice(&seq_no.to_le_bytes());
         plain.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        plain.extend_from_slice(&body);
-        (self.auth_key.encrypt_message(plain, Side::Client), ids)
+        plain.extend_from_slice(body);
+        self.auth_key.encrypt_message(plain, Side::Client)
+    }
+
+    /// Packs `auth.bindTempAuthKey`, which binds this session's (temporary) key to `perm`.
+    /// The inner message must carry the same msg_id as the outer one, so this is always
+    /// sent alone. Returns the frame and the msg_id.
+    pub fn pack_bind(&mut self, perm: &AuthKey, expires_at: i32) -> (Vec<u8>, i64) {
+        let msg_id = self.ids.next_id();
+        let seq_no = self.seq_no(true);
+        let nonce = i64::from_le_bytes(tdr_crypto::random_bytes());
+        let inner = enums::BindAuthKeyInner::BindAuthKeyInner(Box::new(
+            tdr_tl::mtproto::types::BindAuthKeyInner {
+                nonce,
+                temp_auth_key_id: self.auth_key.id() as i64,
+                perm_auth_key_id: perm.id() as i64,
+                temp_session_id: self.session_id,
+                expires_at,
+            },
+        ))
+        .to_bytes();
+        // MTProto 1.0 message: random salt + session_id, the same msg_id, seq_no 0.
+        let mut plain = tdr_crypto::random_bytes::<16>().to_vec();
+        plain.extend_from_slice(&msg_id.to_le_bytes());
+        plain.extend_from_slice(&0i32.to_le_bytes());
+        plain.extend_from_slice(&(inner.len() as u32).to_le_bytes());
+        plain.extend_from_slice(&inner);
+        let request = tdr_tl::functions::auth::BindTempAuthKey {
+            perm_auth_key_id: perm.id() as i64,
+            nonce,
+            expires_at,
+            encrypted_message: perm.encrypt_message_v1(plain).into(),
+        }
+        .to_bytes();
+        (self.encrypt(msg_id, seq_no, &request), msg_id)
     }
 
     /// Decrypts a frame and turns it into events.
@@ -268,7 +333,13 @@ impl Session {
                 self.salt = x.server_salt;
                 events.push(Incoming::NewSession);
             }
-            MSGS_ACK | PONG | FUTURE_SALTS | MSG_DETAILED_INFO | MSG_NEW_DETAILED_INFO => {}
+            PONG => {
+                r.read_u32()?;
+                events.push(Incoming::Pong {
+                    msg_id: i64::deserialize(&mut r)?,
+                });
+            }
+            MSGS_ACK | FUTURE_SALTS | MSG_DETAILED_INFO | MSG_NEW_DETAILED_INFO => {}
             _ => events.push(Incoming::Update(body)),
         }
         Ok(())
@@ -308,17 +379,17 @@ mod tests {
     #[test]
     fn packs_single_and_container() {
         let mut s = session();
-        let (frame, ids) = s.pack(&[b"abcd"]);
+        let (frame, ids) = s.pack(&[(b"abcd", None)]);
         assert_eq!(ids.len(), 1);
         // Decrypt as the server would and check the layout.
         let plain = s.auth_key.decrypt_message(&frame, Side::Client).unwrap();
         assert_eq!(
             i64::from_le_bytes(plain[16..24].try_into().unwrap()),
-            ids[0]
+            ids[0].0
         );
         assert_eq!(i32::from_le_bytes(plain[24..28].try_into().unwrap()), 1);
 
-        let (frame, ids) = s.pack(&[b"aaaa", b"bbbb"]);
+        let (frame, ids) = s.pack(&[(b"aaaa", None), (b"bbbb", None)]);
         assert_eq!(ids.len(), 2);
         let plain = s.auth_key.decrypt_message(&frame, Side::Client).unwrap();
         assert_eq!(
@@ -326,7 +397,11 @@ mod tests {
             MSG_CONTAINER
         );
         let container_id = i64::from_le_bytes(plain[16..24].try_into().unwrap());
-        assert!(container_id > ids[1]);
+        assert!(container_id > ids[1].0);
+
+        // A resend keeps the original id.
+        let (_, again) = s.pack(&[(b"aaaa", Some(ids[0]))]);
+        assert_eq!(again[0], ids[0]);
     }
 
     #[test]

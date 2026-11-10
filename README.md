@@ -5,8 +5,8 @@
 разбор протокола без лишних копирований, многопоточная обработка данных и мгновенный
 старт из локального кэша.
 
-> **Статус:** этап 1 — протокол. Графического интерфейса пока нет; есть консольный
-> клиент `tdr` для проверки сетевого стека.
+> **Статус:** этап 1 (протокол) завершён. Графического интерфейса пока нет; есть
+> консольный клиент `tdr` для проверки сетевого стека.
 > Это неофициальный проект, он не связан с Telegram FZ-LLC и работает через
 > [Telegram API](https://core.telegram.org/api).
 
@@ -38,7 +38,21 @@ cargo xtask upstream check
 ```bash
 cargo run --release -p tdr-cli -- ping         # подключение и замеры
 cargo run --release -p tdr-cli -- login        # вход по QR-коду
+cargo run --release -p tdr-cli -- login phone  # вход по номеру телефона
+cargo run --release -p tdr-cli -- me           # аккаунт и время запуска
 cargo run --release -p tdr-cli -- dialogs 30   # список чатов
+cargo run --release -p tdr-cli -- avatar       # скачать свою аватарку
+```
+
+Самотесты сети на реальном аккаунте: `selftest reconnect` (обрыв соединения),
+`selftest unknown-key` (сервер «забыл» ключ), `selftest dc 4` (другой DC).
+`TDR_KEEP_TEMP_KEYS=1` включает сохранение временных ключей между запусками.
+
+Если PowerShell открывается не в папке проекта (а из-за `[` `]` в имени перейти в неё
+командой `cd` не получается), укажите путь к проекту явно:
+
+```bash
+cargo run --release --manifest-path "C:\путь\к\проекту\Cargo.toml" -p tdr-cli -- me
 ```
 
 Сессия хранится в `data/session.bin` (не попадает в git). Это полный доступ к аккаунту:
@@ -51,7 +65,8 @@ crates/tl-parser/   парсер и diff TL-схем
 crates/tl-gen/      генератор Rust-кода из TL-схемы
 crates/tl/          типы Telegram API (генерируются при сборке)
 crates/crypto/      криптография MTProto 2.0
-crates/mtproto/     транспорт, ключи, сессии
+crates/mtproto/     транспорт, ключи, сессии, переподключение
+crates/api/         ядро клиента: несколько DC, PFS, миграции, сохранение сессии
 crates/cli/         консольный клиент `tdr`
 xtask/              автоматизация (отслеживание upstream)
 schema/             TL-схемы, скопированные из tdesktop (не править руками)

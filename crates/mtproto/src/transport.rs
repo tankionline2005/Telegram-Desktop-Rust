@@ -55,6 +55,26 @@ fn obfuscation_init(dc_id: i16) -> ([u8; 64], Ctr, Ctr) {
     (init, encryptor, decryptor)
 }
 
+/// An error code sent by the server instead of a message, e.g. `-404` when the auth key
+/// is unknown (a temporary key expired or was destroyed) or `-429` on flood.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportError(pub i32);
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "transport error {}", self.0)
+    }
+}
+
+impl std::error::Error for TransportError {}
+
+impl TransportError {
+    /// Extracts the code from an I/O error produced by [`Reader::recv`].
+    pub fn from_io(e: &io::Error) -> Option<i32> {
+        e.get_ref()?.downcast_ref::<TransportError>().map(|t| t.0)
+    }
+}
+
 pub struct Reader {
     stream: OwnedReadHalf,
     cipher: Ctr,
@@ -114,7 +134,7 @@ impl Reader {
         self.cipher.apply_keystream(&mut buf);
         if len == 4 {
             let code = i32::from_le_bytes(buf[..4].try_into().unwrap());
-            return Err(io::Error::other(format!("transport error {code}")));
+            return Err(io::Error::other(TransportError(code)));
         }
         Ok(buf.freeze())
     }

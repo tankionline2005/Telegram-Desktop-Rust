@@ -8,6 +8,7 @@ members = [
     "crates/tl",
     "crates/crypto",
     "crates/mtproto",
+    "crates/api",
     "crates/cli",
     "xtask",
 ]
@@ -24,6 +25,7 @@ tdr-tl-gen = { path = "crates/tl-gen" }
 tdr-tl = { path = "crates/tl" }
 tdr-crypto = { path = "crates/crypto" }
 tdr-mtproto = { path = "crates/mtproto" }
+tdr-api = { path = "crates/api" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

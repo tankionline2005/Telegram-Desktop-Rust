@@ -85,12 +85,14 @@ fn to_256(x: &BigUint) -> [u8; 256] {
 /// Runs the DH key exchange on a fresh connection.
 ///
 /// `dc_id` is the DC number as sent in `p_q_inner_data_dc`: negative for media-only DCs,
-/// +10000 in the test environment.
+/// +10000 in the test environment. With `temp_expires_in` a temporary key (for perfect
+/// forward secrecy) is created; it must then be bound to the permanent key.
 pub async fn create_auth_key(
     r: &mut Reader,
     w: &mut Writer,
     dc_id: i32,
     test: bool,
+    temp_expires_in: Option<i32>,
 ) -> Result<CreatedKey, Error> {
     let mut ids = MsgIdGen::new(0);
 
@@ -122,15 +124,27 @@ pub async fn create_auth_key(
 
     // 3. req_DH_params with RSA_PAD-encrypted p_q_inner_data_dc
     let new_nonce: [u8; 32] = random_bytes();
-    let inner = enums::PQInnerData::Dc(Box::new(types::PQInnerDataDc {
-        pq: res.pq.clone(),
-        p: be_bytes(p),
-        q: be_bytes(q),
-        nonce,
-        server_nonce,
-        new_nonce,
-        dc: dc_id,
-    }));
+    let inner = match temp_expires_in {
+        None => enums::PQInnerData::Dc(Box::new(types::PQInnerDataDc {
+            pq: res.pq.clone(),
+            p: be_bytes(p),
+            q: be_bytes(q),
+            nonce,
+            server_nonce,
+            new_nonce,
+            dc: dc_id,
+        })),
+        Some(expires_in) => enums::PQInnerData::TempDc(Box::new(types::PQInnerDataTempDc {
+            pq: res.pq.clone(),
+            p: be_bytes(p),
+            q: be_bytes(q),
+            nonce,
+            server_nonce,
+            new_nonce,
+            dc: dc_id,
+            expires_in,
+        })),
+    };
     let encrypted = key
         .encrypt_pad(&inner.to_bytes())
         .ok_or(security("p_q_inner_data is too long"))?;

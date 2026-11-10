@@ -108,7 +108,11 @@ impl<'a> Generator<'a> {
         let mut defs: Vec<&Definition> = schema
             .definitions
             .iter()
-            .filter(|d| !BUILTIN_TYPES.contains(&d.result.as_str()))
+            // Constructors of built-in types (`boolTrue`, `true`) are not generated;
+            // functions returning them are.
+            .filter(|d| {
+                d.category == Category::Function || !BUILTIN_TYPES.contains(&d.result.as_str())
+            })
             .collect();
         loop {
             let before = defs.len();
@@ -567,5 +571,19 @@ mod tests {
         // Small primitive-only constructors are inline, big ones boxed.
         assert!(code.contains("    User(crate::types::InputPeerUser),"));
         assert!(code.contains("Box<crate::types::Message>"));
+        // Methods returning Bool are kept.
+        assert!(code.contains("pub struct BindTempAuthKey"));
+        assert!(code.contains("impl crate::RemoteCall for LogOut"));
+        // Every function in the schema is generated.
+        let functions = schema
+            .definitions
+            .iter()
+            .filter(|d| d.category == Category::Function)
+            .count();
+        assert_eq!(
+            code.matches("impl crate::RemoteCall for").count()
+                + code.matches("> crate::RemoteCall for").count(),
+            functions
+        );
     }
 }
