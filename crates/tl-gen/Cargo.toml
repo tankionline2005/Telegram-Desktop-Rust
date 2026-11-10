@@ -1,0 +1,14 @@
+[package]
+name = "tdr-tl-gen"
+version = "0.1.0"
+description = "Rust code generator for Telegram TL schemas"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tdr-tl-parser.workspace = true
+
+[lints]
+workspace = true

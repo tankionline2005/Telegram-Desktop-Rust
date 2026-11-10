@@ -2,16 +2,28 @@
 resolver = "3"
 # Members are listed explicitly: glob patterns break when the checkout path
 # contains `[` or `]` (e.g. "Telegram Desktop [Rust Version]").
-members = ["crates/tl-parser", "xtask"]
+members = [
+    "crates/tl-parser",
+    "crates/tl-gen",
+    "crates/tl",
+    "crates/crypto",
+    "crates/mtproto",
+    "crates/cli",
+    "xtask",
+]
 
 [workspace.package]
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/tankionline2005/Telegram-Desktop-Rust"
-rust-version = "1.85"
+rust-version = "1.90"
 
 [workspace.dependencies]
 tdr-tl-parser = { path = "crates/tl-parser" }
+tdr-tl-gen = { path = "crates/tl-gen" }
+tdr-tl = { path = "crates/tl" }
+tdr-crypto = { path = "crates/crypto" }
+tdr-mtproto = { path = "crates/mtproto" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

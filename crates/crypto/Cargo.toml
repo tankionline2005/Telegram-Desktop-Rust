@@ -1,0 +1,19 @@
+[package]
+name = "tdr-crypto"
+version = "0.1.0"
+description = "MTProto 2.0 cryptography: AES-IGE, message keys, RSA_PAD, DH, factorization"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aes = "0.9"
+getrandom = "0.4.3"
+num-bigint = "0.5.1"
+pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
+sha1 = "0.11.0"
+sha2 = "0.11.1"
+
+[lints]
+workspace = true

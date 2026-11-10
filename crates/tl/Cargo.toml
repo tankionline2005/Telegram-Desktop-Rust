@@ -1,0 +1,18 @@
+[package]
+name = "tdr-tl"
+version = "0.1.0"
+description = "Telegram API types generated from the TL schema, with zero-copy deserialization"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes = "1.12.1"
+
+[build-dependencies]
+tdr-tl-parser.workspace = true
+tdr-tl-gen.workspace = true
+
+[lints]
+workspace = true

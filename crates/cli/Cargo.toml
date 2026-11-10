@@ -1,0 +1,25 @@
+[package]
+name = "tdr-cli"
+version = "0.1.0"
+description = "Console client used to exercise the protocol stack before the GUI exists"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "tdr"
+path = "src/main.rs"
+
+[dependencies]
+tdr-tl.workspace = true
+tdr-crypto.workspace = true
+tdr-mtproto.workspace = true
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+qrcode = { version = "0.14.1", default-features = false }
+rpassword = "7.5.4"
+anyhow = "1.0.104"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[lints]
+workspace = true
