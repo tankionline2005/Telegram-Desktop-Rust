@@ -317,7 +317,15 @@ async fn dialogs(limit: i32) -> Result<()> {
         let (kind, title) = match &d.peer {
             enums::Peer::User(p) => ("user", user_title(p.user_id)),
             enums::Peer::Chat(p) => ("group", chat_title(p.chat_id)),
-            enums::Peer::Channel(p) => ("channel", chat_title(p.channel_id)),
+            enums::Peer::Channel(p) => {
+                let megagroup = chats.iter().any(
+                    |c| matches!(c, enums::Chat::Channel(x) if x.id == p.channel_id && x.megagroup),
+                );
+                (
+                    if megagroup { "group" } else { "channel" },
+                    chat_title(p.channel_id),
+                )
+            }
         };
         let unread = if d.unread_count > 0 {
             format!("  [{}]", d.unread_count)
