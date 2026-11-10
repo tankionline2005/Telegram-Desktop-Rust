@@ -1,0 +1,96 @@
+# Watches the original Telegram Desktop client and opens a PR when it ships a release.
+#
+# The PR contains: re-vendored TL schemas, bumped upstream/upstream.lock.toml, the full
+# report in upstream/reports/<tag>.md, and a compact report as the PR description
+# (changelog, TL schema diff, new localization strings, affected areas, submodules).
+#
+# Setup (once): Settings → Actions → General → Workflow permissions →
+#   "Read and write permissions" + "Allow GitHub Actions to create and approve pull requests".
+# Optional secrets:
+#   UPSTREAM_TOKEN     — a PAT/App token; PRs opened with it also trigger CI
+#                        (PRs opened with the default GITHUB_TOKEN do not).
+#   TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID — get a Telegram message about new releases.
+name: Upstream tracker
+
+on:
+  schedule:
+    - cron: "23 */6 * * *" # every 6 hours
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "stable — releases only, beta — also prereleases"
+        type: choice
+        options: [stable, beta]
+        default: stable
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-tracker
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: xtask
+
+      - name: Check for a new tdesktop release
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ inputs.channel || '' }}
+        run: |
+          args=(--save --pr-body "$RUNNER_TEMP/pr-body.md" --github-output)
+          if [ -n "$CHANNEL" ]; then args+=(--channel "$CHANNEL"); fi
+          cargo xtask upstream check "${args[@]}"
+
+      - name: Re-vendor schemas and bump the lock
+        if: steps.check.outputs.update == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.check.outputs.tag }}
+        run: |
+          cargo xtask upstream sync --tag "$TAG"
+          cargo xtask upstream verify
+          # The new schema must still parse and keep the id rules.
+          cargo test -p tdr-tl-parser
+
+      - name: Open or update the sync PR
+        if: steps.check.outputs.update == 'true'
+        id: pr
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.UPSTREAM_TOKEN || github.token }}
+          branch: upstream/sync
+          delete-branch: true
+          title: ${{ steps.check.outputs.title }}
+          body-path: ${{ runner.temp }}/pr-body.md
+          commit-message: "upstream: sync with tdesktop ${{ steps.check.outputs.tag }}"
+          labels: upstream
+          add-paths: |
+            schema/**
+            upstream/**
+
+      - name: Notify in Telegram
+        if: steps.check.outputs.update == 'true' && steps.pr.outputs.pull-request-url != ''
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TITLE: ${{ steps.check.outputs.title }}
+          URL: ${{ steps.pr.outputs.pull-request-url }}
+        run: |
+          if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+            echo "Telegram secrets are not set, skipping."
+            exit 0
+          fi
+          curl -sS --fail -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${TITLE}"$'\n'"${URL}" > /dev/null

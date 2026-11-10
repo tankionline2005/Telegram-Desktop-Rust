@@ -1,0 +1,19 @@
+# Upstream tdesktop release this port is synced to.
+# Managed by `cargo xtask upstream sync` — do not edit checksums by hand.
+
+repo = "telegramdesktop/tdesktop"
+channel = "stable"
+tag = "v7.4.1"
+commit = "157f5cfc85e2dd1fa67f129a5e31a81db5ddeb19"
+published_at = "2026-11-06T19:19:58Z"
+layer = 233
+
+[[vendored]]
+path = "schema/api.tl"
+upstream = "Telegram/SourceFiles/mtproto/scheme/api.tl"
+sha256 = "c2bbefcaec3285ba46c8af8f429c7012fe5aea253fd16d4be089f91c7c3fa71e"
+
+[[vendored]]
+path = "schema/mtproto.tl"
+upstream = "Telegram/SourceFiles/mtproto/scheme/mtproto.tl"
+sha256 = "40c10255afb6cfcbcfc190a457a53b66ec9e410f6418cd97cc4c276709a739a9"

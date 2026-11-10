@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+# Members are listed explicitly: glob patterns break when the checkout path
+# contains `[` or `]` (e.g. "Telegram Desktop [Rust Version]").
+members = ["crates/tl-parser", "xtask"]
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/tankionline2005/Telegram-Desktop-Rust"
+rust-version = "1.85"
+
+[workspace.dependencies]
+tdr-tl-parser = { path = "crates/tl-parser" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# Fast local builds of the tooling.
+[profile.dev.package."*"]
+opt-level = 2

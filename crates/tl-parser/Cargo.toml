@@ -1,0 +1,11 @@
+[package]
+name = "tdr-tl-parser"
+version = "0.1.0"
+description = "Parser and differ for Telegram TL schemas"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

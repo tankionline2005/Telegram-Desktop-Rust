@@ -1,0 +1,192 @@
+# Which parts of tdesktop correspond to which parts of this project.
+# Used by `cargo xtask upstream check` to show which of our crates an upstream
+# release touches. The longest matching path prefix wins.
+# Crates marked (planned) do not exist yet — see docs/ARCHITECTURE.md.
+
+# ---------- Protocol & data ----------
+[[area]]
+name = "TL-схема"
+ours = "schema/, tdr-tl-gen"
+paths = ["Telegram/SourceFiles/mtproto/scheme/"]
+
+[[area]]
+name = "MTProto / сеть"
+ours = "tdr-mtproto"
+paths = ["Telegram/SourceFiles/mtproto/"]
+
+[[area]]
+name = "API-обёртки, обработка апдейтов"
+ours = "tdr-api"
+paths = ["Telegram/SourceFiles/api/", "Telegram/SourceFiles/apiwrap.", "Telegram/SourceFiles/main/"]
+
+[[area]]
+name = "Модель данных (peers, messages, stickers…)"
+ours = "tdr-data"
+paths = ["Telegram/SourceFiles/data/"]
+
+[[area]]
+name = "Локальное хранилище, кэш"
+ours = "tdr-storage"
+paths = ["Telegram/SourceFiles/storage/"]
+
+[[area]]
+name = "Медиа, ffmpeg, плееры"
+ours = "tdr-media"
+paths = ["Telegram/SourceFiles/media/", "Telegram/SourceFiles/ffmpeg/"]
+
+[[area]]
+name = "Звонки"
+ours = "tdr-calls"
+paths = ["Telegram/SourceFiles/calls/", "Telegram/SourceFiles/tde2e/"]
+
+[[area]]
+name = "Экспорт данных"
+ours = "tdr-export"
+paths = ["Telegram/SourceFiles/export/"]
+
+# ---------- UI ----------
+[[area]]
+name = "Базовые UI-компоненты"
+ours = "tdr-ui"
+paths = ["Telegram/SourceFiles/ui/", "Telegram/SourceFiles/layout/"]
+
+[[area]]
+name = "Список чатов"
+ours = "tdr-app::dialogs"
+paths = ["Telegram/SourceFiles/dialogs/"]
+
+[[area]]
+name = "Лента сообщений"
+ours = "tdr-app::history"
+paths = ["Telegram/SourceFiles/history/"]
+
+[[area]]
+name = "Ввод: эмодзи, стикеры, GIF, автодополнение"
+ours = "tdr-app::chat_helpers"
+paths = ["Telegram/SourceFiles/chat_helpers/", "Telegram/SourceFiles/inline_bots/"]
+
+[[area]]
+name = "Профили, медиа-разделы"
+ours = "tdr-app::info"
+paths = ["Telegram/SourceFiles/info/", "Telegram/SourceFiles/profile/", "Telegram/SourceFiles/overview/"]
+
+[[area]]
+name = "Диалоги и окна (boxes)"
+ours = "tdr-app::boxes"
+paths = ["Telegram/SourceFiles/boxes/"]
+
+[[area]]
+name = "Настройки"
+ours = "tdr-app::settings"
+paths = ["Telegram/SourceFiles/settings/", "Telegram/SourceFiles/settings."]
+
+[[area]]
+name = "Вход в аккаунт"
+ours = "tdr-app::intro"
+paths = ["Telegram/SourceFiles/intro/"]
+
+[[area]]
+name = "Окна, главный виджет, трей"
+ours = "tdr-app::window"
+paths = ["Telegram/SourceFiles/window/", "Telegram/SourceFiles/mainwidget.", "Telegram/SourceFiles/mainwindow.", "Telegram/SourceFiles/tray"]
+
+[[area]]
+name = "Платформенная интеграция (Win/macOS/Linux)"
+ours = "tdr-platform"
+paths = ["Telegram/SourceFiles/platform/"]
+
+[[area]]
+name = "Ядро приложения"
+ours = "tdr-app::core"
+paths = ["Telegram/SourceFiles/core/", "Telegram/SourceFiles/main.cpp", "Telegram/SourceFiles/config.h", "Telegram/SourceFiles/logs."]
+
+[[area]]
+name = "Прочие фичи (боты, платежи, опросы, IV, редактор, статистика…)"
+ours = "tdr-app::*"
+paths = [
+  "Telegram/SourceFiles/payments/", "Telegram/SourceFiles/poll/", "Telegram/SourceFiles/iv/",
+  "Telegram/SourceFiles/editor/", "Telegram/SourceFiles/statistics/", "Telegram/SourceFiles/passport/",
+  "Telegram/SourceFiles/menu/", "Telegram/SourceFiles/wallet/", "Telegram/SourceFiles/webauthn/",
+  "Telegram/SourceFiles/countries/", "Telegram/SourceFiles/lang/", "Telegram/SourceFiles/support/",
+  "Telegram/SourceFiles/tgw/", "Telegram/SourceFiles/gram/", "Telegram/SourceFiles/_other/",
+]
+
+[[area]]
+name = "Стили, ресурсы, иконки"
+ours = "tdr-ui (theme), assets/"
+paths = ["Telegram/SourceFiles/", "Telegram/Resources/"]
+
+[[area]]
+name = "Локализация"
+ours = "tdr-lang"
+paths = ["Telegram/Resources/langs/"]
+
+[[area]]
+name = "Шейдеры"
+ours = "tdr-ui (render)"
+paths = ["Telegram/shaders/"]
+
+[[area]]
+name = "Тесты upstream"
+ours = "—"
+paths = ["Telegram/SourceFiles/tests/", "Telegram/SourceFiles/test/"]
+
+[[area]]
+name = "Сборка/CI/инструменты upstream (не переносится)"
+ours = "—"
+paths = [
+  "Telegram/CMakeLists.txt", "Telegram/build/", "Telegram/cmake/", "Telegram/configure", "Telegram/create.bat",
+  "Telegram/Telegram/", "Telegram/Telegram.plist", "CMakeLists.txt", ".github/", ".agents/", ".claude/", ".grok/",
+  "AGENTS.md", "CLAUDE.md", "GROK.md", "REVIEW.md", "docs/", "snap/", "tools/", "tasks/", "lib/",
+  ".devcontainer.json", ".gitignore", ".gitattributes", ".gitmodules", ".clang-tidy", ".oss-scanner",
+  "changelog.txt", "README.md", "LEGAL", "LICENSE",
+]
+
+# ---------- Submodules: compared in their own repositories ----------
+[[submodule]]
+path = "Telegram/lib_ui"
+ours = "tdr-ui"
+
+[[submodule]]
+path = "Telegram/lib_base"
+ours = "tdr-base / tdr-platform"
+
+[[submodule]]
+path = "Telegram/lib_tl"
+ours = "tdr-tl-gen"
+
+[[submodule]]
+path = "Telegram/lib_storage"
+ours = "tdr-storage"
+
+[[submodule]]
+path = "Telegram/lib_lottie"
+ours = "tdr-media (lottie)"
+
+[[submodule]]
+path = "Telegram/lib_spellcheck"
+ours = "tdr-ui (spellcheck)"
+
+[[submodule]]
+path = "Telegram/lib_webview"
+ours = "tdr-webview"
+
+[[submodule]]
+path = "Telegram/lib_webrtc"
+ours = "tdr-calls"
+
+[[submodule]]
+path = "Telegram/ThirdParty/tgcalls"
+ours = "tdr-calls"
+
+[[submodule]]
+path = "Telegram/lib_translate"
+ours = "tdr-app (translate)"
+
+[[submodule]]
+path = "Telegram/codegen"
+ours = "tdr-ui (styles codegen)"
+
+[[submodule]]
+path = "cmake"
+ours = "—"
