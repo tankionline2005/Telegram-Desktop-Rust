@@ -1,2 +1,6 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# The LLVM linker shipped with rustup is much faster than MSVC's link.exe.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"

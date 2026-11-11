@@ -11,3 +11,10 @@
   (CI uses `-D warnings`), `cargo test --workspace`.
 - License is GPL-3.0-or-later; porting tdesktop code is allowed and expected.
 - Never commit `api_id`/`api_hash`; they come from environment variables at build time.
+- Profiles: `release` is the fast everyday optimized build (incremental, no LTO);
+  `dist` (`--profile dist`) is the shipping build with fat LTO. Keep generic code thin:
+  e.g. `tdr_api::Client::invoke<R>` only (de)serializes and calls the non-generic
+  `invoke_raw`, so per-request-type monomorphization stays small.
+- Live checks against Telegram use the user's session in `data/` (git-ignored):
+  `tdr me`, `tdr selftest reconnect|unknown-key|dc N`. Run cargo with
+  `--manifest-path` if the shell cannot `cd` into the bracketed folder.

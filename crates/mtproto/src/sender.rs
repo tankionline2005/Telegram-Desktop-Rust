@@ -405,7 +405,8 @@ async fn serve(
                     Some(Ok(f)) => f,
                     Some(Err(e)) if TransportError::from_io(&e) == Some(-404) => return Ended::UnknownKey,
                     Some(Err(e)) => return Ended::Broken(e.to_string()),
-                    None => return Ended::Broken("reader stopped".into()),
+                    // The reader task is gone without an error: the runtime is shutting down.
+                    None => return Ended::Dropped,
                 };
                 deadline = Instant::now() + READ_TIMEOUT;
                 let incoming = match session.unpack(&frame) {

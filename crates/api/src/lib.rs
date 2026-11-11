@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use tdr_mtproto::{Event, KeySpec, PRODUCTION_DCS, RpcError, Sender, TEST_DCS};
 use tdr_tl::{Deserializable, Reader, RemoteCall, Serializable, enums, functions};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -279,14 +280,11 @@ impl Client {
             let enums::auth::ExportedAuthorization::ExportedAuthorization(exported) = self
                 .invoke_in(home, &functions::auth::ExportAuthorization { dc_id: dc })
                 .await?;
-            self.call(
-                &conn,
-                &functions::auth::ImportAuthorization {
-                    id: exported.id,
-                    bytes: exported.bytes,
-                },
-            )
-            .await?;
+            let import = functions::auth::ImportAuthorization {
+                id: exported.id,
+                bytes: exported.bytes,
+            };
+            self.call(&conn, import.to_bytes()).await?;
             self.inner
                 .session
                 .lock()
@@ -411,47 +409,28 @@ impl Client {
         });
     }
 
-    /// Sends `request` on `conn`, wrapping it in `initConnection` until the server
-    /// has accepted one on this key.
-    async fn call<R: RemoteCall>(&self, conn: &DcConn, request: &R) -> Result<R::Return, Error> {
-        let body = request.to_bytes();
-        let raw = if conn.initialized.load(Ordering::Acquire) {
-            conn.sender.invoke_raw(body).await
-        } else {
-            let cfg = &self.inner.config;
-            let wrapped = functions::InvokeWithLayer {
-                layer: tdr_tl::LAYER,
-                query: functions::InitConnection {
-                    api_id: cfg.api_id,
-                    device_model: cfg.device_model.clone(),
-                    system_version: cfg.system_version.clone(),
-                    app_version: cfg.app_version.clone(),
-                    system_lang_code: cfg.system_lang_code.clone(),
-                    lang_pack: String::new(),
-                    lang_code: cfg.lang_code.clone(),
-                    proxy: None,
-                    params: None,
-                    query: Raw(body),
-                },
-            };
-            let r = conn.sender.invoke_raw(wrapped.to_bytes()).await;
-            if !matches!(
-                r,
-                Err(Error::Disconnected | Error::AuthKeyUnknown | Error::Io(_))
-            ) {
-                conn.initialized.store(true, Ordering::Release);
-            }
-            r
-        };
-        Ok(R::Return::deserialize(&mut Reader::new(&raw?))?)
-    }
+    // Only these thin generic wrappers are instantiated per request type; all the async
+    // logic below them (migrations, flood waits, key recovery, initConnection) is
+    // compiled once. This keeps builds fast and the binary small.
 
     /// Invokes `request` on the home DC.
     pub async fn invoke<R: RemoteCall>(&self, request: &R) -> Result<R::Return, Error> {
+        let answer = self.invoke_raw(&request.to_bytes()).await?;
+        Ok(R::Return::deserialize(&mut Reader::new(&answer))?)
+    }
+
+    /// Invokes `request` on a specific DC (e.g. to download a file stored there).
+    pub async fn invoke_in<R: RemoteCall>(&self, dc: i32, request: &R) -> Result<R::Return, Error> {
+        let answer = self.invoke_in_raw(dc, &request.to_bytes()).await?;
+        Ok(R::Return::deserialize(&mut Reader::new(&answer))?)
+    }
+
+    /// Invokes a serialized request on the home DC, following `*_MIGRATE_X`.
+    pub async fn invoke_raw(&self, body: &[u8]) -> Result<Bytes, Error> {
         let mut migrations = 0;
         loop {
             let home = self.home_dc();
-            match self.invoke_in(home, request).await {
+            match self.invoke_in_raw(home, body).await {
                 Err(Error::Rpc(e)) if e.code == 303 && migrations < 3 => {
                     let Some(target) = migrate_target(&e) else {
                         return Err(Error::Rpc(e));
@@ -465,12 +444,13 @@ impl Client {
         }
     }
 
-    /// Invokes `request` on a specific DC (e.g. to download a file stored there).
-    pub async fn invoke_in<R: RemoteCall>(&self, dc: i32, request: &R) -> Result<R::Return, Error> {
+    /// Invokes a serialized request on `dc`, waiting out short flood waits and
+    /// recreating a key the server forgot.
+    pub async fn invoke_in_raw(&self, dc: i32, body: &[u8]) -> Result<Bytes, Error> {
         let mut retried_key = false;
         loop {
             let conn = self.conn(dc).await?;
-            match self.call(&conn, request).await {
+            match self.call(&conn, body.to_vec()).await {
                 Err(Error::Rpc(e)) if e.is("FLOOD_WAIT") || e.is("FLOOD_PREMIUM_WAIT") => {
                     let secs = e.value().unwrap_or(0).max(0) as u32;
                     if secs > self.inner.config.flood_sleep_threshold {
@@ -486,6 +466,38 @@ impl Client {
                 other => return other,
             }
         }
+    }
+
+    /// Sends a serialized request on `conn`, wrapping it in `initConnection` until the
+    /// server has accepted one on this key.
+    async fn call(&self, conn: &DcConn, body: Vec<u8>) -> Result<Bytes, Error> {
+        if conn.initialized.load(Ordering::Acquire) {
+            return conn.sender.invoke_raw(body).await;
+        }
+        let cfg = &self.inner.config;
+        let wrapped = functions::InvokeWithLayer {
+            layer: tdr_tl::LAYER,
+            query: functions::InitConnection {
+                api_id: cfg.api_id,
+                device_model: cfg.device_model.clone(),
+                system_version: cfg.system_version.clone(),
+                app_version: cfg.app_version.clone(),
+                system_lang_code: cfg.system_lang_code.clone(),
+                lang_pack: String::new(),
+                lang_code: cfg.lang_code.clone(),
+                proxy: None,
+                params: None,
+                query: Raw(body),
+            },
+        };
+        let r = conn.sender.invoke_raw(wrapped.to_bytes()).await;
+        if !matches!(
+            r,
+            Err(Error::Disconnected | Error::AuthKeyUnknown | Error::Io(_))
+        ) {
+            conn.initialized.store(true, Ordering::Release);
+        }
+        r
     }
 
     /// Drops the socket to `dc` as if the network failed (for testing reconnects).
