@@ -1,3 +1,5 @@
 * text=auto eol=lf
 # Vendored upstream files are byte-exact copies; their SHA-256 is in upstream/upstream.lock.toml.
 schema/** -text
+assets/theme/** -text
+assets/fonts/** -text

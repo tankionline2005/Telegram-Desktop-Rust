@@ -12,6 +12,7 @@ tdr-tl.workspace = true
 tdr-api.workspace = true
 tdr-updates.workspace = true
 tdr-storage.workspace = true
+getrandom = "0.4.3"
 tokio = { version = "1.54.1", features = ["time", "sync"] }
 tracing = "0.1.44"
 

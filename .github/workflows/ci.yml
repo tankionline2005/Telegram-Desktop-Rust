@@ -18,13 +18,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          # The GUI (tdr-app, GPUI) is built on Windows for now; on Linux it also needs
+          # system libraries (Wayland/X11/Vulkan), on macOS the Metal toolchain.
+          - os: windows-latest
+            exclude: ""
+          - os: ubuntu-latest
+            exclude: "--exclude tdr-app"
+          - os: macos-latest
+            exclude: "--exclude tdr-app"
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets
-      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets ${{ matrix.exclude }}
+      - run: cargo test --workspace ${{ matrix.exclude }}
       - name: Vendored upstream files are untouched
         run: cargo xtask upstream verify

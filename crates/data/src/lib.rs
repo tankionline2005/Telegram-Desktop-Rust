@@ -18,6 +18,13 @@ use tracing::{debug, info, warn};
 
 pub use tdr_storage;
 
+/// Random bytes for `random_id` (the server deduplicates sends by it).
+fn tdr_crypto_random() -> [u8; 8] {
+    let mut b = [0u8; 8];
+    getrandom::fill(&mut b).expect("OS random number generator failed");
+    b
+}
+
 #[derive(Debug)]
 pub enum Error {
     Api(ApiError),
@@ -269,11 +276,23 @@ impl Sync {
 
     /// Waits up to `timeout` for updates and applies them.
     pub async fn next(&mut self, timeout: Duration) -> Result<Applied> {
+        let event = self.wait_event(timeout).await;
+        self.process(event).await
+    }
+
+    /// Waits for the next event (or the next gap deadline). Cancel-safe: use it inside
+    /// `select!` and pass the result to [`Sync::process`], which must not be cancelled.
+    pub async fn wait_event(&self, timeout: Duration) -> Option<Event> {
         let wait = match self.engine.next_deadline() {
             Some(d) => d.saturating_duration_since(Instant::now()).min(timeout),
             None => timeout,
         };
-        let out = match self.client.next_event(wait).await {
+        self.client.next_event(wait).await
+    }
+
+    /// Applies an event from [`Sync::wait_event`] (`None`: a timeout).
+    pub async fn process(&mut self, event: Option<Event>) -> Result<Applied> {
+        let out = match event {
             Some(Event::Update(bytes)) => match enums::Updates::from_bytes(&bytes) {
                 Ok(u) => self.engine.feed(u, Instant::now()),
                 Err(e) => {
@@ -291,6 +310,63 @@ impl Sync {
     pub async fn feed(&mut self, updates: enums::Updates) -> Result<Applied> {
         let out = self.engine.feed(updates, Instant::now());
         self.run(out).await
+    }
+
+    /// Sends a text message and records it in the cache.
+    pub async fn send_text(&mut self, peer: PeerKey, text: &str) -> Result<Applied> {
+        let access_hash = self.store.access_hash(peer)?;
+        let Some(input) = convert::input_peer(peer, access_hash) else {
+            return Ok(Applied::default());
+        };
+        let random_id = i64::from_le_bytes(tdr_crypto_random());
+        let updates = self
+            .client
+            .invoke(&functions::messages::SendMessage {
+                no_webpage: false,
+                silent: false,
+                background: false,
+                clear_draft: true,
+                noforwards: false,
+                update_stickersets_order: false,
+                invert_media: false,
+                allow_paid_floodskip: false,
+                peer: input,
+                reply_to: None,
+                message: text.to_string(),
+                random_id,
+                reply_markup: None,
+                entities: None,
+                schedule_date: None,
+                schedule_repeat_period: None,
+                send_as: None,
+                quick_reply_shortcut: None,
+                effect: None,
+                allow_paid_stars: None,
+                suggested_post: None,
+                rich_message: None,
+            })
+            .await?;
+        // In private chats the server answers with a compact form that has no text:
+        // build the message row ourselves.
+        if let enums::Updates::UpdateShortSentMessage(sent) = &updates {
+            let row = MessageRow {
+                peer,
+                id: sent.id,
+                date: sent.date,
+                from: Some(PeerKey::user(self.self_id)),
+                out: true,
+                text: text.to_string(),
+                raw: None,
+            };
+            let mut applied = self.feed(updates.clone()).await?;
+            self.store.write(|w| {
+                w.put_message(&row)?;
+                w.message_arrived(&row)
+            })?;
+            applied.new_messages.push(row);
+            return Ok(applied);
+        }
+        self.feed(updates).await
     }
 
     /// Commits `out`, then performs its actions (and the ones they lead to).

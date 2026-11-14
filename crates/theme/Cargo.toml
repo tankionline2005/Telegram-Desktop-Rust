@@ -1,0 +1,16 @@
+[package]
+name = "tdr-theme"
+version = "0.1.0"
+description = "Color palettes generated from tdesktop's colors.palette and built-in themes"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
+
+[build-dependencies]
+zip = { version = "9.5.1", default-features = false, features = ["deflate"] }

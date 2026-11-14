@@ -48,8 +48,12 @@ struct Lock {
 struct Vendored {
     /// Path in this repository.
     path: String,
-    /// Path in the upstream repository.
+    /// Path in the upstream repository (inside `submodule` if set).
     upstream: String,
+    /// The file lives in this git submodule of tdesktop (e.g. `Telegram/lib_ui`); it is
+    /// fetched from the submodule's repository at the commit pinned by the release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    submodule: Option<String>,
     sha256: String,
 }
 
@@ -338,7 +342,20 @@ pub fn sync(args: &[&str]) -> Result<()> {
     // Download everything first so a network error never leaves a half-updated tree.
     let mut downloads = Vec::new();
     for v in &lock.vendored {
-        downloads.push(gh.raw(&lock.repo, &tag, &v.upstream)?);
+        let data = match &v.submodule {
+            None => gh.raw(&lock.repo, &tag, &v.upstream)?,
+            Some(sub) => {
+                let entry = gh.content_entry(&lock.repo, sub, &tag)?;
+                let sub_repo = entry
+                    .submodule_git_url
+                    .as_deref()
+                    .and_then(|u| u.strip_prefix("https://github.com/"))
+                    .map(|u| u.trim_end_matches(".git").to_string())
+                    .with_context(|| format!("{sub} is not a GitHub submodule"))?;
+                gh.raw(&sub_repo, &entry.sha, &v.upstream)?
+            }
+        };
+        downloads.push(data);
     }
     let commit = gh.commit_sha(&lock.repo, &tag)?;
 

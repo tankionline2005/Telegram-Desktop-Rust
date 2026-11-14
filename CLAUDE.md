@@ -21,6 +21,13 @@
 - Cache rows store our own columns plus the TL blob tagged with its layer, so schema
   updates never break the cache. Don't print cached message texts or chat names in
   tool output: they are the user's private data.
+- Run clippy as `cargo clippy --workspace --all-targets -- -D warnings`: setting
+  `RUSTFLAGS=-D warnings` locally changes every dependency's fingerprint and rebuilds
+  GPUI (tens of minutes).
+- UI checks: run the app with `--demo [--light|--dark] [--open=N]` (fake chats) and
+  capture only its window with a `PrintWindow` script; never screenshot the real mode
+  (the user's chats).
+- GPUI 0.2.2 never truncates `nowrap` text (stale measure cache); use `ui::one_line`.
 - Live checks against Telegram use the user's session in `data/` (git-ignored):
   `tdr me`, `tdr selftest reconnect|unknown-key|dc N`. Run cargo with
   `--manifest-path` if the shell cannot `cd` into the bracketed folder.
