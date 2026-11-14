@@ -97,8 +97,11 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(640.), px(420.))),
                 titlebar: Some(TitlebarOptions {
+                    // The title is shown in the taskbar only: the window draws tdesktop's
+                    // custom title bar itself.
                     title: Some(APP_NAME.into()),
-                    ..Default::default()
+                    appears_transparent: true,
+                    traffic_light_position: None,
                 }),
                 app_id: Some("unofficial-telegram-desktop-rust".into()),
                 ..Default::default()

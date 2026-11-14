@@ -1,11 +1,12 @@
-//! The main window: chat list on the left, the open chat on the right.
+//! The main window: custom title bar, chat list on the left, the open chat on the right.
 //!
-//! Sizes follow tdesktop's styles (`dialogs.style`, `ui/chat/chat.style`), colors come
-//! from its palette (`tdr-theme`).
+//! Sizes follow tdesktop's styles (`dialogs.style`, `ui/chat/chat.style`,
+//! `lib_ui/ui/widgets/widgets.style`), colors come from its palette (`tdr-theme`).
 
 use gpui::{
-    AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight, ListAlignment, ListState,
-    Rgba, SharedString, Window, div, list, prelude::*, px, rgba, uniform_list,
+    AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight, ListAlignment, ListOffset,
+    ListState, Pixels, Rgba, SharedString, TextRun, Window, WindowControlArea, div, font, list,
+    prelude::*, px, rgba, uniform_list,
 };
 use tdr_data::tdr_storage::PeerKey;
 use tdr_theme::{Color, Palette};
@@ -14,6 +15,9 @@ use tokio::sync::mpsc;
 use crate::bridge::{Command, DialogItem, MessageItem, Update};
 use crate::text_input::{Submit, TextInput};
 
+// widgets.style: windowTitleHeight, windowTitleButtonWidth
+const TITLE_HEIGHT: f32 = 24.;
+const TITLE_BUTTON_WIDTH: f32 = 36.;
 // dialogs.style: defaultDialogRow
 const DIALOG_ROW_HEIGHT: f32 = 62.;
 const DIALOG_PHOTO: f32 = 46.;
@@ -21,19 +25,58 @@ const DIALOG_PADDING_X: f32 = 10.;
 const DIALOG_PADDING_Y: f32 = 8.;
 const DIALOGS_WIDTH: f32 = 320.;
 const TOP_BAR_HEIGHT: f32 = 54.;
-// chat.style
+// chat.style: msgMaxWidth, msgPadding, bubbleRadiusLarge, msgMargin
 const MSG_MAX_WIDTH: f32 = 430.;
 const MSG_PADDING_X: f32 = 11.;
 const MSG_PADDING_Y: f32 = 8.;
 const MSG_RADIUS: f32 = 16.;
 const MSG_MARGIN_TOP: f32 = 6.;
 const MSG_SIDE: f32 = 16.;
+const MSG_MARGIN_FAR: f32 = 56.;
 // basic.style: fsize
 const FONT_SIZE: f32 = 13.;
+const DATE_FONT_SIZE: f32 = 12.;
 const FONT_FAMILY: &str = "Open Sans";
+/// Ask for older messages when the top of the list is this close (in items).
+const LOAD_OLDER_THRESHOLD: usize = 3;
 
 fn c(color: Color) -> Rgba {
     rgba(color.rgba())
+}
+
+/// One line of text cut with "…". (GPUI 0.2.2 caches the size of `nowrap` text from its
+/// first, unconstrained measurement and then never truncates it; a one-line clamp of
+/// wrapping text is re-measured with the real width.)
+fn one_line(text: String) -> gpui::Div {
+    div()
+        .w_full()
+        .overflow_hidden()
+        .line_clamp(1)
+        .text_ellipsis()
+        .child(text)
+}
+
+/// Width of the longest line of `text` when laid out without wrapping.
+fn text_width(window: &Window, text: &str, size: f32, weight: FontWeight) -> Pixels {
+    let mut f = font(FONT_FAMILY);
+    f.weight = weight;
+    text.split('\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let run = TextRun {
+                len: line.len(),
+                font: f.clone(),
+                color: gpui::black(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            window
+                .text_system()
+                .layout_line(line, px(size), &[run], None)
+                .width
+        })
+        .fold(px(0.), |a, b| a.max(b))
 }
 
 /// tdesktop's userpic colors in `color_index` order (red, orange, violet, green, cyan,
@@ -62,32 +105,27 @@ fn name_color(p: &Palette, index: u8) -> Color {
     ][index as usize % 7]
 }
 
-/// One line of text cut with "…". (GPUI 0.2.2 caches the size of `nowrap` text from its
-/// first, unconstrained measurement and then never truncates it; a one-line clamp of
-/// wrapping text is re-measured with the real width.)
-fn one_line(text: String) -> gpui::Div {
-    div()
-        .w_full()
-        .overflow_hidden()
-        .line_clamp(1)
-        .text_ellipsis()
-        .child(text)
-}
-
 pub struct MainView {
     dark: bool,
     dialogs: Vec<DialogItem>,
     selected: Option<PeerKey>,
     messages: Vec<MessageItem>,
     messages_state: ListState,
+    history_complete: bool,
+    loading_older: bool,
+    /// Keep the newest message in view (true until the user scrolls up, and again once
+    /// they scroll back to the bottom).
+    stick_to_bottom: bool,
     input: Entity<TextInput>,
     status: String,
     fatal: Option<String>,
+    commands: mpsc::UnboundedSender<Command>,
+    focus: FocusHandle,
+    /// Font with the Windows caption-button glyphs.
+    icon_font: SharedString,
     first_list_frame_logged: bool,
     /// Demo/screenshot helper: open the chat at this list index once the list arrives.
     pub open_on_start: Option<usize>,
-    commands: mpsc::UnboundedSender<Command>,
-    focus: FocusHandle,
 }
 
 impl MainView {
@@ -120,19 +158,45 @@ impl MainView {
         })
         .detach();
 
+        let messages_state = ListState::new(0, ListAlignment::Bottom, px(600.));
+        let view = cx.entity().downgrade();
+        messages_state.set_scroll_handler(move |event, _window, cx| {
+            let near_top = event.visible_range.start <= LOAD_OLDER_THRESHOLD;
+            let at_bottom = event.visible_range.end >= event.count;
+            let view = view.clone();
+            cx.defer(move |cx| {
+                let _ = view.update(cx, |v, _| {
+                    v.stick_to_bottom = at_bottom;
+                    if near_top {
+                        v.load_older();
+                    }
+                });
+            });
+        });
+
+        let fonts = cx.text_system().all_font_names();
+        let icon_font = ["Segoe Fluent Icons", "Segoe MDL2 Assets"]
+            .into_iter()
+            .find(|f| fonts.iter().any(|n| n == f))
+            .unwrap_or("Segoe MDL2 Assets");
+
         Self {
             dark,
             dialogs: Vec::new(),
             selected: None,
             messages: Vec::new(),
-            messages_state: ListState::new(0, ListAlignment::Bottom, px(400.)),
+            messages_state,
+            history_complete: false,
+            loading_older: false,
+            stick_to_bottom: true,
             input,
             status: String::new(),
             fatal: None,
-            open_on_start: None,
-            first_list_frame_logged: false,
             commands,
             focus: cx.focus_handle(),
+            icon_font: icon_font.into(),
+            first_list_frame_logged: false,
+            open_on_start: None,
         }
     }
 
@@ -154,14 +218,18 @@ impl MainView {
                     let _ = self.commands.send(Command::OpenChat(peer));
                 }
             }
-            Update::History { peer, messages } => {
+            Update::History {
+                peer,
+                messages,
+                complete,
+            } => {
                 if self.selected == Some(peer) {
-                    let stick_to_bottom = true;
-                    self.messages = messages;
-                    self.messages_state.reset(self.messages.len());
-                    if stick_to_bottom && !self.messages.is_empty() {
-                        self.messages_state
-                            .scroll_to_reveal_item(self.messages.len() - 1);
+                    self.history_complete = complete;
+                    self.loading_older = false;
+                    self.set_messages(messages);
+                    // A short chat may not fill the view, so no scroll would ever ask for more.
+                    if self.messages.len() < 20 {
+                        self.load_older();
                     }
                 }
             }
@@ -171,6 +239,76 @@ impl MainView {
         cx.notify();
     }
 
+    /// Replaces the shown messages, telling the list exactly what changed so that the
+    /// scroll position survives: older messages prepended, new ones appended, edits in
+    /// place. (A full reset would jump to the bottom.)
+    fn set_messages(&mut self, new: Vec<MessageItem>) {
+        self.update_list(new);
+        if self.stick_to_bottom && !self.messages.is_empty() {
+            self.messages_state
+                .scroll_to_reveal_item(self.messages.len() - 1);
+        }
+    }
+
+    fn update_list(&mut self, new: Vec<MessageItem>) {
+        let old = std::mem::take(&mut self.messages);
+        let same_block = old.first().and_then(|first| {
+            let k = new.iter().position(|m| m.id == first.id)?;
+            let matches = new.len() >= k + old.len()
+                && new[k..k + old.len()]
+                    .iter()
+                    .zip(&old)
+                    .all(|(a, b)| a.id == b.id);
+            matches.then_some(k)
+        });
+        match same_block {
+            Some(prepended) => {
+                let changed: Vec<usize> = (0..old.len())
+                    .filter(|&i| new[prepended + i].text != old[i].text)
+                    .collect();
+                let appended = new.len() - prepended - old.len();
+                let old_len = old.len();
+                self.messages = new;
+                if prepended > 0 {
+                    self.messages_state.splice(0..0, prepended);
+                }
+                for i in changed {
+                    let at = prepended + i;
+                    self.messages_state.splice(at..at + 1, 1);
+                }
+                if appended > 0 {
+                    let at = prepended + old_len;
+                    self.messages_state.splice(at..at, appended);
+                }
+            }
+            None => {
+                // Deletions or a different chat: rebuild, keeping the position if the
+                // user had scrolled up.
+                let top = self.messages_state.logical_scroll_top();
+                let at_bottom = top.item_ix >= old.len();
+                let len = new.len();
+                self.messages = new;
+                self.messages_state.reset(len);
+                if !at_bottom && len > 0 {
+                    self.messages_state.scroll_to(ListOffset {
+                        item_ix: top.item_ix.min(len - 1),
+                        offset_in_item: top.offset_in_item,
+                    });
+                }
+            }
+        }
+    }
+
+    fn load_older(&mut self) {
+        if self.loading_older || self.history_complete || self.messages.is_empty() {
+            return;
+        }
+        if let Some(peer) = self.selected {
+            self.loading_older = true;
+            let _ = self.commands.send(Command::LoadOlder(peer));
+        }
+    }
+
     fn open(&mut self, peer: PeerKey, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected == Some(peer) {
             return;
@@ -178,6 +316,9 @@ impl MainView {
         self.selected = Some(peer);
         self.messages.clear();
         self.messages_state.reset(0);
+        self.history_complete = false;
+        self.loading_older = false;
+        self.stick_to_bottom = true;
         let _ = self.commands.send(Command::OpenChat(peer));
         window.focus(&self.input.focus_handle(cx));
         cx.notify();
@@ -188,7 +329,92 @@ impl MainView {
         let palette = self.palette();
         self.input
             .update(cx, |input, cx| input.set_palette(palette, cx));
+        // Message colors changed: re-measure nothing, just repaint.
         cx.notify();
+    }
+
+    /// The custom title bar of tdesktop on Windows: no text, caption buttons on the right.
+    fn render_title_bar(&self, window: &Window) -> impl IntoElement {
+        let p = self.palette();
+        let active = window.is_window_active();
+        let bg = if active {
+            p.title_bg_active
+        } else {
+            p.title_bg
+        };
+        let button =
+            |id: &'static str, glyph: &'static str, area: WindowControlArea, close: bool| {
+                let (fg, bg_over, fg_over) = match (close, active) {
+                    (true, true) => (
+                        p.title_button_close_fg_active,
+                        p.title_button_close_bg_active_over,
+                        p.title_button_close_fg_active_over,
+                    ),
+                    (true, false) => (
+                        p.title_button_close_fg,
+                        p.title_button_close_bg_over,
+                        p.title_button_close_fg_over,
+                    ),
+                    (false, true) => (
+                        p.title_button_fg_active,
+                        p.title_button_bg_active_over,
+                        p.title_button_fg_active_over,
+                    ),
+                    (false, false) => (
+                        p.title_button_fg,
+                        p.title_button_bg_over,
+                        p.title_button_fg_over,
+                    ),
+                };
+                div()
+                    .id(id)
+                    .w(px(TITLE_BUTTON_WIDTH))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .font_family(self.icon_font.clone())
+                    .text_size(px(10.))
+                    .text_color(c(fg))
+                    .hover(move |s| s.bg(c(bg_over)).text_color(c(fg_over)))
+                    .window_control_area(area)
+                    .child(glyph)
+            };
+        let max_glyph = if window.is_maximized() {
+            "\u{E923}"
+        } else {
+            "\u{E922}"
+        };
+        div()
+            .h(px(TITLE_HEIGHT))
+            .w_full()
+            .flex_none()
+            .flex()
+            .bg(c(bg))
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .window_control_area(WindowControlArea::Drag),
+            )
+            .child(button(
+                "title-min",
+                "\u{E921}",
+                WindowControlArea::Min,
+                false,
+            ))
+            .child(button(
+                "title-max",
+                max_glyph,
+                WindowControlArea::Max,
+                false,
+            ))
+            .child(button(
+                "title-close",
+                "\u{E8BB}",
+                WindowControlArea::Close,
+                true,
+            ))
     }
 
     fn render_dialog(&self, item: &DialogItem, cx: &mut Context<Self>) -> AnyElement {
@@ -283,12 +509,12 @@ impl MainView {
                                     .min_w(px(0.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(c(name_fg))
-                                    .child(div().w_full().child(one_line(item.name.clone()))),
+                                    .child(one_line(item.name.clone())),
                             )
                             .child(
                                 div()
                                     .flex_none()
-                                    .text_size(px(12.))
+                                    .text_size(px(DATE_FONT_SIZE))
                                     .text_color(c(date_fg))
                                     .child(item.time.clone()),
                             ),
@@ -303,14 +529,14 @@ impl MainView {
                                     .flex_1()
                                     .min_w(px(0.))
                                     .text_color(c(text_fg))
-                                    .child(div().w_full().child(one_line(item.last.clone()))),
+                                    .child(one_line(item.last.clone())),
                             )
                             .children(badge)
                             .when(item.unread == 0 && item.pinned, |d| {
                                 d.child(
                                     div()
                                         .flex_none()
-                                        .text_size(px(12.))
+                                        .text_size(px(DATE_FONT_SIZE))
                                         .text_color(c(date_fg))
                                         .child("📌"),
                                 )
@@ -320,15 +546,43 @@ impl MainView {
             .into_any_element()
     }
 
-    fn render_message(&self, item: &MessageItem) -> AnyElement {
+    /// A message bubble with an explicit width: its natural text width, capped. GPUI 0.2.2
+    /// otherwise measures wrapped text at one width and paints it at another, so long
+    /// messages overlap the next ones.
+    fn render_message(&self, item: &MessageItem, window: &Window) -> AnyElement {
         let p = self.palette();
         let (bg, fg, date_fg) = if item.out {
             (p.msg_out_bg, p.history_text_out_fg, p.msg_out_date_fg)
         } else {
             (p.msg_in_bg, p.history_text_in_fg, p.msg_in_date_fg)
         };
+        let available =
+            f32::from(window.viewport_size().width) - DIALOGS_WIDTH - MSG_SIDE - MSG_MARGIN_FAR;
+        let max_inner = MSG_MAX_WIDTH.min(available).max(120.) - 2. * MSG_PADDING_X;
+        let natural = [
+            f32::from(text_width(
+                window,
+                &item.text,
+                FONT_SIZE,
+                FontWeight::NORMAL,
+            )),
+            item.sender.as_ref().map_or(0., |(name, _)| {
+                f32::from(text_width(window, name, FONT_SIZE, FontWeight::SEMIBOLD))
+            }),
+            f32::from(text_width(
+                window,
+                &item.time,
+                DATE_FONT_SIZE,
+                FontWeight::NORMAL,
+            )),
+        ]
+        .into_iter()
+        .fold(0., f32::max);
+        // +1 px: sub-pixel rounding must not push the last word to a new line.
+        let inner = (natural + 1.).min(max_inner).ceil();
+
         let bubble = div()
-            .max_w(px(MSG_MAX_WIDTH))
+            .flex_none()
             .px(px(MSG_PADDING_X))
             .py(px(MSG_PADDING_Y))
             .rounded(px(MSG_RADIUS))
@@ -339,16 +593,18 @@ impl MainView {
             .gap(px(2.))
             .children(item.sender.as_ref().map(|(name, color)| {
                 div()
+                    .w(px(inner))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(c(name_color(p, *color)))
-                    .child(name.clone())
+                    .child(one_line(name.clone()))
             }))
-            .child(div().child(item.text.clone()))
+            .child(div().w(px(inner)).child(item.text.clone()))
             .child(
                 div()
+                    .w(px(inner))
                     .flex()
                     .justify_end()
-                    .text_size(px(12.))
+                    .text_size(px(DATE_FONT_SIZE))
                     .text_color(c(date_fg))
                     .child(item.time.clone()),
             );
@@ -370,7 +626,7 @@ impl Focusable for MainView {
 }
 
 impl Render for MainView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.first_list_frame_logged && !self.dialogs.is_empty() {
             self.first_list_frame_logged = true;
             tracing::info!(
@@ -483,16 +739,14 @@ impl Render for MainView {
                             .text_color(c(p.window_bold_fg))
                             .child(chat.name.clone()),
                     )
-                    .child(
-                        div()
-                            .text_color(c(p.window_sub_text_fg))
-                            .child(if chat.is_channel { "channel" } else { "" }),
-                    );
+                    .when(chat.is_channel, |d| {
+                        d.child(div().text_color(c(p.window_sub_text_fg)).child("channel"))
+                    });
                 let view = cx.entity();
-                let messages = list(self.messages_state.clone(), move |i, _window, cx| {
+                let messages = list(self.messages_state.clone(), move |i, window, cx| {
                     let view = view.read(cx);
                     match view.messages.get(i) {
-                        Some(m) => view.render_message(m),
+                        Some(m) => view.render_message(m, window),
                         None => div().into_any_element(),
                     }
                 })
@@ -537,12 +791,23 @@ impl Render for MainView {
         div()
             .size_full()
             .flex()
+            .flex_col()
             .font_family(FONT_FAMILY)
             .text_size(px(FONT_SIZE))
             .bg(c(p.window_bg))
             .text_color(c(p.window_fg))
-            .track_focus(&self.focus)
-            .child(left)
-            .child(right)
+            .child(self.render_title_bar(window))
+            // Focus tracking stays below the title bar: a focusable element swallows mouse
+            // downs (prevent_default), and GPUI then skips the native caption-button
+            // handling (minimize / maximize / close / drag would do nothing).
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .track_focus(&self.focus)
+                    .child(left)
+                    .child(right),
+            )
     }
 }

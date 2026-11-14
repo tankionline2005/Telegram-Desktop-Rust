@@ -15,7 +15,12 @@ use tracing::{error, info};
 #[derive(Debug, Clone)]
 pub enum Command {
     OpenChat(PeerKey),
-    Send { peer: PeerKey, text: String },
+    /// The user scrolled to the top of the open chat: load older messages.
+    LoadOlder(PeerKey),
+    Send {
+        peer: PeerKey,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +29,8 @@ pub enum Update {
     History {
         peer: PeerKey,
         messages: Vec<MessageItem>,
+        /// The first message of the chat is loaded: nothing older to ask for.
+        complete: bool,
     },
     /// Connection state for the header ("Connecting…"), empty when online.
     Status(String),
@@ -46,6 +53,7 @@ pub struct DialogItem {
 
 #[derive(Debug, Clone)]
 pub struct MessageItem {
+    pub id: i32,
     pub out: bool,
     pub text: String,
     pub time: String,
@@ -140,6 +148,7 @@ fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec
                     (name, color_index(from.id))
                 });
             MessageItem {
+                id: m.id,
                 out: m.out,
                 text: m.text.clone(),
                 time: Local
@@ -199,12 +208,14 @@ fn send_dialogs(store: &Storage, tx: &mpsc::UnboundedSender<Update>) -> anyhow::
 fn send_history(
     store: &Storage,
     peer: PeerKey,
+    count: usize,
     tx: &mpsc::UnboundedSender<Update>,
 ) -> anyhow::Result<()> {
-    let h = store.history(peer, HISTORY)?;
+    let h = store.history(peer, count)?;
     let _ = tx.send(Update::History {
         peer,
         messages: message_items(store, peer, &h.messages),
+        complete: h.complete,
     });
     Ok(())
 }
@@ -254,6 +265,8 @@ async fn run(
 
     // 3. Commands and live updates.
     let mut open: Option<PeerKey> = None;
+    // How many messages of the open chat are shown (grows as the user scrolls up).
+    let mut count = HISTORY;
     loop {
         tokio::select! {
             cmd = commands.recv() => {
@@ -261,19 +274,29 @@ async fn run(
                 match cmd {
                     Command::OpenChat(peer) => {
                         open = Some(peer);
-                        send_history(sync.store(), peer, &tx)?;
-                        match sync.history(peer, HISTORY).await {
-                            Ok(_) => send_history(sync.store(), peer, &tx)?,
+                        count = HISTORY;
+                        send_history(sync.store(), peer, count, &tx)?;
+                        match sync.history(peer, count).await {
+                            Ok(_) => send_history(sync.store(), peer, count, &tx)?,
                             Err(e) => error!("history: {e}"),
                         }
                         send_dialogs(sync.store(), &tx)?;
+                    }
+                    Command::LoadOlder(peer) => {
+                        if open == Some(peer) {
+                            count += HISTORY;
+                            if let Err(e) = sync.history(peer, count).await {
+                                error!("history: {e}");
+                            }
+                            send_history(sync.store(), peer, count, &tx)?;
+                        }
                     }
                     Command::Send { peer, text } => {
                         match sync.send_text(peer, &text).await {
                             Ok(_) => {
                                 send_dialogs(sync.store(), &tx)?;
                                 if open == Some(peer) {
-                                    send_history(sync.store(), peer, &tx)?;
+                                    send_history(sync.store(), peer, count, &tx)?;
                                 }
                             }
                             Err(e) => {
@@ -292,7 +315,7 @@ async fn run(
                         let touched = applied.new_messages.iter().any(|m| m.peer == peer)
                             || applied.edited + applied.deleted > 0;
                         if touched {
-                            send_history(sync.store(), peer, &tx)?;
+                            send_history(sync.store(), peer, count, &tx)?;
                         }
                     }
                     save(&client);
@@ -359,37 +382,60 @@ pub fn start_demo() -> (
                 true,
                 "Taken straight from tdesktop's palette, day and night.",
             ),
+            (false, "https://example.com/very/long/link/without/any/spaces?utm_source=demo&utm_medium=social&utm_content=link_in_bio&fbclid=PAZnRzaAVi_zNleHRuA2FlbQIxMQBwZG9mAmZkaWQWUSFgPoFLDSR14gI_z30rz-irR2s_T3NydGMGYXBwX2lkDzEyNDAyNDU3NDI4NzQxNAABp"),
+            (true, "A long paragraph to check wrapping: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur."),
+            (false, "0101001101001101010110000100101101001001010011100101001101010000010000010100001101000101010100001001001100010101010100111001010100"),
             (false, "See you tomorrow at 10!"),
         ]
         .into_iter()
         .enumerate()
         .map(|(i, (out, text))| MessageItem {
+            id: 1000 + i as i32,
             out,
             text: text.to_string(),
             time: format!("10:{:02}", i * 3),
             sender: None,
         })
         .collect();
+        // Older demo messages appear 20 at a time when the user scrolls up.
+        let mut older_left = 60;
+        let mut next_id = 2000;
         while let Some(cmd) = cmd_rx.blocking_recv() {
             match cmd {
-                Command::OpenChat(peer) => {
-                    let _ = up_tx.send(Update::History {
-                        peer,
-                        messages: history.clone(),
-                    });
+                Command::OpenChat(_) => {}
+                Command::LoadOlder(_) if older_left > 0 => {
+                    let first = history.first().map_or(1000, |m| m.id);
+                    let page: Vec<MessageItem> = (1..=20)
+                        .rev()
+                        .map(|k| MessageItem {
+                            id: first - k,
+                            out: k % 3 == 0,
+                            text: format!("Older message #{}", older_left - 20 + k),
+                            time: "09:00".into(),
+                            sender: None,
+                        })
+                        .collect();
+                    older_left -= 20;
+                    history.splice(0..0, page);
                 }
-                Command::Send { peer, text } => {
+                Command::LoadOlder(_) => {}
+                Command::Send { text, .. } => {
+                    next_id += 1;
                     history.push(MessageItem {
+                        id: next_id,
                         out: true,
                         text,
                         time: "now".into(),
                         sender: None,
                     });
-                    let _ = up_tx.send(Update::History {
-                        peer,
-                        messages: history.clone(),
-                    });
                 }
+            }
+            for i in 0..8 {
+                let _ = up_tx.send(Update::History {
+                    peer: PeerKey::user(i + 1),
+                    messages: history.clone(),
+                    complete: older_left == 0,
+                });
             }
         }
     });

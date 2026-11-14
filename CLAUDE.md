@@ -25,8 +25,14 @@
   `RUSTFLAGS=-D warnings` locally changes every dependency's fingerprint and rebuilds
   GPUI (tens of minutes).
 - UI checks: run the app with `--demo [--light|--dark] [--open=N]` (fake chats) and
-  capture only its window with a `PrintWindow` script; never screenshot the real mode
-  (the user's chats).
+  capture only its window (bring it to front, copy its rect; `PrintWindow` renders the
+  custom-frame window wrongly); never screenshot the real mode (the user's chats).
+- Give the user the path of the built exe (`target/release/unofficial-telegram-desktop-rust.exe`)
+  after each build: they test it directly instead of rebuilding.
+- Never put `track_focus` on an ancestor of the title bar: focusable elements
+  prevent_default mouse downs and GPUI then skips the native caption buttons.
+- GPUI 0.2.2 measures wrapped text at a different width than it paints it: message
+  bubbles get an explicit width from `text_width` (see `render_message`).
 - GPUI 0.2.2 never truncates `nowrap` text (stale measure cache); use `ui::one_line`.
 - Live checks against Telegram use the user's session in `data/` (git-ignored):
   `tdr me`, `tdr selftest reconnect|unknown-key|dc N`. Run cargo with
