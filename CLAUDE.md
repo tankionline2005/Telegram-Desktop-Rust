@@ -27,6 +27,14 @@
 - UI checks: run the app with `--demo [--light|--dark] [--open=N]` (fake chats) and
   capture only its window (bring it to front, copy its rect; `PrintWindow` renders the
   custom-frame window wrongly); never screenshot the real mode (the user's chats).
+  Synthetic mouse/keyboard input (SendKeys, mouse_event) is allowed for demo checks,
+  but before every input action verify that the foreground window belongs to the demo
+  process (`GetForegroundWindow` + `GetWindowThreadProcessId`) and abort otherwise:
+  `SetForegroundWindow` can silently fail, and the input then lands in the user's own
+  window (once it typed into the user's real Telegram client). Maximize the window for
+  tests.
+- GPUI 0.2.2 applies `hover(...)` styles at paint time, after text is shaped, so a
+  hover `text_color` never shows; track the hover with `on_hover` instead.
 - Give the user the path of the built exe (`target/release/unofficial-telegram-desktop-rust.exe`)
   after each build: they test it directly instead of rebuilding.
 - Never put `track_focus` on an ancestor of the title bar: focusable elements

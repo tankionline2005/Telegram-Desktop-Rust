@@ -5657,6 +5657,8 @@ dependencies = [
  "chrono",
  "embed-resource",
  "gpui",
+ "image",
+ "smallvec",
  "tdr-api",
  "tdr-data",
  "tdr-theme",

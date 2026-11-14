@@ -49,16 +49,31 @@ pub struct DialogItem {
     pub unread: i32,
     pub pinned: bool,
     pub is_channel: bool,
+    /// The chat with yourself: "Saved Messages" with the bookmark userpic.
+    pub is_saved: bool,
+    /// A basic group or supergroup (sender names and avatars in the feed).
+    pub is_group: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MessageItem {
     pub id: i32,
     pub out: bool,
     pub text: String,
     pub time: String,
+    /// Unix time, for grouping consecutive messages of one author.
+    pub date: i32,
     /// Sender name and color in groups (incoming messages only).
     pub sender: Option<(String, u8)>,
+    pub author: Author,
+}
+
+/// Who wrote a message: for the userpic next to it and for grouping.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Author {
+    pub key: Option<PeerKey>,
+    pub initials: String,
+    pub color: u8,
 }
 
 /// tdesktop's peer color for an id (`Data::DecideColorIndex`: `id % 7`).
@@ -93,7 +108,7 @@ fn time_label(date: i32) -> String {
     }
 }
 
-fn dialog_item(d: &DialogView) -> DialogItem {
+fn dialog_item(d: &DialogView, self_id: i64) -> DialogItem {
     let name = d
         .peer
         .as_ref()
@@ -118,6 +133,10 @@ fn dialog_item(d: &DialogView) -> DialogItem {
         pinned: d.dialog.pinned,
         is_channel: d.dialog.peer.kind == PeerKind::Channel
             && !d.peer.as_ref().is_some_and(|p| p.is_megagroup),
+        is_saved: d.dialog.peer == PeerKey::user(self_id),
+        is_group: d.dialog.peer.kind == PeerKind::Chat
+            || (d.dialog.peer.kind == PeerKind::Channel
+                && d.peer.as_ref().is_some_and(|p| p.is_megagroup)),
     }
 }
 
@@ -131,6 +150,7 @@ fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec
             .is_some_and(|p| p.is_megagroup),
         PeerKind::User => false,
     };
+    let self_id = store.meta_i64("self_id").ok().flatten().unwrap_or(0);
     // Oldest first for display.
     messages
         .iter()
@@ -147,9 +167,24 @@ fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec
                         .map_or_else(|| "…".into(), |p| p.name);
                     (name, color_index(from.id))
                 });
+            let key = if m.out {
+                Some(PeerKey::user(self_id))
+            } else {
+                m.from.or(Some(peer))
+            };
+            let name = key
+                .and_then(|k| store.peer(k).ok().flatten())
+                .map_or_else(String::new, |p| p.name);
+            let author = Author {
+                key,
+                initials: initials(&name),
+                color: key.map_or(0, |k| color_index(k.id)),
+            };
             MessageItem {
                 id: m.id,
                 out: m.out,
+                date: m.date,
+                author,
                 text: m.text.clone(),
                 time: Local
                     .timestamp_opt(m.date as i64, 0)
@@ -201,7 +236,18 @@ pub fn start(
 
 fn send_dialogs(store: &Storage, tx: &mpsc::UnboundedSender<Update>) -> anyhow::Result<()> {
     let list = store.dialogs(0, DIALOGS)?;
-    let _ = tx.send(Update::Dialogs(list.iter().map(dialog_item).collect()));
+    let self_id = store.meta_i64("self_id")?.unwrap_or(0);
+    let items = list
+        .iter()
+        .map(|d| {
+            let mut item = dialog_item(d, self_id);
+            if item.is_saved {
+                item.name = "Saved Messages".into();
+            }
+            item
+        })
+        .collect();
+    let _ = tx.send(Update::Dialogs(items));
     Ok(())
 }
 
@@ -327,6 +373,22 @@ async fn run(
     Ok(())
 }
 
+fn demo_author(out: bool) -> Author {
+    if out {
+        Author {
+            key: Some(PeerKey::user(103)),
+            initials: "ME".into(),
+            color: color_index(103),
+        }
+    } else {
+        Author {
+            key: Some(PeerKey::user(2)),
+            initials: "BO".into(),
+            color: color_index(2),
+        }
+    }
+}
+
 /// Fake chats for screenshots and UI work without an account (`--demo`).
 pub fn start_demo() -> (
     mpsc::UnboundedSender<Command>,
@@ -367,11 +429,16 @@ pub fn start_demo() -> (
             unread: *unread,
             pinned: *pinned,
             is_channel: false,
+            is_saved: *name == "Saved Messages",
+            is_group: *name == "Rust Developers"
+                || *name == "Weekend Hiking"
+                || *name == "Design Team",
         })
         .collect();
     let _ = up_tx.send(Update::Dialogs(dialogs));
     std::thread::spawn(move || {
         let mut history: Vec<MessageItem> = [
+            (false, "Hey there"),
             (false, "Hi! Did you try the new client?"),
             (
                 true,
@@ -394,7 +461,9 @@ pub fn start_demo() -> (
             out,
             text: text.to_string(),
             time: format!("10:{:02}", i * 3),
+            date: 1_700_000_000 + i as i32 * 60,
             sender: None,
+            author: demo_author(out),
         })
         .collect();
         // Older demo messages appear 20 at a time when the user scrolls up.
@@ -412,7 +481,9 @@ pub fn start_demo() -> (
                             out: k % 3 == 0,
                             text: format!("Older message #{}", older_left - 20 + k),
                             time: "09:00".into(),
+                            date: 1_699_990_000 - k * 60,
                             sender: None,
+                            author: demo_author(k % 3 == 0),
                         })
                         .collect();
                     older_left -= 20;
@@ -426,14 +497,23 @@ pub fn start_demo() -> (
                         out: true,
                         text,
                         time: "now".into(),
+                        date: 1_800_000_000,
                         sender: None,
+                        author: demo_author(true),
                     });
                 }
             }
             for i in 0..8 {
+                let mut messages = history.clone();
+                // Groups (Rust Developers, Weekend Hiking, Design Team) show sender names.
+                if matches!(i + 1, 2 | 6 | 8) {
+                    for m in messages.iter_mut().filter(|m| !m.out) {
+                        m.sender = Some(("Bob Smith".into(), m.author.color));
+                    }
+                }
                 let _ = up_tx.send(Update::History {
                     peer: PeerKey::user(i + 1),
-                    messages: history.clone(),
+                    messages,
                     complete: older_left == 0,
                 });
             }

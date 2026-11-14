@@ -22,6 +22,8 @@ anyhow = "1.0.104"
 tracing = "0.1.44"
 unicode-segmentation = "1.13.3"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+smallvec = "1"
 
 [lints]
 workspace = true
