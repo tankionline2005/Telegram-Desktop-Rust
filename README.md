@@ -5,8 +5,8 @@
 разбор протокола без лишних копирований, многопоточная обработка данных и мгновенный
 старт из локального кэша.
 
-> **Статус:** этап 1 (протокол) завершён. Графического интерфейса пока нет; есть
-> консольный клиент `tdr` для проверки сетевого стека.
+> **Статус:** этап 1 (протокол) завершён, этап 2 (данные) в работе. Графического
+> интерфейса пока нет; есть консольный клиент `tdr` для проверки стека.
 > Это неофициальный проект, он не связан с Telegram FZ-LLC и работает через
 > [Telegram API](https://core.telegram.org/api).
 
@@ -40,7 +40,8 @@ cargo run --release -p tdr-cli -- ping         # подключение и за�
 cargo run --release -p tdr-cli -- login        # вход по QR-коду
 cargo run --release -p tdr-cli -- login phone  # вход по номеру телефона
 cargo run --release -p tdr-cli -- me           # аккаунт и время запуска
-cargo run --release -p tdr-cli -- dialogs 30   # список чатов
+cargo run --release -p tdr-cli -- dialogs 30   # список чатов: из кэша, затем синхронизация
+cargo run --release -p tdr-cli -- watch        # новые сообщения в реальном времени
 cargo run --release -p tdr-cli -- avatar       # скачать свою аватарку
 ```
 
@@ -56,8 +57,9 @@ cargo run --release -p tdr-cli -- avatar       # скачать свою ава�
 cargo run --release --manifest-path "C:\путь\к\проекту\Cargo.toml" -p tdr-cli -- me
 ```
 
-Сессия хранится в `data/session.bin` (не попадает в git). Это полный доступ к аккаунту:
-файл никому не передавайте.
+Сессия хранится в `data/session.bin`, кэш чатов — в `data/cache.sqlite`; оба не попадают
+в git. Сессия — это полный доступ к аккаунту, а кэш содержит тексты сообщений и пока
+не зашифрован: эти файлы никому не передавайте.
 
 ### Профили сборки
 
@@ -80,6 +82,9 @@ crates/tl/          типы Telegram API (генерируются при сб�
 crates/crypto/      криптография MTProto 2.0
 crates/mtproto/     транспорт, ключи, сессии, переподключение
 crates/api/         ядро клиента: несколько DC, PFS, миграции, сохранение сессии
+crates/updates/     движок обновлений: порядок, пропуски, getDifference
+crates/storage/     локальный кэш на SQLite
+crates/data/        синхронизация кэша с сервером
 crates/cli/         консольный клиент `tdr`
 xtask/              автоматизация (отслеживание upstream)
 schema/             TL-схемы, скопированные из tdesktop (не править руками)

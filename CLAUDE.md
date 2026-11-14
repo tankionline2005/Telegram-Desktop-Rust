@@ -15,6 +15,12 @@
   `dist` (`--profile dist`) is the shipping build with fat LTO. Keep generic code thin:
   e.g. `tdr_api::Client::invoke<R>` only (de)serializes and calls the non-generic
   `invoke_raw`, so per-request-type monomorphization stays small.
+- `tdr-updates` is a pure state machine (no I/O): keep it that way and test it there;
+  network and storage glue lives in `tdr-data`. Its test checks that every sequenced
+  `Update` in the schema is classified — extend `classify` when a new layer adds one.
+- Cache rows store our own columns plus the TL blob tagged with its layer, so schema
+  updates never break the cache. Don't print cached message texts or chat names in
+  tool output: they are the user's private data.
 - Live checks against Telegram use the user's session in `data/` (git-ignored):
   `tdr me`, `tdr selftest reconnect|unknown-key|dc N`. Run cargo with
   `--manifest-path` if the shell cannot `cd` into the bracketed folder.

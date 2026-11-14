@@ -12,6 +12,8 @@ use anyhow::{Context, Result, bail};
 use qrcode::QrCode;
 use qrcode::render::unicode;
 use tdr_api::{Client, Config, Error, SessionData};
+use tdr_data::tdr_storage::{DialogView, MessageRow, PeerKind, Storage};
+use tdr_data::{Applied, Sync};
 use tdr_tl::{enums, functions, types};
 
 const USAGE: &str = "\
@@ -20,7 +22,8 @@ usage:
   tdr login           log in by scanning a QR code (Settings → Devices → Link Desktop Device)
   tdr login phone     log in with a phone number and a code
   tdr me              show the logged-in account (with connection timings)
-  tdr dialogs [N]     list the first N chats (default 20)
+  tdr dialogs [N]     the first N chats: instantly from the cache, then synced (default 20)
+  tdr watch [SECS]    print new messages as they arrive (Ctrl+C to stop)
   tdr avatar          download your profile photo to data/avatar.jpg
   tdr logout          log out and delete the local session
 
@@ -92,6 +95,8 @@ async fn main() -> Result<()> {
         ["me"] => me().await,
         ["dialogs"] => dialogs(20).await,
         ["dialogs", n] => dialogs(n.parse().context("N must be a number")?).await,
+        ["watch"] => watch(None).await,
+        ["watch", secs] => watch(Some(secs.parse().context("seconds must be a number")?)).await,
         ["avatar"] => avatar().await,
         ["logout"] => logout().await,
         ["selftest", "reconnect"] => selftest_reconnect().await,
@@ -412,71 +417,149 @@ async fn me() -> Result<()> {
     Ok(())
 }
 
-async fn dialogs(limit: i32) -> Result<()> {
-    let client = logged_in()?;
-    let t = Instant::now();
-    let result = client
-        .invoke(&functions::messages::GetDialogs {
-            exclude_pinned: false,
-            folder_id: None,
-            offset_date: 0,
-            offset_id: 0,
-            offset_peer: enums::InputPeer::Empty,
-            limit,
-            hash: 0,
-        })
-        .await?;
-    let elapsed = t.elapsed();
-    save_session(&client)?;
-    let (dialogs, chats, users) = match result {
-        enums::messages::Dialogs::Dialogs(d) => (d.dialogs, d.chats, d.users),
-        enums::messages::Dialogs::Slice(d) => (d.dialogs, d.chats, d.users),
-        enums::messages::Dialogs::NotModified(_) => (vec![], vec![], vec![]),
-    };
-    let user_title = |id: i64| {
-        users.iter().find_map(|u| match u {
-            enums::User::User(x) if x.id == id => Some(user_name(u)),
-            _ => None,
-        })
-    };
-    let chat_title = |id: i64| {
-        chats.iter().find_map(|c| match c {
-            enums::Chat::Chat(x) if x.id == id => Some(x.title.clone()),
-            enums::Chat::Channel(x) if x.id == id => Some(x.title.clone()),
-            enums::Chat::Forbidden(x) if x.id == id => Some(x.title.clone()),
-            enums::Chat::ChannelForbidden(x) if x.id == id => Some(x.title.clone()),
-            _ => None,
-        })
-    };
-    for d in &dialogs {
-        let enums::Dialog::Dialog(d) = d else {
-            continue;
+fn cache_path() -> PathBuf {
+    data_dir().join("cache.sqlite")
+}
+
+fn open_cache() -> Result<Storage> {
+    std::fs::create_dir_all(data_dir())?;
+    Ok(Storage::open(cache_path())?)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    let line = s.lines().next().unwrap_or("");
+    if line.chars().count() > max {
+        format!("{}…", line.chars().take(max).collect::<String>())
+    } else {
+        line.to_string()
+    }
+}
+
+fn print_dialogs(list: &[DialogView]) {
+    for d in list {
+        let kind = match (
+            d.dialog.peer.kind,
+            d.peer.as_ref().is_some_and(|p| p.is_megagroup),
+        ) {
+            (PeerKind::User, _) => "user",
+            (PeerKind::Chat, _) | (PeerKind::Channel, true) => "group",
+            (PeerKind::Channel, false) => "channel",
         };
-        let (kind, title) = match &d.peer {
-            enums::Peer::User(p) => ("user", user_title(p.user_id)),
-            enums::Peer::Chat(p) => ("group", chat_title(p.chat_id)),
-            enums::Peer::Channel(p) => {
-                let megagroup = chats.iter().any(
-                    |c| matches!(c, enums::Chat::Channel(x) if x.id == p.channel_id && x.megagroup),
-                );
-                (
-                    if megagroup { "group" } else { "channel" },
-                    chat_title(p.channel_id),
-                )
-            }
-        };
-        let unread = if d.unread_count > 0 {
-            format!("  [{}]", d.unread_count)
+        let name = d.peer.as_ref().map_or("?", |p| p.name.as_str());
+        let unread = if d.dialog.unread_count > 0 {
+            format!(" [{}]", d.dialog.unread_count)
         } else {
             String::new()
         };
-        println!(
-            "{:<8} {}{unread}",
-            kind,
-            title.unwrap_or_else(|| "?".into())
+        let pin = if d.dialog.pinned { "📌 " } else { "" };
+        let last = d
+            .top
+            .as_ref()
+            .map(|m| truncate(&m.text, 40))
+            .unwrap_or_default();
+        println!("{kind:<8} {pin}{}{unread}  — {last}", truncate(name, 40));
+    }
+}
+
+fn describe(applied: &Applied) -> String {
+    format!(
+        "{} new, {} edited, {} deleted{}",
+        applied.new_messages.len(),
+        applied.edited,
+        applied.deleted,
+        if applied.reloaded {
+            ", chat list (re)loaded"
+        } else {
+            ""
+        }
+    )
+}
+
+async fn dialogs(limit: i32) -> Result<()> {
+    let started = Instant::now();
+    let store = open_cache()?;
+    let cached = store.dialogs(0, limit as usize)?;
+    if !cached.is_empty() {
+        print_dialogs(&cached);
+        eprintln!(
+            "\n{} chats from the cache in {}",
+            cached.len(),
+            ms(started.elapsed())
         );
     }
-    eprintln!("\n{} chats in {}", dialogs.len(), ms(elapsed));
+
+    let client = logged_in()?;
+    let mut sync = Sync::new(client.clone(), store)?;
+    let t = Instant::now();
+    let applied = sync.start().await?;
+    save_session(&client)?;
+    eprintln!(
+        "sync with the server: {} in {}",
+        describe(&applied),
+        ms(t.elapsed())
+    );
+    if cached.is_empty()
+        || applied.reloaded
+        || !applied.new_messages.is_empty()
+        || applied.deleted > 0
+    {
+        let list = sync.store().dialogs(0, limit as usize)?;
+        println!();
+        print_dialogs(&list);
+    }
+    Ok(())
+}
+
+fn sender_name(store: &Storage, m: &MessageRow) -> String {
+    if m.out {
+        return "you".into();
+    }
+    match m.from {
+        Some(from) if from != m.peer => store
+            .peer(from)
+            .ok()
+            .flatten()
+            .map_or_else(|| format!("{from:?}"), |p| p.name),
+        _ => String::new(),
+    }
+}
+
+/// Prints new messages as they arrive. `seconds`: stop after that long (for tests).
+async fn watch(seconds: Option<u64>) -> Result<()> {
+    let client = logged_in()?;
+    let mut sync = Sync::new(client.clone(), open_cache()?)?;
+    let t = Instant::now();
+    let applied = sync.start().await?;
+    save_session(&client)?;
+    eprintln!("caught up: {} in {}", describe(&applied), ms(t.elapsed()));
+    eprintln!("waiting for messages (Ctrl+C to stop)…");
+    let until = seconds.map(|s| Instant::now() + Duration::from_secs(s));
+    loop {
+        if until.is_some_and(|u| Instant::now() >= u) {
+            break;
+        }
+        let applied = tokio::select! {
+            r = sync.next(Duration::from_secs(1)) => r?,
+            _ = tokio::signal::ctrl_c() => break,
+        };
+        for m in &applied.new_messages {
+            let chat = sync
+                .store()
+                .peer(m.peer)?
+                .map_or_else(|| "?".into(), |p| p.name);
+            let from = sender_name(sync.store(), m);
+            let from = if from.is_empty() {
+                String::new()
+            } else {
+                format!("{from}: ")
+            };
+            println!("[{}] {from}{}", truncate(&chat, 30), truncate(&m.text, 80));
+        }
+        if applied.edited + applied.deleted > 0 || applied.reloaded {
+            eprintln!("  ({})", describe(&applied));
+        }
+    }
+    save_session(&client)?;
     Ok(())
 }
 

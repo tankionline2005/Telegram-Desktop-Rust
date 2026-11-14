@@ -399,7 +399,13 @@ impl {rt}::Deserializable for {name} {{\n\
             .iter()
             .map(|c| {
                 let cn = pascal(split_ns(&c.name).1);
-                let stripped = if cn.to_lowercase().starts_with(&tn) {
+                // Strip the type name only at a word boundary: `UpdateShortMessage` in type
+                // `Updates` must not become `hortMessage`.
+                let at_boundary = cn[tn.len().min(cn.len())..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+                let stripped = if cn.to_lowercase().starts_with(&tn) && at_boundary {
                     &cn[tn.len()..]
                 } else {
                     ""
@@ -571,6 +577,23 @@ mod tests {
         // Small primitive-only constructors are inline, big ones boxed.
         assert!(code.contains("    User(crate::types::InputPeerUser),"));
         assert!(code.contains("Box<crate::types::Message>"));
+        // Variant names are stripped at word boundaries only.
+        assert!(code.contains(
+            "    UpdateShortMessage(::std::boxed::Box<crate::types::UpdateShortMessage>),"
+        ));
+        // Variant declarations look like `    Name(::std::boxed::Box<…>),` or `    Name(crate::…),`.
+        let lowercase_variant = code.lines().any(|l| {
+            l.strip_prefix("    ").is_some_and(|v| {
+                v.starts_with(|c: char| c.is_ascii_lowercase())
+                    && (v.contains("(::std::boxed::Box<crate::types")
+                        || v.contains("(crate::types"))
+                    && v.ends_with("),")
+            })
+        });
+        assert!(
+            !lowercase_variant,
+            "a variant name starts with a lowercase letter"
+        );
         // Methods returning Bool are kept.
         assert!(code.contains("pub struct BindTempAuthKey"));
         assert!(code.contains("impl crate::RemoteCall for LogOut"));

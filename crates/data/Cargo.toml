@@ -1,0 +1,19 @@
+[package]
+name = "tdr-data"
+version = "0.1.0"
+description = "Data layer: turns Telegram objects and updates into the local cache and keeps it in sync"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tdr-tl.workspace = true
+tdr-api.workspace = true
+tdr-updates.workspace = true
+tdr-storage.workspace = true
+tokio = { version = "1.54.1", features = ["time", "sync"] }
+tracing = "0.1.44"
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "tdr-updates"
+version = "0.1.0"
+description = "Telegram update handling: pts/qts/seq ordering, gap detection and difference recovery"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tdr-tl.workspace = true
+
+[dev-dependencies]
+tdr-tl-parser.workspace = true
+
+[lints]
+workspace = true

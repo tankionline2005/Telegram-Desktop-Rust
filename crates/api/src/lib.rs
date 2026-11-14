@@ -17,13 +17,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use tdr_mtproto::{Event, KeySpec, PRODUCTION_DCS, RpcError, Sender, TEST_DCS};
+use tdr_mtproto::{KeySpec, PRODUCTION_DCS, RpcError, Sender, TEST_DCS};
 use tdr_tl::{Deserializable, Reader, RemoteCall, Serializable, enums, functions};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tracing::{debug, info};
 
 pub use session::{DcKeys, SessionData, SessionError, TempKey};
-pub use tdr_mtproto::Error;
+pub use tdr_mtproto::{Error, Event};
 
 /// Lifetime of temporary keys, as in tdesktop (`kTemporaryExpiresIn`).
 const TEMP_KEY_LIFETIME: i32 = 24 * 60 * 60;
