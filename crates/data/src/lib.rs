@@ -145,7 +145,13 @@ impl Sync {
             return self.full_load().await;
         }
         let out = self.engine.connection_restored();
-        self.run(out).await
+        let applied = self.run(out).await?;
+        // Channels are not part of the common difference: refresh the top of the chat
+        // list so that channels with new posts move up (tdesktop reloads the whole list).
+        let t = Instant::now();
+        self.load_dialogs(DIALOGS_PAGE as usize).await?;
+        debug!(elapsed = ?t.elapsed(), "chat list refreshed");
+        Ok(applied)
     }
 
     /// Loads the state and the chat list from scratch.
@@ -503,7 +509,96 @@ fn apply_update(
     Ok(())
 }
 
+/// See [`Sync::history`].
+#[derive(Debug)]
+pub struct History {
+    /// Newest first.
+    pub messages: Vec<MessageRow>,
+    /// How many came from the cache without a request.
+    pub from_cache: usize,
+    /// How many were loaded from the server.
+    pub fetched: usize,
+}
+
+const HISTORY_PAGE: usize = 100;
+
 impl Sync {
+    /// The last `limit` messages of a chat: the cached segment first, older messages
+    /// loaded from the server only if the cache does not have enough. For a channel its
+    /// difference is fetched first (as tdesktop does when a channel is opened), since
+    /// channel updates do not come through the common difference.
+    pub async fn history(&mut self, peer: PeerKey, limit: usize) -> Result<History> {
+        if peer.kind == PeerKind::Channel
+            && let Some(pts) = self.engine.channel_pts(peer.id)
+        {
+            let out = Output {
+                items: vec![],
+                actions: vec![Action::GetChannelDifference {
+                    channel_id: peer.id,
+                    pts,
+                }],
+            };
+            self.run(out).await?;
+        }
+        let cached = self.store.history(peer, limit)?;
+        let from_cache = cached.messages.len();
+        let mut fetched = 0;
+        let mut have = cached.messages.len();
+        let mut offset = cached.cached_from.unwrap_or(0);
+        let mut complete = cached.complete;
+        while have < limit && !complete {
+            let access_hash = self.store.access_hash(peer)?;
+            let Some(input) = convert::input_peer(peer, access_hash) else {
+                break;
+            };
+            let page = (limit - have).min(HISTORY_PAGE);
+            let answer = self
+                .client
+                .invoke(&functions::messages::GetHistory {
+                    peer: input,
+                    offset_id: offset,
+                    offset_date: 0,
+                    add_offset: 0,
+                    limit: page as i32,
+                    max_id: 0,
+                    min_id: 0,
+                    hash: 0,
+                })
+                .await?;
+            let (messages, chats, users) = match answer {
+                enums::messages::Messages::Messages(m) => (m.messages, m.chats, m.users),
+                enums::messages::Messages::Slice(m) => (m.messages, m.chats, m.users),
+                enums::messages::Messages::ChannelMessages(m) => (m.messages, m.chats, m.users),
+                enums::messages::Messages::NotModified(_) => break,
+            };
+            let rows: Vec<MessageRow> = messages.iter().filter_map(convert::message_row).collect();
+            let peers: Vec<_> = users
+                .iter()
+                .filter_map(convert::user_row)
+                .chain(chats.iter().filter_map(convert::chat_row))
+                .collect();
+            self.store.write(|w| {
+                for p in &peers {
+                    w.put_peer(p)?;
+                }
+                w.extend_history(peer, offset, page, &rows)
+            })?;
+            fetched += rows.len();
+            have += rows.len();
+            complete = rows.len() < page;
+            match rows.iter().map(|m| m.id).min() {
+                Some(oldest) => offset = oldest,
+                None => break,
+            }
+        }
+        let messages = self.store.history(peer, limit)?.messages;
+        Ok(History {
+            messages,
+            from_cache,
+            fetched,
+        })
+    }
+
     /// Reloads the chat list if a `differenceTooLong` made it stale.
     pub async fn reload_if_stale(&mut self) -> Result<bool> {
         if self.store.meta_i64("dialogs_stale")? != Some(1) {

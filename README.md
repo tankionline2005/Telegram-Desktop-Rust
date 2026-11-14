@@ -41,7 +41,9 @@ cargo run --release -p tdr-cli -- login        # вход по QR-коду
 cargo run --release -p tdr-cli -- login phone  # вход по номеру телефона
 cargo run --release -p tdr-cli -- me           # аккаунт и время запуска
 cargo run --release -p tdr-cli -- dialogs 30   # список чатов: из кэша, затем синхронизация
+cargo run --release -p tdr-cli -- history 3 50 # 50 последних сообщений чата №3 из списка
 cargo run --release -p tdr-cli -- watch        # новые сообщения в реальном времени
+cargo run --release -p tdr-cli -- files        # размер файлового кэша (`files clear` — очистить)
 cargo run --release -p tdr-cli -- avatar       # скачать свою аватарку
 ```
 
@@ -57,7 +59,8 @@ cargo run --release -p tdr-cli -- avatar       # скачать свою ава�
 cargo run --release --manifest-path "C:\путь\к\проекту\Cargo.toml" -p tdr-cli -- me
 ```
 
-Сессия хранится в `data/session.bin`, кэш чатов — в `data/cache.sqlite`; оба не попадают
+Сессия хранится в `data/session.bin`, кэш чатов — в `data/cache.sqlite`, файлы — в
+`data/files/`; всё это не попадает
 в git. Сессия — это полный доступ к аккаунту, а кэш содержит тексты сообщений и пока
 не зашифрован: эти файлы никому не передавайте.
 

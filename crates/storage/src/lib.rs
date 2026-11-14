@@ -12,16 +12,19 @@
 //! Writes go through [`Storage::write`], one transaction per batch, together with the
 //! update state they correspond to.
 
+pub mod files;
+
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+pub use files::{FileCache, FileCacheConfig, FileCacheStats};
 pub use rusqlite::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Schema version (`PRAGMA user_version`); bump with a migration in [`migrate`].
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PeerKind {
@@ -113,6 +116,17 @@ pub struct DialogView {
     pub top: Option<MessageRow>,
 }
 
+/// See [`Storage::history`].
+#[derive(Debug, Clone)]
+pub struct CachedHistory {
+    /// Newest first.
+    pub messages: Vec<MessageRow>,
+    /// The oldest id of the contiguous cached segment (`None`: nothing cached).
+    pub cached_from: Option<i32>,
+    /// The segment reaches the first message of the chat.
+    pub complete: bool,
+}
+
 /// The common update state, see `tdr_updates::State`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UpdateState {
@@ -132,6 +146,26 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         return Ok(());
     }
     let tx = conn.transaction()?;
+    if version < 1 {
+        create_v1(&tx)?;
+    }
+    if version < 2 {
+        // The cached part of each chat's history: all messages with ids in
+        // [cached_from, top_message] are present.
+        tx.execute_batch(
+            "ALTER TABLE dialogs ADD COLUMN cached_from INTEGER;
+             ALTER TABLE dialogs ADD COLUMN history_complete INTEGER NOT NULL DEFAULT 0;
+             -- Chat-list loads always stored the top message: it starts the segment.
+             UPDATE dialogs SET cached_from = top_message
+             WHERE EXISTS (SELECT 1 FROM messages m
+                           WHERE m.kind = dialogs.kind AND m.peer_id = dialogs.id AND m.id = dialogs.top_message);",
+        )?;
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()
+}
+
+fn create_v1(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS meta (
@@ -184,9 +218,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             pts INTEGER NOT NULL
         );
         ",
-    )?;
-    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    tx.commit()
+    )
 }
 
 impl Storage {
@@ -272,6 +304,51 @@ impl Storage {
     pub fn dialog_count(&self) -> Result<i64> {
         self.conn
             .query_row("SELECT COUNT(*) FROM dialogs", [], |r| r.get(0))
+    }
+
+    /// The cached history segment of a chat: up to `limit` newest messages known to be
+    /// contiguous, newest first, and whether the segment reaches the start of the chat.
+    pub fn history(&self, peer: PeerKey, limit: usize) -> Result<CachedHistory> {
+        let seg: Option<(i32, Option<i32>, bool)> = self
+            .conn
+            .prepare_cached(
+                "SELECT top_message, cached_from, history_complete FROM dialogs WHERE kind = ?1 AND id = ?2",
+            )?
+            .query_row(params![peer.kind as i64, peer.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?;
+        let Some((top, Some(from), complete)) = seg else {
+            return Ok(CachedHistory {
+                messages: vec![],
+                cached_from: None,
+                complete: false,
+            });
+        };
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, date, from_kind, from_id, out, text, raw_layer, raw FROM messages
+             WHERE kind = ?1 AND peer_id = ?2 AND id BETWEEN ?3 AND ?4
+             ORDER BY id DESC LIMIT ?5",
+        )?;
+        let messages = stmt
+            .query_map(
+                params![peer.kind as i64, peer.id, from, top, limit as i64],
+                |r| {
+                    Ok(MessageRow {
+                        peer,
+                        id: r.get(0)?,
+                        date: r.get(1)?,
+                        from: peer_key(r.get(2)?, r.get(3)?),
+                        out: r.get(4)?,
+                        text: r.get(5)?,
+                        raw: raw(r.get(6)?, r.get(7)?),
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(CachedHistory {
+            messages,
+            cached_from: Some(from),
+            complete,
+        })
     }
 
     /// The chat list of `folder_id` (0 = main), pinned first, then by last message.
@@ -472,11 +549,25 @@ impl Writer<'_> {
         Ok(())
     }
 
+    /// Inserts or refreshes a chat-list entry (from `messages.getDialogs`). Its top
+    /// message must be stored too. If the top message changed without us seeing the
+    /// messages in between, the cached history segment restarts at the new top.
     pub fn put_dialog(&self, d: &DialogRow) -> Result<()> {
         self.tx
             .prepare_cached(
-                "INSERT OR REPLACE INTO dialogs (kind, id, top_message, top_date, pinned, folder_id, unread_count, pts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO dialogs (kind, id, top_message, top_date, pinned, folder_id, unread_count, pts, cached_from)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?3)
+                 ON CONFLICT (kind, id) DO UPDATE SET
+                    cached_from      = CASE WHEN dialogs.top_message = excluded.top_message
+                                            THEN dialogs.cached_from ELSE excluded.top_message END,
+                    history_complete = CASE WHEN dialogs.top_message = excluded.top_message
+                                            THEN dialogs.history_complete ELSE 0 END,
+                    top_message      = excluded.top_message,
+                    top_date         = excluded.top_date,
+                    pinned           = excluded.pinned,
+                    folder_id        = excluded.folder_id,
+                    unread_count     = excluded.unread_count,
+                    pts              = excluded.pts",
             )?
             .execute(params![
                 d.peer.kind as i64,
@@ -496,8 +587,8 @@ impl Writer<'_> {
     pub fn message_arrived(&self, m: &MessageRow) -> Result<()> {
         self.tx
             .prepare_cached(
-                "INSERT INTO dialogs (kind, id, top_message, top_date, pinned, folder_id, unread_count, pts)
-                 VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, NULL)
+                "INSERT INTO dialogs (kind, id, top_message, top_date, pinned, folder_id, unread_count, pts, cached_from)
+                 VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, NULL, ?3)
                  ON CONFLICT (kind, id) DO UPDATE SET
                     top_message  = MAX(dialogs.top_message, excluded.top_message),
                     top_date     = MAX(dialogs.top_date, excluded.top_date),
@@ -517,6 +608,47 @@ impl Writer<'_> {
     /// Forgets the chat list (before reloading it after `differenceTooLong`).
     pub fn clear_dialogs(&self) -> Result<()> {
         self.tx.execute("DELETE FROM dialogs", [])?;
+        Ok(())
+    }
+
+    /// Stores older messages loaded with `offset_id` (newest first, as the server
+    /// returns them). If they continue the cached segment, the segment grows down to
+    /// the oldest of them; fewer than `limit` messages means the start of the chat.
+    pub fn extend_history(
+        &self,
+        peer: PeerKey,
+        offset_id: i32,
+        limit: usize,
+        rows: &[MessageRow],
+    ) -> Result<()> {
+        for m in rows {
+            self.put_message(m)?;
+        }
+        let Some(oldest) = rows.iter().map(|m| m.id).min() else {
+            if offset_id != 0 {
+                self.mark_complete(peer, offset_id)?;
+            }
+            return Ok(());
+        };
+        self.tx
+            .prepare_cached(
+                "UPDATE dialogs SET cached_from = ?4
+                 WHERE kind = ?1 AND id = ?2 AND (cached_from = ?3 OR (?3 = 0 AND cached_from IS NULL))",
+            )?
+            .execute(params![peer.kind as i64, peer.id, offset_id, oldest])?;
+        if rows.len() < limit {
+            self.mark_complete(peer, oldest)?;
+        }
+        Ok(())
+    }
+
+    fn mark_complete(&self, peer: PeerKey, cached_from: i32) -> Result<()> {
+        self.tx
+            .prepare_cached(
+                "UPDATE dialogs SET history_complete = 1
+                 WHERE kind = ?1 AND id = ?2 AND cached_from = ?3",
+            )?
+            .execute(params![peer.kind as i64, peer.id, cached_from])?;
         Ok(())
     }
 }
@@ -639,6 +771,95 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1, "the channel message with the same id survives");
+    }
+
+    #[test]
+    fn history_segment_grows_and_restarts() {
+        let mut s = Storage::open_in_memory().unwrap();
+        let a = PeerKey::user(1);
+        let dialog = |top: i32| DialogRow {
+            peer: a,
+            top_message: top,
+            top_date: top,
+            pinned: false,
+            folder_id: 0,
+            unread_count: 0,
+            pts: None,
+        };
+        // Chat list load: only the top message is known.
+        s.write(|w| {
+            w.put_message(&msg(a, 100, 100, false, "top"))?;
+            w.put_dialog(&dialog(100))
+        })
+        .unwrap();
+        let h = s.history(a, 10).unwrap();
+        assert_eq!(
+            (h.messages.len(), h.cached_from, h.complete),
+            (1, Some(100), false)
+        );
+
+        // Older messages loaded below the segment extend it.
+        let older: Vec<_> = (90..100)
+            .rev()
+            .map(|id| msg(a, id, id, false, "old"))
+            .collect();
+        s.write(|w| w.extend_history(a, 100, 10, &older)).unwrap();
+        assert_eq!(s.history(a, 50).unwrap().messages.len(), 11);
+
+        // A live message (in order) keeps the segment contiguous.
+        s.write(|w| {
+            let m = msg(a, 101, 101, false, "new");
+            w.put_message(&m)?;
+            w.message_arrived(&m)
+        })
+        .unwrap();
+        let h = s.history(a, 50).unwrap();
+        assert_eq!(
+            (h.messages.len(), h.messages[0].id, h.cached_from),
+            (12, 101, Some(90))
+        );
+
+        // A short page means the start of the chat.
+        s.write(|w| w.extend_history(a, 90, 10, &[msg(a, 50, 50, false, "first")]))
+            .unwrap();
+        let h = s.history(a, 50).unwrap();
+        assert!(h.complete);
+        assert_eq!(h.cached_from, Some(50));
+
+        // The chat list says the top moved without us seeing it: the segment restarts.
+        s.write(|w| {
+            w.put_message(&msg(a, 200, 200, false, "jump"))?;
+            w.put_dialog(&dialog(200))
+        })
+        .unwrap();
+        let h = s.history(a, 50).unwrap();
+        assert_eq!(
+            (h.messages.len(), h.cached_from, h.complete),
+            (1, Some(200), false)
+        );
+
+        // Refreshing with the same top keeps the segment.
+        s.write(|w| w.extend_history(a, 200, 10, &older)).unwrap();
+        s.write(|w| w.put_dialog(&dialog(200))).unwrap();
+        assert_eq!(s.history(a, 50).unwrap().cached_from, Some(90));
+    }
+
+    #[test]
+    fn migrates_from_v1() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            create_v1(&tx).unwrap();
+            tx.pragma_update(None, "user_version", 1).unwrap();
+            tx.commit().unwrap();
+        }
+        let s = Storage::init(conn).unwrap();
+        let v: i32 = s
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(s.history(PeerKey::user(1), 5).unwrap().cached_from, None);
     }
 
     #[test]

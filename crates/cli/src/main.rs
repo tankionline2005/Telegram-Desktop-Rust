@@ -12,7 +12,9 @@ use anyhow::{Context, Result, bail};
 use qrcode::QrCode;
 use qrcode::render::unicode;
 use tdr_api::{Client, Config, Error, SessionData};
-use tdr_data::tdr_storage::{DialogView, MessageRow, PeerKind, Storage};
+use tdr_data::tdr_storage::{
+    DialogView, FileCache, FileCacheConfig, MessageRow, PeerKind, Storage,
+};
 use tdr_data::{Applied, Sync};
 use tdr_tl::{enums, functions, types};
 
@@ -23,6 +25,8 @@ usage:
   tdr login phone     log in with a phone number and a code
   tdr me              show the logged-in account (with connection timings)
   tdr dialogs [N]     the first N chats: instantly from the cache, then synced (default 20)
+  tdr history I [N]   the last N messages (default 30) of chat number I from `tdr dialogs`
+  tdr files [clear]   size of the file cache, or clear it
   tdr watch [SECS]    print new messages as they arrive (Ctrl+C to stop)
   tdr avatar          download your profile photo to data/avatar.jpg
   tdr logout          log out and delete the local session
@@ -95,6 +99,16 @@ async fn main() -> Result<()> {
         ["me"] => me().await,
         ["dialogs"] => dialogs(20).await,
         ["dialogs", n] => dialogs(n.parse().context("N must be a number")?).await,
+        ["history", n] => history(n.parse().context("chat number")?, 30).await,
+        ["history", n, count] => {
+            history(
+                n.parse().context("chat number")?,
+                count.parse().context("count")?,
+            )
+            .await
+        }
+        ["files"] => files_info(),
+        ["files", "clear"] => files_clear(),
         ["watch"] => watch(None).await,
         ["watch", secs] => watch(Some(secs.parse().context("seconds must be a number")?)).await,
         ["avatar"] => avatar().await,
@@ -524,6 +538,91 @@ fn sender_name(store: &Storage, m: &MessageRow) -> String {
     }
 }
 
+fn print_history(store: &Storage, messages: &[MessageRow]) {
+    for m in messages.iter().rev() {
+        let time = (m.date.rem_euclid(86_400) / 60) as u32;
+        let from = sender_name(store, m);
+        let from = if from.is_empty() {
+            String::new()
+        } else {
+            format!("{from}: ")
+        };
+        println!(
+            "[{:02}:{:02} UTC] {from}{}",
+            time / 60,
+            time % 60,
+            truncate(&m.text, 100)
+        );
+    }
+}
+
+async fn history(index: usize, count: usize) -> Result<()> {
+    let started = Instant::now();
+    let store = open_cache()?;
+    let list = store.dialogs(0, index.max(1))?;
+    let Some(dialog) = index.checked_sub(1).and_then(|i| list.get(i)) else {
+        bail!("no chat number {index} in the cached list; run `tdr dialogs` first");
+    };
+    let peer = dialog.dialog.peer;
+    let cached = store.history(peer, count)?;
+    if !cached.messages.is_empty() {
+        print_history(&store, &cached.messages);
+        eprintln!(
+            "
+{} messages from the cache in {}",
+            cached.messages.len(),
+            ms(started.elapsed())
+        );
+    }
+
+    let client = logged_in()?;
+    let mut sync = Sync::new(client.clone(), store)?;
+    let t = Instant::now();
+    let applied = sync.start().await?;
+    eprintln!("sync: {} in {}", describe(&applied), ms(t.elapsed()));
+    let t = Instant::now();
+    let h = sync.history(peer, count).await?;
+    save_session(&client)?;
+    eprintln!(
+        "history: {} messages ({} from the cache, {} loaded from the server) in {}",
+        h.messages.len(),
+        h.from_cache,
+        h.fetched,
+        ms(t.elapsed())
+    );
+    if h.messages.len() != cached.messages.len()
+        || h.messages.first().map(|m| m.id) != cached.messages.first().map(|m| m.id)
+    {
+        println!();
+        print_history(sync.store(), &h.messages);
+    }
+    Ok(())
+}
+
+fn open_files() -> Result<FileCache> {
+    Ok(FileCache::open(
+        data_dir().join("files"),
+        FileCacheConfig::default(),
+    )?)
+}
+
+fn files_info() -> Result<()> {
+    let s = open_files()?.stats()?;
+    println!(
+        "{} files, {:.1} MB (limit {} MB)",
+        s.files,
+        s.bytes as f64 / 1048576.0,
+        FileCacheConfig::default().size_limit / 1048576
+    );
+    Ok(())
+}
+
+fn files_clear() -> Result<()> {
+    open_files()?.clear()?;
+    println!("File cache cleared.");
+    Ok(())
+}
+
 /// Prints new messages as they arrive. `seconds`: stop after that long (for tests).
 async fn watch(seconds: Option<u64>) -> Result<()> {
     let client = logged_in()?;
@@ -583,6 +682,24 @@ async fn avatar() -> Result<()> {
         photo_id: photo.photo_id,
     }
     .into();
+    let mut files = open_files()?;
+    let key = format!("avatar:{}:big", photo.photo_id);
+    let t_cache = Instant::now();
+    if let Some(data) = files.get(&key)? {
+        let path = data_dir().join("avatar.jpg");
+        std::fs::write(&path, &data)?;
+        println!(
+            "Saved {} KB to {} (from the file cache)",
+            data.len() / 1024,
+            path.display()
+        );
+        eprintln!(
+            "\nfile cache hit: {}; total with getUsers: {}",
+            ms(t_cache.elapsed()),
+            ms(t.elapsed())
+        );
+        return Ok(());
+    }
     // upload.getFile: the limit must divide 1 MiB and offsets must be multiples of it.
     const PART: i32 = 512 * 1024;
     let mut data = Vec::new();
@@ -607,6 +724,7 @@ async fn avatar() -> Result<()> {
             break;
         }
     }
+    files.put(&key, &data)?;
     let path = data_dir().join("avatar.jpg");
     std::fs::write(&path, &data)?;
     save_session(&client)?;
