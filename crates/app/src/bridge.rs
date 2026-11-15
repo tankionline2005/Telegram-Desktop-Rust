@@ -2,7 +2,7 @@
 //! the network client and the cache. The UI thread never waits for the network or the
 //! disk; it sends [`Command`]s and receives ready-to-draw [`Update`]s.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +23,9 @@ use crate::present;
 #[derive(Debug, Clone)]
 pub enum Command {
     OpenChat(PeerKey),
+    /// Open a chat where it was left (its scroll state was kept): the same part of
+    /// its history as then, plus a page.
+    ReopenChat(PeerKey),
     /// The chat list was scrolled near its end: show (and load) more chats.
     LoadMoreDialogs,
     /// The pinned chats were dragged into this order.
@@ -703,10 +706,12 @@ fn send_history(
     let update = match shown {
         Shown::Latest(count) => {
             let h = store.history(peer, *count)?;
+            // Complete only once every cached message is shown, not just cached.
+            let complete = h.complete && h.messages.len() < *count;
             Update::History {
                 peer,
                 messages: message_items(store, peer, &h.messages),
-                complete: h.complete,
+                complete,
                 newer: false,
                 focus,
             }
@@ -843,10 +848,17 @@ async fn run(
     let mut shown = Shown::Latest(HISTORY);
     // Chats `OpenChatAt` went away from, with what they showed (`Back` returns).
     let mut back: Vec<(PeerKey, Shown)> = Vec::new();
+    // What chats left this session showed (`History::scrollTopItem` keeps the
+    // place in tdesktop): `ReopenChat` shows it again.
+    let mut remembered: HashMap<PeerKey, Shown> = HashMap::new();
     loop {
         tokio::select! {
             cmd = commands.recv() => {
                 let Some(cmd) = cmd else { break };
+                let (cmd, restore) = match cmd {
+                    Command::ReopenChat(peer) => (Command::OpenChat(peer), true),
+                    cmd => (cmd, false),
+                };
                 match cmd {
                     Command::LoadMoreDialogs => {
                         shown_dialogs += DIALOGS_STEP;
@@ -863,13 +875,26 @@ async fn run(
                     }
                     Command::OpenChat(peer) => {
                         back.clear();
+                        if let Some(previous) = open.filter(|p| *p != peer) {
+                            remembered.insert(
+                                previous,
+                                std::mem::replace(&mut shown, Shown::Latest(HISTORY)),
+                            );
+                        }
                         open = Some(peer);
-                        let count = open_count(sync.store(), peer);
-                        shown = Shown::Latest(count);
+                        // Where it was left: the same messages (a page more, so new
+                        // ones at the bottom never push the shown ones out).
+                        shown = match (restore, remembered.remove(&peer)) {
+                            (true, Some(Shown::Latest(count))) => Shown::Latest(count + HISTORY),
+                            (true, Some(window)) => window,
+                            _ => Shown::Latest(open_count(sync.store(), peer)),
+                        };
                         send_history(sync.store(), peer, &shown, None, &tx)?;
-                        match sync.history(peer, count).await {
-                            Ok(_) => send_history(sync.store(), peer, &shown, None, &tx)?,
-                            Err(e) => error!("history: {e}"),
+                        if let Shown::Latest(count) = shown {
+                            match sync.history(peer, count).await {
+                                Ok(_) => send_history(sync.store(), peer, &shown, None, &tx)?,
+                                Err(e) => error!("history: {e}"),
+                            }
                         }
                         // A private chat's status, fresh from the server.
                         if let Err(e) = sync.refresh_user(peer).await {
@@ -910,7 +935,14 @@ async fn run(
                             });
                         }
                     }
-                    Command::CloseChat => open = None,
+                    Command::CloseChat => {
+                        if let Some(previous) = open.take() {
+                            remembered.insert(
+                                previous,
+                                std::mem::replace(&mut shown, Shown::Latest(HISTORY)),
+                            );
+                        }
+                    }
                     Command::SaveDraft { peer, text, cloud } => {
                         if sync.set_draft(peer, &text)? {
                             send_dialogs(sync.store(), shown_dialogs, &tx)?;
@@ -981,11 +1013,15 @@ async fn run(
                             send_history(sync.store(), peer, &shown, None, &tx)?;
                         }
                     }
-                    Command::LoadNewer(_) => {}
+                    Command::LoadNewer(_) | Command::ReopenChat(_) => {}
                     Command::Back => {
                         if let Some((peer, was)) = back.pop() {
+                            if let Some(previous) = open {
+                                remembered.insert(previous, std::mem::replace(&mut shown, was));
+                            } else {
+                                shown = was;
+                            }
                             open = Some(peer);
-                            shown = was;
                             send_history(sync.store(), peer, &shown, None, &tx)?;
                         }
                     }
@@ -1372,7 +1408,10 @@ pub fn start_demo() -> (
                     let _ = up_tx.send(Update::Dialogs(dialogs.clone()));
                     continue;
                 }
-                Command::LoadMoreDialogs | Command::LoadNewer(_) | Command::Back => continue,
+                Command::LoadMoreDialogs
+                | Command::LoadNewer(_)
+                | Command::Back
+                | Command::ReopenChat(_) => continue,
                 Command::OpenChatAt { peer, msg_id } => focus = Some((peer, msg_id)),
                 Command::OpenChat(_)
                 | Command::CloseChat

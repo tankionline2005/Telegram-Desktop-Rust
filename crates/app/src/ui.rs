@@ -738,6 +738,10 @@ pub struct MainView {
     extra_chats: HashMap<PeerKey, DialogItem>,
     /// Show this chat's row once the chat list has it (it joins it when opened).
     reveal_pending: Option<PeerKey>,
+    /// Chats left this session with their place, as tdesktop keeps every history's
+    /// `scrollTopItem`: opened again, a chat shows where it was. A chat left at its
+    /// bottom is not kept (`forgetScrollState`): it opens as usual.
+    remembered: HashMap<PeerKey, SavedPane>,
     /// Chats to go back to (`showBackFromStack`), the last on top.
     back_stack: Vec<SavedPane>,
     slide: Option<Slide>,
@@ -887,6 +891,7 @@ impl MainView {
             menu_hovered: false,
             extra_chats: HashMap::new(),
             reveal_pending: None,
+            remembered: HashMap::new(),
             back_stack: Vec::new(),
             slide: None,
             newer_available: false,
@@ -1008,6 +1013,24 @@ impl MainView {
         })
     }
 
+    /// Keeps a chat's place for when it is opened again, unless it was left at its
+    /// bottom.
+    fn remember(&mut self, pane: SavedPane) {
+        if pane.stick_to_bottom {
+            self.remembered.remove(&pane.peer);
+        } else {
+            self.remembered.insert(pane.peer, pane);
+        }
+    }
+
+    /// The open chat is left (another one opens, or Esc): its place is kept.
+    fn leave_current(&mut self, cx: &mut Context<Self>) {
+        if let Some(pane) = self.take_current_pane(cx) {
+            self.remember(pane);
+        }
+        self.selected = None;
+    }
+
     /// A set-aside chat open again, where it was scrolled.
     fn restore_pane(&mut self, pane: SavedPane) {
         self.selected = Some(pane.peer);
@@ -1091,6 +1114,7 @@ impl MainView {
         let peer = previous.peer;
         self.restore_pane(previous);
         if let Some(pane) = closing {
+            self.remember(pane.clone());
             self.slide = Some(Slide {
                 pane,
                 forward: false,
@@ -1857,11 +1881,8 @@ impl MainView {
         } else if self.selected.is_some() {
             self.save_draft(cx);
             self.set_input_text(String::new(), cx);
-            self.selected = None;
-            self.messages.clear();
-            self.messages_state.reset(0);
+            self.leave_current(cx);
             self.history_bar.drag = None;
-            self.unread_bar = None;
             self.unread_target = None;
             let _ = self.commands.send(Command::CloseChat);
             window.focus(&self.focus);
@@ -1892,8 +1913,11 @@ impl MainView {
     }
 
     fn open(&mut self, peer: PeerKey, window: &mut Window, cx: &mut Context<Self>) {
-        // From the chat list: the back stack is cleared (`Way::ClearStack`).
-        self.back_stack.clear();
+        // From the chat list: the back stack is cleared (`Way::ClearStack`); its chats
+        // keep their places like any chat left.
+        for pane in std::mem::take(&mut self.back_stack) {
+            self.remember(pane);
+        }
         self.slide = None;
         if self.selected == Some(peer) {
             return;
@@ -1902,7 +1926,16 @@ impl MainView {
         self.save_draft(cx);
         let draft = self.draft_of(peer).unwrap_or_default();
         self.set_input_text(draft, cx);
-        self.start_opening(peer);
+        self.leave_current(cx);
+        // Opened again: where it was (`showHistory` prefers the saved scroll state to
+        // the unread bar), else at the first unread message or the end.
+        match self.remembered.remove(&peer) {
+            Some(pane) => {
+                self.restore_pane(pane);
+                let _ = self.commands.send(Command::ReopenChat(peer));
+            }
+            None => self.start_opening(peer),
+        }
         window.focus(&self.input.focus_handle(cx));
         cx.notify();
     }
