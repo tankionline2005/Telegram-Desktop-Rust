@@ -289,10 +289,11 @@ impl Client {
             return Ok(c.clone());
         }
         let conn = Arc::new(self.open(dc).await?);
-        *guard = Some(conn.clone());
-        drop(guard);
 
-        // Other DCs need the account's authorization copied from the home DC.
+        // Other DCs need the account's authorization copied from the home DC. The slot
+        // stays locked until that is done: a request sent on the connection before the
+        // import fails with AUTH_KEY_UNREGISTERED (several userpics from one DC at once
+        // did exactly that). The import goes through the home DC's slot, not this one.
         let (home, needs_import) = {
             let s = self.inner.session.lock().unwrap();
             let authorized_here = s.dcs.get(&dc).is_some_and(|d| d.authorized);
@@ -321,7 +322,21 @@ impl Client {
                 .authorized = true;
             info!(dc, elapsed = ?started.elapsed(), "authorization imported");
         }
+        *guard = Some(conn.clone());
         Ok(conn)
+    }
+
+    /// The server no longer accepts the authorization on `dc` (another DC than home):
+    /// import it again with the next connection, as tdesktop does.
+    fn forget_authorization(&self, dc: i32) {
+        if let Some(keys) = self.inner.session.lock().unwrap().dcs.get_mut(&dc) {
+            keys.authorized = false;
+        }
+        if let Some(slot) = self.inner.slots.lock().unwrap().get(&dc)
+            && let Ok(mut g) = slot.try_lock()
+        {
+            *g = None;
+        }
     }
 
     async fn open(&self, dc: i32) -> Result<DcConn, Error> {
@@ -474,6 +489,7 @@ impl Client {
     /// recreating a key the server forgot.
     pub async fn invoke_in_raw(&self, dc: i32, body: &[u8]) -> Result<Bytes, Error> {
         let mut retried_key = false;
+        let mut retried_auth = false;
         loop {
             let conn = self.conn(dc).await?;
             match self.call(&conn, body.to_vec()).await {
@@ -484,6 +500,16 @@ impl Client {
                     }
                     info!(dc, secs, "flood wait");
                     tokio::time::sleep(Duration::from_secs(secs as u64 + 1)).await;
+                }
+                Err(Error::Rpc(e))
+                    if e.code == 401
+                        && e.is("AUTH_KEY_UNREGISTERED")
+                        && dc != self.home_dc()
+                        && !retried_auth =>
+                {
+                    retried_auth = true;
+                    info!(dc, "authorization lost on this DC, importing it again");
+                    self.forget_authorization(dc);
                 }
                 Err(Error::AuthKeyUnknown) if !retried_key => {
                     retried_key = true;

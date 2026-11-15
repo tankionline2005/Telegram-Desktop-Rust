@@ -2,15 +2,23 @@
 //! the network client and the cache. The UI thread never waits for the network or the
 //! disk; it sends [`Command`]s and receives ready-to-draw [`Update`]s.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{Local, TimeZone};
+use gpui::RenderImage;
+use tdr_data::describe::{self, PeerKind as ChatKind};
+use tdr_data::tdr_storage::{FileCache, FileCacheConfig};
+
+use chrono::Local;
 use tdr_api::{Client, Config, SessionData};
 use tdr_data::tdr_storage::{DialogView, MessageRow, PeerKey, PeerKind, Storage};
 use tdr_data::{Applied, Sync};
 use tokio::sync::mpsc;
 use tracing::{error, info};
+
+use crate::present;
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -22,6 +30,17 @@ pub enum Command {
     Send {
         peer: PeerKey,
         text: String,
+    },
+    /// The user saw the open chat's messages up to `max_id`: mark them read.
+    Read {
+        peer: PeerKey,
+        max_id: i32,
+    },
+    /// A userpic is needed (once per photo).
+    LoadUserpic {
+        peer: PeerKey,
+        photo_id: i64,
+        dc_id: i32,
     },
     /// The input field of `peer` holds `text`. `cloud`: also save it to the server
     /// soon (the chat was left, or typing paused for a while).
@@ -47,6 +66,17 @@ pub enum Update {
         peer: PeerKey,
         text: Option<String>,
     },
+    /// The member count of a group or channel arrived ("906 members").
+    Members {
+        peer: PeerKey,
+        text: String,
+    },
+    /// A userpic is ready to draw.
+    Userpic {
+        peer: PeerKey,
+        photo_id: i64,
+        image: Arc<RenderImage>,
+    },
     /// Connection state for the header ("Connecting…"), empty when online.
     Status(String),
     Fatal(String),
@@ -57,19 +87,42 @@ pub struct DialogItem {
     pub peer: PeerKey,
     pub name: String,
     pub initials: String,
-    /// Index into the userpic colors (tdesktop's 7 peer colors).
+    /// tdesktop's color index (`PeerData::colorIndex`).
     pub color: u8,
-    pub last: String,
-    pub time: String,
-    pub unread: i32,
-    pub pinned: bool,
-    pub is_channel: bool,
+    /// Small userpic: photo id and DC.
+    pub photo: Option<(i64, i32)>,
+    pub kind: ChatKind,
     /// The chat with yourself: "Saved Messages" with the bookmark userpic.
     pub is_saved: bool,
-    /// A basic group or supergroup (sender names and avatars in the feed).
-    pub is_group: bool,
+    pub last: LastLine,
+    /// Our last message: `Some(false)` sent (✓), `Some(true)` read (✓✓).
+    pub last_read: Option<bool>,
+    pub time: String,
+    pub unread: i32,
+    /// Notifications off: the badge is grey.
+    pub muted: bool,
+    pub pinned: bool,
     /// The saved draft ("Draft: …" in the list).
     pub draft: Option<String>,
+    /// Incoming messages up to this id are read (where the "Unread messages" bar goes).
+    pub read_inbox_max_id: i32,
+    /// Under the name in the chat header: "online", "906 members", "bot", ...
+    pub status: String,
+}
+
+impl DialogItem {
+    pub fn is_group(&self) -> bool {
+        self.kind == ChatKind::Group
+    }
+}
+
+/// The second line of a chat-list row: "Sender: " and a media caption or service text
+/// in the accent color, then the text.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LastLine {
+    pub prefix: Option<String>,
+    pub accent: Option<String>,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -77,8 +130,15 @@ pub struct MessageItem {
     pub id: i32,
     pub out: bool,
     pub text: String,
+    /// Shown instead of media that is not drawn yet ("Photo", "Voice message", ...).
+    pub media: Option<String>,
+    /// A service message: centered grey bubble with this text.
+    pub service: Option<String>,
+    pub edited: bool,
+    /// Outgoing messages: read by the other side (✓✓) or only sent (✓).
+    pub read: Option<bool>,
     pub time: String,
-    /// Unix time, for grouping consecutive messages of one author.
+    /// Unix time, for grouping and date dividers.
     pub date: i32,
     /// Sender name and color in groups (incoming messages only).
     pub sender: Option<(String, u8)>,
@@ -91,6 +151,7 @@ pub struct Author {
     pub key: Option<PeerKey>,
     pub initials: String,
     pub color: u8,
+    pub photo: Option<(i64, i32)>,
 }
 
 /// tdesktop's peer color for an id (`Data::DecideColorIndex`: `id % 7`).
@@ -111,108 +172,252 @@ fn initials(name: &str) -> String {
     }
 }
 
-fn time_label(date: i32) -> String {
-    let Some(t) = Local.timestamp_opt(date as i64, 0).single() else {
-        return String::new();
-    };
-    let now = Local::now();
-    if t.date_naive() == now.date_naive() {
-        t.format("%H:%M").to_string()
-    } else if (now - t).num_days() < 7 {
-        t.format("%a").to_string()
-    } else {
-        t.format("%d.%m.%y").to_string()
+/// What the bridge knows about the account and the defaults.
+struct Context {
+    self_id: i64,
+    now: i64,
+    mute_users: i64,
+    mute_chats: i64,
+    mute_broadcasts: i64,
+}
+
+impl Context {
+    fn load(store: &Storage) -> Self {
+        let meta = |k: &str| store.meta_i64(k).ok().flatten().unwrap_or(0);
+        Self {
+            self_id: meta("self_id"),
+            now: chrono::Utc::now().timestamp(),
+            mute_users: meta(tdr_data::MUTE_USERS),
+            mute_chats: meta(tdr_data::MUTE_CHATS),
+            mute_broadcasts: meta(tdr_data::MUTE_BROADCASTS),
+        }
     }
 }
 
-fn dialog_item(d: &DialogView, self_id: i64) -> DialogItem {
-    let name = d
-        .peer
-        .as_ref()
-        .map_or_else(|| "…".to_string(), |p| p.name.clone());
-    let last = d
+fn peer_name(store: &Storage, key: PeerKey) -> String {
+    store
+        .peer(key)
+        .ok()
+        .flatten()
+        .map_or_else(|| "…".into(), |p| p.name)
+}
+
+/// First name for "Name: text" in the chat list (`PeerData::shortName`).
+fn short_name(store: &Storage, key: PeerKey, self_id: i64) -> String {
+    if key == PeerKey::user(self_id) {
+        return "You".into();
+    }
+    match store.peer(key).ok().flatten() {
+        Some(row) => describe::peer_info(&row)
+            .first_name
+            .filter(|n| !n.is_empty())
+            .unwrap_or(row.name),
+        None => "…".into(),
+    }
+}
+
+/// Media caption and service text of a message.
+fn message_content(
+    store: &Storage,
+    m: &MessageRow,
+    is_channel: bool,
+) -> (Option<String>, Option<String>, describe::MessageInfo) {
+    let info = describe::message_info(m);
+    let service = info.service.as_ref().map(|s| {
+        let from_id = m.from.map(|f| f.id);
+        let from = m.from.map_or_else(String::new, |f| peer_name(store, f));
+        present::service_text(s, &from, from_id, m.out, is_channel, |id| {
+            peer_name(store, PeerKey::user(id))
+        })
+    });
+    let media = info.media.as_ref().map(present::media_label);
+    (media, service, info)
+}
+
+/// Text of a message row: older cache rows stored placeholders for media and service
+/// messages.
+fn row_text(m: &MessageRow) -> String {
+    match m.text.as_str() {
+        "[media]" | "[service message]" => String::new(),
+        t => t.to_string(),
+    }
+}
+
+fn dialog_item(store: &Storage, d: &DialogView, ctx: &Context) -> DialogItem {
+    let peer = d.dialog.peer;
+    let info = d.peer.as_ref().map(describe::peer_info).unwrap_or_default();
+    let is_saved = peer == PeerKey::user(ctx.self_id);
+    let name = if is_saved {
+        "Saved Messages".to_string()
+    } else {
+        d.peer
+            .as_ref()
+            .map_or_else(|| "…".to_string(), |p| p.name.clone())
+    };
+    let kind = match peer.kind {
+        PeerKind::Chat => ChatKind::Group,
+        _ => info.kind,
+    };
+    let is_channel = kind == ChatKind::Channel;
+    let last = d.top.as_ref().map(|m| {
+        let (media, service, _) = message_content(store, m, is_channel);
+        let text = row_text(m).lines().next().unwrap_or("").to_string();
+        let prefix = (kind == ChatKind::Group && service.is_none())
+            .then(|| {
+                if m.out {
+                    Some("You".to_string())
+                } else {
+                    m.from.map(|f| short_name(store, f, ctx.self_id))
+                }
+            })
+            .flatten();
+        match (service, media) {
+            (Some(s), _) => LastLine {
+                prefix: None,
+                accent: Some(s),
+                text: String::new(),
+            },
+            (None, Some(label)) if text.is_empty() => LastLine {
+                prefix,
+                accent: Some(label),
+                text: String::new(),
+            },
+            _ => LastLine {
+                prefix,
+                accent: None,
+                text,
+            },
+        }
+    });
+    let last_read = d
         .top
         .as_ref()
-        .map(|m| m.text.lines().next().unwrap_or("").to_string())
-        .unwrap_or_default();
+        .filter(|m| m.out && !is_saved && !is_channel)
+        .map(|m| m.id <= d.dialog.read_outbox_max_id);
+    let default_mute = match kind {
+        ChatKind::User | ChatKind::Bot => ctx.mute_users,
+        ChatKind::Group => ctx.mute_chats,
+        ChatKind::Channel => ctx.mute_broadcasts,
+    };
+    let mute_until = d.dialog.mute_until.map_or(default_mute, i64::from);
+    let muted = mute_until > ctx.now;
+    let now = Local::now();
+    let status = if is_saved {
+        String::new()
+    } else if peer == PeerKey::user(tdr_data::SERVICE_NOTIFICATIONS_ID) {
+        "service notifications".into()
+    } else {
+        match kind {
+            ChatKind::Bot => "bot".into(),
+            ChatKind::User => info
+                .lastseen
+                .map(|l| present::lastseen_text(l, now))
+                .unwrap_or_else(|| "last seen a long time ago".into()),
+            ChatKind::Group => info
+                .members
+                .map(|n| present::count_text(n, "member", "members"))
+                .unwrap_or_default(),
+            ChatKind::Channel => info
+                .members
+                .map(|n| present::count_text(n, "subscriber", "subscribers"))
+                .unwrap_or_default(),
+        }
+    };
     DialogItem {
-        peer: d.dialog.peer,
+        peer,
         initials: initials(&name),
-        color: color_index(d.dialog.peer.id),
+        color: info.color.unwrap_or_else(|| color_index(peer.id)),
+        photo: info.photo,
+        kind,
+        is_saved,
         name,
-        last,
+        last: last.unwrap_or_default(),
+        last_read,
         // A newer draft shows its own time, as in tdesktop.
         time: d
             .top
             .as_ref()
             .map(|m| m.date)
             .max(d.draft.as_ref().map(|(_, date)| *date))
-            .map(time_label)
+            .map(|date| present::dialogs_date(date, now))
             .unwrap_or_default(),
         draft: d.draft.as_ref().map(|(text, _)| text.clone()),
         unread: d.dialog.unread_count,
+        muted,
         pinned: d.dialog.pinned,
-        is_channel: d.dialog.peer.kind == PeerKind::Channel
-            && !d.peer.as_ref().is_some_and(|p| p.is_megagroup),
-        is_saved: d.dialog.peer == PeerKey::user(self_id),
-        is_group: d.dialog.peer.kind == PeerKind::Chat
-            || (d.dialog.peer.kind == PeerKind::Channel
-                && d.peer.as_ref().is_some_and(|p| p.is_megagroup)),
+        read_inbox_max_id: d.dialog.read_inbox_max_id,
+        status,
+    }
+}
+
+fn author_of(store: &Storage, key: PeerKey) -> Author {
+    let row = store.peer(key).ok().flatten();
+    let name = row.as_ref().map_or_else(String::new, |p| p.name.clone());
+    let info = row.as_ref().map(describe::peer_info).unwrap_or_default();
+    Author {
+        key: Some(key),
+        initials: initials(&name),
+        color: info.color.unwrap_or_else(|| color_index(key.id)),
+        photo: info.photo,
     }
 }
 
 fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec<MessageItem> {
-    let is_group = match peer.kind {
-        PeerKind::Chat => true,
-        PeerKind::Channel => store
+    let ctx = Context::load(store);
+    let peer_kind = match peer.kind {
+        PeerKind::Chat => ChatKind::Group,
+        _ => store
             .peer(peer)
             .ok()
             .flatten()
-            .is_some_and(|p| p.is_megagroup),
-        PeerKind::User => false,
+            .map(|p| describe::peer_info(&p).kind)
+            .unwrap_or_default(),
     };
-    let self_id = store.meta_i64("self_id").ok().flatten().unwrap_or(0);
+    let is_group = peer_kind == ChatKind::Group;
+    let is_channel = peer_kind == ChatKind::Channel;
+    let is_saved = peer == PeerKey::user(ctx.self_id);
+    let read_outbox = store
+        .read_marks(peer)
+        .ok()
+        .flatten()
+        .map_or(0, |(_, _, outbox)| outbox);
+    let mut authors: std::collections::HashMap<PeerKey, Author> = Default::default();
     // Oldest first for display.
     messages
         .iter()
         .rev()
         .map(|m| {
-            let sender = (is_group && !m.out)
-                .then_some(m.from)
-                .flatten()
-                .map(|from| {
-                    let name = store
-                        .peer(from)
-                        .ok()
-                        .flatten()
-                        .map_or_else(|| "…".into(), |p| p.name);
-                    (name, color_index(from.id))
-                });
+            let (media, service, info) = message_content(store, m, is_channel);
             let key = if m.out {
-                Some(PeerKey::user(self_id))
+                PeerKey::user(ctx.self_id)
             } else {
-                m.from.or(Some(peer))
+                m.from.unwrap_or(peer)
             };
-            let name = key
-                .and_then(|k| store.peer(k).ok().flatten())
-                .map_or_else(String::new, |p| p.name);
-            let author = Author {
-                key,
-                initials: initials(&name),
-                color: key.map_or(0, |k| color_index(k.id)),
-            };
+            let author = authors
+                .entry(key)
+                .or_insert_with(|| author_of(store, key))
+                .clone();
+            let sender = (is_group && !m.out)
+                .then(|| m.from.map(|from| (peer_name(store, from), author.color)))
+                .flatten();
+            // Calls are bubbles with their caption, not service lines.
+            let call = info.service.as_ref().is_some_and(present::is_call);
             MessageItem {
                 id: m.id,
                 out: m.out,
                 date: m.date,
-                author,
-                text: m.text.clone(),
-                time: Local
-                    .timestamp_opt(m.date as i64, 0)
-                    .single()
-                    .map(|t| t.format("%H:%M").to_string())
-                    .unwrap_or_default(),
+                text: if call {
+                    service.clone().unwrap_or_default()
+                } else {
+                    row_text(m)
+                },
+                media,
+                service: service.filter(|_| !call),
+                edited: info.edited,
+                read: (m.out && !is_saved && !is_channel).then_some(m.id <= read_outbox),
+                time: present::message_time(m.date),
                 sender,
+                author,
             }
         })
         .collect()
@@ -224,6 +429,52 @@ const HISTORY: usize = 60;
 pub struct Paths {
     pub session: PathBuf,
     pub cache: PathBuf,
+    /// The file cache (userpics, media).
+    pub files: PathBuf,
+}
+
+/// Userpics are drawn at up to 46 px (dialogs) on screens up to 2x: decode once at this
+/// size, off the UI thread.
+const USERPIC_SIZE: u32 = 96;
+
+fn userpic_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+    let decoded = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let mut scaled = image::imageops::resize(
+        &decoded,
+        USERPIC_SIZE,
+        USERPIC_SIZE,
+        image::imageops::FilterType::Triangle,
+    );
+    for px in scaled.pixels_mut() {
+        px.0.swap(0, 2); // GPUI wants BGRA
+    }
+    Some(Arc::new(RenderImage::new(smallvec::smallvec![
+        image::Frame::new(scaled)
+    ])))
+}
+
+/// How many messages to load when a chat opens: enough to reach the first unread one
+/// (tdesktop opens there), within reason.
+fn open_count(store: &Storage, peer: PeerKey) -> usize {
+    let unread = store
+        .read_marks(peer)
+        .ok()
+        .flatten()
+        .map_or(0, |(unread, _, _)| unread.max(0) as usize);
+    HISTORY.max((unread + 20).min(400))
+}
+
+fn members_text(store: &Storage, peer: PeerKey, count: i32) -> String {
+    let channel = store
+        .peer(peer)
+        .ok()
+        .flatten()
+        .is_some_and(|p| describe::peer_info(&p).kind == ChatKind::Channel);
+    if channel {
+        present::count_text(count, "subscriber", "subscribers")
+    } else {
+        present::count_text(count, "member", "members")
+    }
 }
 
 /// Starts the data thread.
@@ -257,17 +508,8 @@ pub fn start(
 
 fn send_dialogs(store: &Storage, tx: &mpsc::UnboundedSender<Update>) -> anyhow::Result<()> {
     let list = store.dialogs(0, DIALOGS)?;
-    let self_id = store.meta_i64("self_id")?.unwrap_or(0);
-    let items = list
-        .iter()
-        .map(|d| {
-            let mut item = dialog_item(d, self_id);
-            if item.is_saved {
-                item.name = "Saved Messages".into();
-            }
-            item
-        })
-        .collect();
+    let ctx = Context::load(store);
+    let items = list.iter().map(|d| dialog_item(store, d, &ctx)).collect();
     let _ = tx.send(Update::Dialogs(items));
     Ok(())
 }
@@ -359,6 +601,12 @@ async fn run(
         .has_unsaved_drafts()
         .then(|| tokio::time::Instant::now() + SAVE_CLOUD_DRAFT_DELAY);
 
+    // Userpics: from the file cache, or downloaded in the background (a few at once).
+    let mut files = FileCache::open(&paths.files, FileCacheConfig::default())?;
+    let (pics_tx, mut pics_rx) = mpsc::unbounded_channel::<(PeerKey, i64, Option<Vec<u8>>)>();
+    let downloads = Arc::new(tokio::sync::Semaphore::new(4));
+    let mut loading: HashSet<i64> = HashSet::new();
+
     // 3. Commands and live updates.
     let mut open: Option<PeerKey> = None;
     // How many messages of the open chat are shown (grows as the user scrolls up).
@@ -370,13 +618,46 @@ async fn run(
                 match cmd {
                     Command::OpenChat(peer) => {
                         open = Some(peer);
-                        count = HISTORY;
+                        count = open_count(sync.store(), peer);
                         send_history(sync.store(), peer, count, &tx)?;
                         match sync.history(peer, count).await {
                             Ok(_) => send_history(sync.store(), peer, count, &tx)?,
                             Err(e) => error!("history: {e}"),
                         }
                         send_dialogs(sync.store(), &tx)?;
+                        // Supergroups and channels: the member count is in the full info.
+                        match sync.member_count(peer).await {
+                            Ok(Some(n)) => {
+                                let text = members_text(sync.store(), peer, n);
+                                let _ = tx.send(Update::Members { peer, text });
+                            }
+                            Ok(None) => {}
+                            Err(e) => error!("full info: {e}"),
+                        }
+                    }
+                    Command::Read { peer, max_id } => match sync.read_history(peer, max_id).await {
+                        Ok(_) => send_dialogs(sync.store(), &tx)?,
+                        Err(e) => error!("read: {e}"),
+                    },
+                    Command::LoadUserpic { peer, photo_id, dc_id } => {
+                        let key = format!("userpic:{photo_id}:small");
+                        if let Some(image) = files.get(&key)?.as_deref().and_then(userpic_image) {
+                            let _ = tx.send(Update::Userpic { peer, photo_id, image });
+                        } else if loading.insert(photo_id)
+                            && let Some(input) = sync.input_peer(peer)
+                        {
+                            let client = client.clone();
+                            let done = pics_tx.clone();
+                            let downloads = downloads.clone();
+                            tokio::spawn(async move {
+                                let _permit = downloads.acquire().await;
+                                let bytes = tdr_data::download_userpic(&client, input, photo_id, dc_id)
+                                    .await
+                                    .map_err(|e| tracing::debug!("userpic: {e}"))
+                                    .ok();
+                                let _ = done.send((peer, photo_id, bytes));
+                            });
+                        }
                     }
                     Command::CloseChat => open = None,
                     Command::SaveDraft { peer, text, cloud } => {
@@ -412,6 +693,15 @@ async fn run(
                     }
                 }
             }
+            Some((peer, photo_id, bytes)) = pics_rx.recv() => {
+                loading.remove(&photo_id);
+                if let Some(bytes) = bytes {
+                    files.put(&format!("userpic:{photo_id}:small"), &bytes)?;
+                    if let Some(image) = userpic_image(&bytes) {
+                        let _ = tx.send(Update::Userpic { peer, photo_id, image });
+                    }
+                }
+            }
             _ = async {
                 match cloud_save_at {
                     Some(at) => tokio::time::sleep_until(at).await,
@@ -430,7 +720,8 @@ async fn run(
                     send_draft_changes(&applied, &tx);
                     if let Some(peer) = open {
                         let touched = applied.new_messages.iter().any(|m| m.peer == peer)
-                            || applied.edited + applied.deleted > 0;
+                            || applied.edited + applied.deleted > 0
+                            || applied.marks_changed;
                         if touched {
                             send_history(sync.store(), peer, count, &tx)?;
                         }
@@ -450,12 +741,14 @@ fn demo_author(out: bool) -> Author {
             key: Some(PeerKey::user(103)),
             initials: "ME".into(),
             color: color_index(103),
+            photo: None,
         }
     } else {
         Author {
             key: Some(PeerKey::user(2)),
             initials: "BO".into(),
             color: color_index(2),
+            photo: None,
         }
     }
 }
@@ -467,95 +760,228 @@ pub fn start_demo() -> (
 ) {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Command>();
     let (up_tx, up_rx) = mpsc::unbounded_channel();
-    let names = [
-        ("Alice Johnson", "See you tomorrow at 10!", 2, true),
+    let now = Local::now();
+    let today = move |h: u32, m: u32| {
+        now.date_naive()
+            .and_hms_opt(h, m, 0)
+            .and_then(|t| t.and_local_timezone(Local).single())
+            .map_or(0, |t| t.timestamp() as i32)
+    };
+    let day = 86_400;
+    let line = |prefix: Option<&str>, accent: Option<&str>, text: &str| LastLine {
+        prefix: prefix.map(Into::into),
+        accent: accent.map(Into::into),
+        text: text.into(),
+    };
+    // name, kind, last line, unread, muted, pinned, our last message read
+    let rows = [
+        (
+            "Alice Johnson",
+            ChatKind::User,
+            line(None, None, "See you tomorrow at 10!"),
+            2,
+            false,
+            true,
+            None,
+            today(9, 0),
+        ),
         (
             "Rust Developers",
-            "Bob: the new borrow checker is great",
+            ChatKind::Group,
+            line(Some("Bob"), None, "the new borrow checker is great"),
             14,
             false,
+            false,
+            None,
+            today(8, 7),
         ),
-        ("Saved Messages", "build: 3.2 s → 0.9 s", 0, true),
-        ("Telegram Tips", "Pin your important chats", 0, false),
-        ("Mom", "Call me when you can ❤", 1, false),
+        (
+            "Saved Messages",
+            ChatKind::User,
+            line(None, Some("Photo"), ""),
+            0,
+            false,
+            true,
+            None,
+            today(7, 14) - day,
+        ),
+        (
+            "Telegram Tips",
+            ChatKind::Channel,
+            line(None, None, "Pin your important chats"),
+            554,
+            true,
+            false,
+            None,
+            today(6, 21) - day,
+        ),
+        (
+            "Mom",
+            ChatKind::User,
+            line(None, None, "Call me when you can ❤"),
+            0,
+            false,
+            false,
+            Some(true),
+            today(5, 28) - 2 * day,
+        ),
         (
             "Weekend Hiking",
-            "Carol: photos are in the album",
+            ChatKind::Group,
+            line(Some("Carol"), Some("Voice message"), ""),
             37,
+            true,
             false,
+            None,
+            today(4, 35) - 3 * day,
         ),
-        ("Daniel", "ok", 0, false),
-        ("Design Team", "Eve: new icons attached", 3, false),
+        (
+            "Daniel",
+            ChatKind::User,
+            line(None, None, "ok"),
+            0,
+            false,
+            false,
+            Some(false),
+            today(3, 42) - 4 * day,
+        ),
+        (
+            "Design Team",
+            ChatKind::Group,
+            line(None, Some("Eve joined the group"), ""),
+            3,
+            false,
+            false,
+            None,
+            today(2, 49) - 10 * day,
+        ),
+        (
+            "Smart Help",
+            ChatKind::Bot,
+            line(None, None, "Hello! How can I help?"),
+            0,
+            false,
+            false,
+            None,
+            today(1, 0) - 20 * day,
+        ),
     ];
-    let dialogs: Vec<DialogItem> = names
+    let dialogs: Vec<DialogItem> = rows
         .iter()
         .enumerate()
-        .map(|(i, (name, last, unread, pinned))| DialogItem {
-            peer: PeerKey::user(i as i64 + 1),
-            name: name.to_string(),
-            initials: initials(name),
-            color: color_index(i as i64 + 1),
-            last: last.to_string(),
-            time: format!("{}:{:02}", 9 + i, (i * 7) % 60),
-            unread: *unread,
-            pinned: *pinned,
-            is_channel: false,
-            is_saved: *name == "Saved Messages",
-            draft: None,
-            is_group: *name == "Rust Developers"
-                || *name == "Weekend Hiking"
-                || *name == "Design Team",
-        })
+        .map(
+            |(i, (name, kind, last, unread, muted, pinned, read, date))| DialogItem {
+                peer: PeerKey::user(i as i64 + 1),
+                name: name.to_string(),
+                initials: initials(name),
+                color: color_index(i as i64 + 1),
+                photo: None,
+                kind: *kind,
+                is_saved: *name == "Saved Messages",
+                last: last.clone(),
+                last_read: *read,
+                time: present::dialogs_date(*date, now),
+                unread: *unread,
+                muted: *muted,
+                pinned: *pinned,
+                draft: None,
+                // The last few messages of each chat are unread.
+                read_inbox_max_id: 1005,
+                status: match kind {
+                    ChatKind::Group => "906 members".into(),
+                    ChatKind::Channel => "8 subscribers".into(),
+                    ChatKind::Bot => "bot".into(),
+                    ChatKind::User => "last seen recently".into(),
+                },
+            },
+        )
         .collect();
     let _ = up_tx.send(Update::Dialogs(dialogs));
     std::thread::spawn(move || {
-        let mut history: Vec<MessageItem> = [
-            (false, "Hey there"),
-            (false, "Hi! Did you try the new client?"),
-            (
+        let text =
+            |out: bool, text: &str| (out, Some(text.to_string()), None::<&str>, None::<&str>);
+        let entries = [
+            (false, None, None, Some("Bob Smith joined the group")),
+            text(false, "Hey there"),
+            text(false, "Hi! Did you try the new client?"),
+            text(
                 true,
                 "Yes — the chat list opens from the cache in about 5 ms.",
             ),
-            (false, "That's fast. And the colors?"),
-            (
+            (false, None, Some("Photo"), None),
+            text(false, "That's fast. And the colors?"),
+            text(
                 true,
                 "Taken straight from tdesktop's palette, day and night.",
             ),
-            (false, "https://example.com/very/long/link/without/any/spaces?utm_source=demo&utm_medium=social&utm_content=link_in_bio&fbclid=PAZnRzaAVi_zNleHRuA2FlbQIxMQBwZG9mAmZkaWQWUSFgPoFLDSR14gI_z30rz-irR2s_T3NydGMGYXBwX2lkDzEyNDAyNDU3NDI4NzQxNAABp"),
-            (true, "A long paragraph to check wrapping: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur."),
-            (false, "0101001101001101010110000100101101001001010011100101001101010000010000010100001101000101010100001001001100010101010100111001010100"),
-            (false, "See you tomorrow at 10!"),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(i, (out, text))| MessageItem {
-            id: 1000 + i as i32,
-            out,
-            text: text.to_string(),
-            time: format!("10:{:02}", i * 3),
-            date: 1_700_000_000 + i as i32 * 60,
-            sender: None,
-            author: demo_author(out),
-        })
-        .collect();
+            text(
+                false,
+                "https://example.com/very/long/link/without/any/spaces?utm_source=demo&utm_medium=social&utm_content=link_in_bio&fbclid=PAZnRzaAVi_zNleHRuA2FlbQIxMQBwZG9mAmZkaWQWUSFgPoFLDSR14gI_z30rz-irR2s_T3NydGMGYXBwX2lkDzEyNDAyNDU3NDI4NzQxNAABp",
+            ),
+            text(
+                true,
+                "A long paragraph to check wrapping: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.",
+            ),
+            (false, None, Some("Voice message"), None),
+            text(
+                false,
+                "0101001101001101010110000100101101001001010011100101001101010000010000010100001101000101010100001001001100010101010100111001010100",
+            ),
+            text(false, "See you tomorrow at 10!"),
+        ];
+        let count = entries.len() as i32;
+        // Two days ago, yesterday, today: date dividers in between.
+        let start = today(10, 0) - 2 * day;
+        let mut history: Vec<MessageItem> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, (out, body, media, service))| {
+                let date = start + (i as i32 * 2 * day) / count;
+                MessageItem {
+                    id: 1000 + i as i32,
+                    out,
+                    text: body.unwrap_or_default(),
+                    media: media.map(Into::into),
+                    service: service.map(Into::into),
+                    edited: i == 5,
+                    read: out.then_some(i < 6),
+                    time: present::message_time(date),
+                    date,
+                    sender: None,
+                    author: demo_author(out),
+                }
+            })
+            .collect();
         // Older demo messages appear 20 at a time when the user scrolls up.
         let mut older_left = 60;
         let mut next_id = 2000;
         while let Some(cmd) = cmd_rx.blocking_recv() {
             match cmd {
-                Command::OpenChat(_) | Command::CloseChat | Command::SaveDraft { .. } => {}
+                Command::OpenChat(_)
+                | Command::CloseChat
+                | Command::SaveDraft { .. }
+                | Command::Read { .. }
+                | Command::LoadUserpic { .. } => {}
                 Command::LoadOlder(_) if older_left > 0 => {
                     let first = history.first().map_or(1000, |m| m.id);
+                    let first_date = history.first().map_or(start, |m| m.date);
                     let page: Vec<MessageItem> = (1..=20)
                         .rev()
-                        .map(|k| MessageItem {
-                            id: first - k,
-                            out: k % 3 == 0,
-                            text: format!("Older message #{}", older_left - 20 + k),
-                            time: "09:00".into(),
-                            date: 1_699_990_000 - k * 60,
-                            sender: None,
-                            author: demo_author(k % 3 == 0),
+                        .map(|k| {
+                            let date = first_date - k * 3 * 3600;
+                            MessageItem {
+                                id: first - k,
+                                out: k % 3 == 0,
+                                text: format!("Older message #{}", older_left - 20 + k),
+                                media: None,
+                                service: None,
+                                edited: false,
+                                read: (k % 3 == 0).then_some(true),
+                                time: present::message_time(date),
+                                date,
+                                sender: None,
+                                author: demo_author(k % 3 == 0),
+                            }
                         })
                         .collect();
                     older_left -= 20;
@@ -564,22 +990,30 @@ pub fn start_demo() -> (
                 Command::LoadOlder(_) => {}
                 Command::Send { text, .. } => {
                     next_id += 1;
+                    let date = Local::now().timestamp() as i32;
                     history.push(MessageItem {
                         id: next_id,
                         out: true,
                         text,
-                        time: "now".into(),
-                        date: 1_800_000_000,
+                        media: None,
+                        service: None,
+                        edited: false,
+                        read: Some(false),
+                        time: present::message_time(date),
+                        date,
                         sender: None,
                         author: demo_author(true),
                     });
                 }
             }
-            for i in 0..8 {
+            for i in 0..9 {
                 let mut messages = history.clone();
                 // Groups (Rust Developers, Weekend Hiking, Design Team) show sender names.
                 if matches!(i + 1, 2 | 6 | 8) {
-                    for m in messages.iter_mut().filter(|m| !m.out) {
+                    for m in messages
+                        .iter_mut()
+                        .filter(|m| !m.out && m.service.is_none())
+                    {
                         m.sender = Some(("Bob Smith".into(), m.author.color));
                     }
                 }

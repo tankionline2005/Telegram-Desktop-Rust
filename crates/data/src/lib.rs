@@ -7,6 +7,7 @@
 //! state it leads to, so after a crash the cache and the state always agree.
 
 pub mod convert;
+pub mod describe;
 pub mod drafts;
 
 use std::time::{Duration, Instant};
@@ -31,6 +32,8 @@ fn tdr_crypto_random() -> [u8; 8] {
 pub enum Error {
     Api(ApiError),
     Storage(tdr_storage::Error),
+    /// Something the client does not handle yet.
+    Unsupported(&'static str),
 }
 
 impl std::fmt::Display for Error {
@@ -38,6 +41,7 @@ impl std::fmt::Display for Error {
         match self {
             Self::Api(e) => write!(f, "{e}"),
             Self::Storage(e) => write!(f, "cache: {e}"),
+            Self::Unsupported(what) => write!(f, "not supported yet: {what}"),
         }
     }
 }
@@ -66,6 +70,8 @@ pub struct Applied {
     pub deleted: usize,
     /// The chat list was reloaded from scratch.
     pub reloaded: bool,
+    /// Read marks or mute settings changed (check marks, badges).
+    pub marks_changed: bool,
     /// Local drafts changed by the server (another device): the input field of an
     /// open chat should show the new text (`None`: cleared).
     pub draft_changes: Vec<drafts::Change>,
@@ -79,6 +85,7 @@ impl Applied {
         self.edited += other.edited;
         self.deleted += other.deleted;
         self.reloaded |= other.reloaded;
+        self.marks_changed |= other.marks_changed;
         self.draft_changes.extend(other.draft_changes);
         self.cloud_drafts.extend(other.cloud_drafts);
     }
@@ -166,6 +173,9 @@ impl Sync {
                 })?;
             }
         }
+        if self.store.meta_i64(MUTE_USERS)?.is_none() {
+            self.load_notify_defaults().await?;
+        }
         if !self.engine.has_state() || self.store.dialog_count()? == 0 {
             return self.full_load().await;
         }
@@ -178,6 +188,34 @@ impl Sync {
         debug!(elapsed = ?t.elapsed(), "chat list refreshed");
         self.apply_drafts(&mut applied)?;
         Ok(applied)
+    }
+
+    /// Default mute settings of private chats, groups and channels (chats without their
+    /// own setting follow them). Later changes come as `updateNotifySettings`.
+    async fn load_notify_defaults(&mut self) -> Result<()> {
+        let get = |peer| functions::account::GetNotifySettings { peer };
+        let (users, chats, broadcasts) = (
+            get(enums::InputNotifyPeer::InputNotifyUsers),
+            get(enums::InputNotifyPeer::InputNotifyChats),
+            get(enums::InputNotifyPeer::InputNotifyBroadcasts),
+        );
+        let (users, chats, broadcasts) = tokio::join!(
+            self.client.invoke(&users),
+            self.client.invoke(&chats),
+            self.client.invoke(&broadcasts),
+        );
+        let (users, chats, broadcasts) = (users?, chats?, broadcasts?);
+        self.store.write(|w| {
+            for (key, settings) in [
+                (MUTE_USERS, &users),
+                (MUTE_CHATS, &chats),
+                (MUTE_BROADCASTS, &broadcasts),
+            ] {
+                w.set_meta_i64(key, convert::mute_until(settings).unwrap_or(0).into())?;
+            }
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// Loads the state and the chat list from scratch.
@@ -260,6 +298,9 @@ impl Sync {
                     folder_id: d.folder_id.unwrap_or(0),
                     unread_count: d.unread_count,
                     pts: d.pts,
+                    read_inbox_max_id: d.read_inbox_max_id,
+                    read_outbox_max_id: d.read_outbox_max_id,
+                    mute_until: convert::mute_until(&d.notify_settings),
                 });
             }
             let dirty = self.engine.take_dirty_channels();
@@ -412,6 +453,91 @@ impl Sync {
         })?;
         applied.draft_changes.extend(changes);
         Ok(())
+    }
+
+    /// The `InputPeer` of a cached chat (needs its access hash).
+    pub fn input_peer(&self, peer: PeerKey) -> Option<enums::InputPeer> {
+        let hash = self.store.access_hash(peer).ok().flatten();
+        convert::input_peer(peer, hash)
+    }
+
+    /// Marks incoming messages up to `max_id` as read (the user saw them), as tdesktop's
+    /// `Histories::readInboxTill`: `messages.readHistory` (its pts goes through the
+    /// update engine like any `updateReadHistoryInbox`) or `channels.readHistory`.
+    pub async fn read_history(&mut self, peer: PeerKey, max_id: i32) -> Result<Applied> {
+        let access_hash = self.store.access_hash(peer)?;
+        if peer.kind == PeerKind::Channel {
+            let Some(access_hash) = access_hash else {
+                return Ok(Applied::default());
+            };
+            self.client
+                .invoke(&functions::channels::ReadHistory {
+                    channel: types::InputChannel {
+                        channel_id: peer.id,
+                        access_hash,
+                    }
+                    .into(),
+                    max_id,
+                })
+                .await?;
+            self.store.write(|w| w.set_read_inbox(peer, max_id, 0))?;
+            return Ok(Applied {
+                marks_changed: true,
+                ..Default::default()
+            });
+        }
+        let Some(input) = convert::input_peer(peer, access_hash) else {
+            return Ok(Applied::default());
+        };
+        let enums::messages::AffectedMessages::AffectedMessages(affected) = self
+            .client
+            .invoke(&functions::messages::ReadHistory {
+                peer: input,
+                max_id,
+            })
+            .await?;
+        let update = types::UpdateReadHistoryInbox {
+            folder_id: None,
+            peer: convert::peer_to_tl(peer),
+            top_msg_id: None,
+            max_id,
+            still_unread_count: 0,
+            pts: affected.pts,
+            pts_count: affected.pts_count,
+        };
+        self.feed(
+            types::UpdateShort {
+                update: update.into(),
+                date: self.client.server_time(),
+            }
+            .into(),
+        )
+        .await
+    }
+
+    /// Members of a group or subscribers of a channel (`*.getFullChannel`; basic groups
+    /// carry the number in their object).
+    pub async fn member_count(&mut self, peer: PeerKey) -> Result<Option<i32>> {
+        if peer.kind != PeerKind::Channel {
+            return Ok(None);
+        }
+        let Some(access_hash) = self.store.access_hash(peer)? else {
+            return Ok(None);
+        };
+        let enums::messages::ChatFull::ChatFull(full) = self
+            .client
+            .invoke(&functions::channels::GetFullChannel {
+                channel: types::InputChannel {
+                    channel_id: peer.id,
+                    access_hash,
+                }
+                .into(),
+            })
+            .await?;
+        Ok(match &full.full_chat {
+            enums::ChatFull::ChannelFull(c) => c.participants_count,
+            _ => None,
+        })
     }
 
     /// Sends a text message and records it in the cache.
@@ -575,6 +701,56 @@ impl Sync {
     }
 }
 
+/// Downloads a peer's small userpic (`inputPeerPhotoFileLocation`, from the DC that
+/// stores it). Independent of `Sync`, so several can run at once.
+pub async fn download_userpic(
+    client: &Client,
+    peer: enums::InputPeer,
+    photo_id: i64,
+    dc_id: i32,
+) -> Result<Vec<u8>> {
+    // upload.getFile: the limit must divide 1 MiB and offsets must be multiples of it.
+    const PART: i32 = 512 * 1024;
+    let location: enums::InputFileLocation = types::InputPeerPhotoFileLocation {
+        big: false,
+        peer,
+        photo_id,
+    }
+    .into();
+    let mut data = Vec::new();
+    loop {
+        let request = functions::upload::GetFile {
+            precise: false,
+            cdn_supported: false,
+            location: location.clone(),
+            offset: data.len() as i64,
+            limit: PART,
+        };
+        let enums::upload::File::File(part) = client.invoke_in(dc_id, &request).await? else {
+            return Err(Error::Unsupported("CDN file"));
+        };
+        let done = part.bytes.len() < PART as usize;
+        data.extend_from_slice(&part.bytes);
+        if done {
+            return Ok(data);
+        }
+    }
+}
+
+/// Default `mute_until` per chat type (`account.getNotifySettings`), in `meta`.
+pub const MUTE_USERS: &str = "mute_users";
+pub const MUTE_CHATS: &str = "mute_chats";
+pub const MUTE_BROADCASTS: &str = "mute_broadcasts";
+
+/// The "Telegram" account that posts service notifications (`kServiceNotificationsId`).
+pub const SERVICE_NOTIFICATIONS_ID: i64 = 777000;
+
+fn unix_now() -> i32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i32)
+}
+
 fn new_message(
     w: &tdr_storage::Writer<'_>,
     row: MessageRow,
@@ -636,6 +812,9 @@ fn apply_item(
                     folder_id: d.folder_id.unwrap_or(0),
                     unread_count: d.unread_count,
                     pts: d.pts,
+                    read_inbox_max_id: d.read_inbox_max_id,
+                    read_outbox_max_id: d.read_outbox_max_id,
+                    mute_until: convert::mute_until(&d.notify_settings),
                 })?;
             }
         }
@@ -681,6 +860,38 @@ fn apply_update(
             w.delete_messages(PeerKey::channel(x.channel_id), &x.messages)?;
             applied.deleted += x.messages.len();
         }
+        // Login alerts and other notices: the server sends them as updates, the client
+        // shows them as messages from "Telegram" (`Session::serviceNotification`).
+        // Popups, forced log-outs and withdrawal notices are not messages.
+        U::ServiceNotification(x)
+            if !x.popup
+                && !x.r#type.starts_with("AUTH_KEY_DROP_")
+                && !x.r#type.starts_with("API_WITHDRAWAL_FEATURE_DISABLED_") =>
+        {
+            let peer = PeerKey::user(SERVICE_NOTIFICATIONS_ID);
+            let date = x.inbox_date.unwrap_or_else(unix_now);
+            if !w.has_local_message(peer, date, &x.message)? {
+                w.put_peer_if_missing(&tdr_storage::PeerRow {
+                    key: peer,
+                    access_hash: None,
+                    is_min: false,
+                    is_megagroup: false,
+                    name: "Telegram".into(),
+                    username: None,
+                    raw: None,
+                })?;
+                let row = MessageRow {
+                    peer,
+                    id: w.next_local_message_id()?,
+                    date,
+                    from: Some(peer),
+                    out: false,
+                    text: x.message.clone(),
+                    raw: None,
+                };
+                new_message(w, row, applied)?;
+            }
+        }
         U::DraftMessage(x) if x.top_msg_id.is_none() && x.saved_peer_id.is_none() => {
             applied.cloud_drafts.push((
                 convert::peer_key(&x.peer),
@@ -688,9 +899,44 @@ fn apply_update(
                 false,
             ));
         }
-        U::ReadHistoryInbox(x) => w.set_unread(convert::peer_key(&x.peer), x.still_unread_count)?,
+        U::ReadHistoryInbox(x) if x.top_msg_id.is_none() => {
+            w.set_read_inbox(convert::peer_key(&x.peer), x.max_id, x.still_unread_count)?;
+            applied.marks_changed = true;
+        }
         U::ReadChannelInbox(x) => {
-            w.set_unread(PeerKey::channel(x.channel_id), x.still_unread_count)?
+            w.set_read_inbox(
+                PeerKey::channel(x.channel_id),
+                x.max_id,
+                x.still_unread_count,
+            )?;
+            applied.marks_changed = true;
+        }
+        U::ReadHistoryOutbox(x) => {
+            w.set_read_outbox(convert::peer_key(&x.peer), x.max_id)?;
+            applied.marks_changed = true;
+        }
+        U::ReadChannelOutbox(x) => {
+            w.set_read_outbox(PeerKey::channel(x.channel_id), x.max_id)?;
+            applied.marks_changed = true;
+        }
+        U::NotifySettings(x) => {
+            let mute = convert::mute_until(&x.notify_settings);
+            match &x.peer {
+                enums::NotifyPeer::NotifyPeer(p) => {
+                    w.set_mute_until(convert::peer_key(&p.peer), mute)?;
+                }
+                enums::NotifyPeer::NotifyUsers => {
+                    w.set_meta_i64(MUTE_USERS, mute.unwrap_or(0).into())?
+                }
+                enums::NotifyPeer::NotifyChats => {
+                    w.set_meta_i64(MUTE_CHATS, mute.unwrap_or(0).into())?
+                }
+                enums::NotifyPeer::NotifyBroadcasts => {
+                    w.set_meta_i64(MUTE_BROADCASTS, mute.unwrap_or(0).into())?
+                }
+                _ => {}
+            }
+            applied.marks_changed = true;
         }
         // Statuses, typing, reactions, ... are not cached yet.
         _ => {}
@@ -797,5 +1043,52 @@ impl Sync {
         self.load_dialogs(INITIAL_DIALOGS).await?;
         self.store.write(|w| w.set_meta_i64("dialogs_stale", 0))?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notification(popup: bool, kind: &str, date: i32) -> enums::Update {
+        enums::Update::ServiceNotification(Box::new(types::UpdateServiceNotification {
+            popup,
+            invert_media: false,
+            inbox_date: Some(date),
+            r#type: kind.into(),
+            message: "New login.".into(),
+            media: enums::MessageMedia::Empty,
+            entities: vec![],
+        }))
+    }
+
+    #[test]
+    fn service_notifications_become_telegram_messages() {
+        let mut store = Storage::open_in_memory().unwrap();
+        let mut applied = Applied::default();
+        store
+            .write(|w| {
+                apply_update(w, &notification(false, "auth123_1", 5000), &mut applied)?;
+                // The same one again (difference and live): no duplicate.
+                apply_update(w, &notification(false, "auth123_1", 5000), &mut applied)?;
+                // Popups and forced log-outs are not messages.
+                apply_update(w, &notification(true, "x", 5001), &mut applied)?;
+                apply_update(
+                    w,
+                    &notification(false, "AUTH_KEY_DROP_DUPLICATE", 5002),
+                    &mut applied,
+                )
+            })
+            .unwrap();
+        assert_eq!(applied.new_messages.len(), 1);
+        let tg = PeerKey::user(SERVICE_NOTIFICATIONS_ID);
+        let history = store.history(tg, 10).unwrap();
+        assert_eq!(history.messages.len(), 1);
+        assert_eq!(history.messages[0].text, "New login.");
+        assert!(history.messages[0].id > tdr_storage::SERVER_MAX_MESSAGE_ID);
+        let list = store.dialogs(0, 10).unwrap();
+        assert_eq!(list[0].dialog.peer, tg);
+        assert_eq!(list[0].dialog.unread_count, 1);
+        assert_eq!(list[0].peer.as_ref().unwrap().name, "Telegram");
     }
 }

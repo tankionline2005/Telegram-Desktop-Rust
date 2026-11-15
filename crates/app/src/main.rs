@@ -10,6 +10,7 @@ mod bridge;
 mod icons;
 mod one_line;
 mod placement;
+mod present;
 mod text_input;
 #[cfg(windows)]
 mod tray;
@@ -182,6 +183,7 @@ fn main() {
             bridge::Paths {
                 session: data_dir().join("session.bin"),
                 cache: data_dir().join("cache.sqlite"),
+                files: data_dir().join("files"),
             },
         )
     };
@@ -239,10 +241,15 @@ fn main() {
                         // Keys (Esc) need a focused element from the start.
                         window.focus(&gpui::Focusable::focus_handle(&view, cx));
                         watch_placement(placement_path.clone(), window, cx);
-                        #[cfg(windows)]
-                        cx.observe_window_activation(window, |_, window, _| {
-                            tray::Tray::window_activation_changed(window.is_window_active());
-                        })
+                        cx.observe_window_activation(
+                            window,
+                            |view: &mut ui::MainView, window, _| {
+                                let active = window.is_window_active();
+                                #[cfg(windows)]
+                                tray::Tray::window_activation_changed(active);
+                                view.window_activation_changed(active);
+                            },
+                        )
                         .detach();
                         view
                     })

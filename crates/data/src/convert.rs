@@ -15,6 +15,12 @@ pub fn peer_key(peer: &enums::Peer) -> PeerKey {
     }
 }
 
+/// `peerNotifySettings.mute_until` (`None`: the default of the chat type applies).
+pub fn mute_until(settings: &enums::PeerNotifySettings) -> Option<i32> {
+    let enums::PeerNotifySettings::PeerNotifySettings(s) = settings;
+    s.mute_until
+}
+
 pub fn cloud_draft(draft: &enums::DraftMessage) -> crate::drafts::CloudDraft {
     use crate::drafts::CloudDraft;
     match draft {
@@ -95,11 +101,7 @@ pub fn chat_row(chat: &enums::Chat) -> Option<PeerRow> {
 pub fn message_row(message: &enums::Message) -> Option<MessageRow> {
     match message {
         enums::Message::Message(m) => {
-            let text = if m.message.is_empty() && m.media.is_some() {
-                "[media]".to_string()
-            } else {
-                m.message.clone()
-            };
+            let text = m.message.clone();
             Some(MessageRow {
                 peer: peer_key(&m.peer_id),
                 id: m.id,
@@ -116,7 +118,7 @@ pub fn message_row(message: &enums::Message) -> Option<MessageRow> {
             date: m.date,
             from: m.from_id.as_ref().map(peer_key),
             out: m.out,
-            text: "[service message]".into(),
+            text: String::new(),
             raw: raw(message),
         }),
         enums::Message::Empty(_) => None,
@@ -148,6 +150,15 @@ pub fn short_chat_message_row(m: &types::UpdateShortChatMessage) -> MessageRow {
 }
 
 /// `InputPeer` for a cached peer (needs its access hash for users and channels).
+pub fn peer_to_tl(key: PeerKey) -> enums::Peer {
+    use tdr_storage::PeerKind;
+    match key.kind {
+        PeerKind::User => types::PeerUser { user_id: key.id }.into(),
+        PeerKind::Chat => types::PeerChat { chat_id: key.id }.into(),
+        PeerKind::Channel => types::PeerChannel { channel_id: key.id }.into(),
+    }
+}
+
 pub fn input_peer(key: PeerKey, access_hash: Option<i64>) -> Option<enums::InputPeer> {
     use tdr_storage::PeerKind;
     Some(match key.kind {

@@ -24,7 +24,11 @@ pub use rusqlite::Error;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Schema version (`PRAGMA user_version`); bump with a migration in [`migrate`].
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
+
+/// Message ids above this are made by the client (tdesktop's `ServerMaxMsgId`), e.g.
+/// service notifications that the server sends as updates rather than messages.
+pub const SERVER_MAX_MESSAGE_ID: i32 = 0x3FFF_FFFF;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PeerKind {
@@ -106,6 +110,12 @@ pub struct DialogRow {
     pub unread_count: i32,
     /// For channels: the pts of the channel's update sequence.
     pub pts: Option<i32>,
+    /// Incoming messages up to this id are read.
+    pub read_inbox_max_id: i32,
+    /// Outgoing messages up to this id are read by the other side (✓✓).
+    pub read_outbox_max_id: i32,
+    /// Muted until this Unix time; `None`: the default for the chat type.
+    pub mute_until: Option<i32>,
 }
 
 /// A chat-list entry with what is needed to show it.
@@ -173,6 +183,15 @@ fn migrate(conn: &mut Connection) -> Result<()> {
                 date INTEGER NOT NULL,
                 PRIMARY KEY (kind, id)
              ) WITHOUT ROWID;",
+        )?;
+    }
+    if version < 4 {
+        // Read state (check marks, the "Unread messages" bar) and mute settings
+        // (NULL: the default of the chat type).
+        tx.execute_batch(
+            "ALTER TABLE dialogs ADD COLUMN read_inbox_max_id INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE dialogs ADD COLUMN read_outbox_max_id INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE dialogs ADD COLUMN mute_until INTEGER;",
         )?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -384,12 +403,27 @@ impl Storage {
         rows.collect()
     }
 
+    /// Unread count and read marks of one chat: (unread, read_inbox_max_id,
+    /// read_outbox_max_id).
+    pub fn read_marks(&self, peer: PeerKey) -> Result<Option<(i32, i32, i32)>> {
+        self.conn
+            .prepare_cached(
+                "SELECT unread_count, read_inbox_max_id, read_outbox_max_id FROM dialogs
+                 WHERE kind = ?1 AND id = ?2",
+            )?
+            .query_row(params![peer.kind as i64, peer.id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()
+    }
+
     pub fn dialogs(&self, folder_id: i32, limit: usize) -> Result<Vec<DialogView>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT d.kind, d.id, d.top_message, d.top_date, d.pinned, d.folder_id, d.unread_count, d.pts,
                     p.kind, p.id, p.access_hash, p.is_min, p.is_megagroup, p.name, p.username, p.raw_layer, p.raw,
                     m.date, m.from_kind, m.from_id, m.out, m.text, m.raw_layer, m.raw,
-                    dr.text, dr.date
+                    dr.text, dr.date,
+                    d.read_inbox_max_id, d.read_outbox_max_id, d.mute_until
              FROM dialogs d
              LEFT JOIN peers p ON p.kind = d.kind AND p.id = d.id
              LEFT JOIN messages m ON m.kind = d.kind AND m.peer_id = d.id AND m.id = d.top_message
@@ -411,6 +445,9 @@ impl Storage {
                 folder_id: r.get(5)?,
                 unread_count: r.get(6)?,
                 pts: r.get(7)?,
+                read_inbox_max_id: r.get(26)?,
+                read_outbox_max_id: r.get(27)?,
+                mute_until: r.get(28)?,
             };
             let peer = match r.get::<_, Option<i64>>(8)? {
                 Some(_) => Some(read_peer_at(r, 8)?),
@@ -614,18 +651,68 @@ impl Writer<'_> {
         Ok(())
     }
 
-    pub fn put_dialog(&self, d: &DialogRow) -> Result<()> {
+    /// A new id for a message made by the client (above [`SERVER_MAX_MESSAGE_ID`]).
+    pub fn next_local_message_id(&self) -> Result<i32> {
+        let last: i64 = self
+            .tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'local_message_id'",
+                [],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .and_then(|v| v.try_into().ok().map(i64::from_le_bytes))
+            .unwrap_or(i64::from(SERVER_MAX_MESSAGE_ID));
+        let next = last + 1;
+        self.set_meta_i64("local_message_id", next)?;
+        Ok(next as i32)
+    }
+
+    /// A client-made message with this date and text exists (the same service
+    /// notification can come twice: in a difference and live).
+    pub fn has_local_message(&self, peer: PeerKey, date: i32, text: &str) -> Result<bool> {
         self.tx
             .prepare_cached(
-                "INSERT INTO dialogs (kind, id, top_message, top_date, pinned, folder_id, unread_count, pts, cached_from)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?3)
+                "SELECT EXISTS (SELECT 1 FROM messages WHERE kind = ?1 AND peer_id = ?2
+                                AND id > ?3 AND date = ?4 AND text = ?5)",
+            )?
+            .query_row(
+                params![peer.kind as i64, peer.id, SERVER_MAX_MESSAGE_ID, date, text],
+                |r| r.get(0),
+            )
+    }
+
+    /// Stores a peer unless one is already known (e.g. the "Telegram" service account
+    /// for notifications that arrive before its user object).
+    pub fn put_peer_if_missing(&self, p: &PeerRow) -> Result<()> {
+        let known: bool = self
+            .tx
+            .prepare_cached("SELECT EXISTS (SELECT 1 FROM peers WHERE kind = ?1 AND id = ?2)")?
+            .query_row(params![p.key.kind as i64, p.key.id], |r| r.get(0))?;
+        if known { Ok(()) } else { self.put_peer(p) }
+    }
+
+    pub fn put_dialog(&self, d: &DialogRow) -> Result<()> {
+        // A newer client-made top message (a service notification) survives refreshes
+        // that bring the server's older top message.
+        self.tx
+            .prepare_cached(
+                "INSERT INTO dialogs (kind, id, top_message, top_date, pinned, folder_id, unread_count, pts, cached_from,
+                                      read_inbox_max_id, read_outbox_max_id, mute_until)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?3, ?10, ?11, ?12)
                  ON CONFLICT (kind, id) DO UPDATE SET
+                    read_inbox_max_id  = MAX(dialogs.read_inbox_max_id, excluded.read_inbox_max_id),
+                    read_outbox_max_id = MAX(dialogs.read_outbox_max_id, excluded.read_outbox_max_id),
+                    mute_until       = excluded.mute_until,
                     cached_from      = CASE WHEN dialogs.top_message = excluded.top_message
+                                              OR (dialogs.top_message > ?9 AND dialogs.top_date >= excluded.top_date)
                                             THEN dialogs.cached_from ELSE excluded.top_message END,
                     history_complete = CASE WHEN dialogs.top_message = excluded.top_message
+                                              OR (dialogs.top_message > ?9 AND dialogs.top_date >= excluded.top_date)
                                             THEN dialogs.history_complete ELSE 0 END,
-                    top_message      = excluded.top_message,
-                    top_date         = excluded.top_date,
+                    top_message      = CASE WHEN dialogs.top_message > ?9 AND dialogs.top_date >= excluded.top_date
+                                            THEN dialogs.top_message ELSE excluded.top_message END,
+                    top_date         = MAX(dialogs.top_date * (dialogs.top_message > ?9), excluded.top_date),
                     pinned           = excluded.pinned,
                     folder_id        = excluded.folder_id,
                     unread_count     = excluded.unread_count,
@@ -639,7 +726,11 @@ impl Writer<'_> {
                 d.pinned,
                 d.folder_id,
                 d.unread_count,
-                d.pts
+                d.pts,
+                SERVER_MAX_MESSAGE_ID,
+                d.read_inbox_max_id,
+                d.read_outbox_max_id,
+                d.mute_until
             ])?;
         Ok(())
     }
@@ -657,6 +748,36 @@ impl Writer<'_> {
                     unread_count = dialogs.unread_count + excluded.unread_count",
             )?
             .execute(params![m.peer.kind as i64, m.peer.id, m.id, m.date, (!m.out) as i32])?;
+        Ok(())
+    }
+
+    /// `updateReadHistoryInbox`: read up to `max_id`, `unread` left.
+    pub fn set_read_inbox(&self, peer: PeerKey, max_id: i32, unread: i32) -> Result<()> {
+        self.tx
+            .prepare_cached(
+                "UPDATE dialogs SET unread_count = ?4, read_inbox_max_id = MAX(read_inbox_max_id, ?3)
+                 WHERE kind = ?1 AND id = ?2",
+            )?
+            .execute(params![peer.kind as i64, peer.id, max_id, unread])?;
+        Ok(())
+    }
+
+    /// `updateReadHistoryOutbox`: the other side read our messages up to `max_id`.
+    pub fn set_read_outbox(&self, peer: PeerKey, max_id: i32) -> Result<()> {
+        self.tx
+            .prepare_cached(
+                "UPDATE dialogs SET read_outbox_max_id = MAX(read_outbox_max_id, ?3)
+                 WHERE kind = ?1 AND id = ?2",
+            )?
+            .execute(params![peer.kind as i64, peer.id, max_id])?;
+        Ok(())
+    }
+
+    /// `updateNotifySettings` for one chat.
+    pub fn set_mute_until(&self, peer: PeerKey, mute_until: Option<i32>) -> Result<()> {
+        self.tx
+            .prepare_cached("UPDATE dialogs SET mute_until = ?3 WHERE kind = ?1 AND id = ?2")?
+            .execute(params![peer.kind as i64, peer.id, mute_until])?;
         Ok(())
     }
 
@@ -744,6 +865,62 @@ mod tests {
     }
 
     #[test]
+    fn local_messages_survive_chat_list_refreshes() {
+        let mut s = Storage::open_in_memory().unwrap();
+        let tg = PeerKey::user(777000);
+        let dialog = |top_message, top_date| DialogRow {
+            peer: tg,
+            top_message,
+            top_date,
+            pinned: false,
+            folder_id: 0,
+            unread_count: 0,
+            pts: None,
+            read_inbox_max_id: 0,
+            read_outbox_max_id: 0,
+            mute_until: None,
+        };
+        s.write(|w| {
+            w.put_message(&msg(tg, 100, 1000, false, "old"))?;
+            w.put_dialog(&dialog(100, 1000))
+        })
+        .unwrap();
+        // A service notification becomes a local message on top.
+        let local = s
+            .write(|w| {
+                let id = w.next_local_message_id()?;
+                let m = msg(tg, id, 2000, false, "notification");
+                w.put_message(&m)?;
+                w.message_arrived(&m)?;
+                Ok(id)
+            })
+            .unwrap();
+        assert!(local > SERVER_MAX_MESSAGE_ID);
+        let ids = |s: &Storage| -> Vec<i32> {
+            s.history(tg, 10)
+                .unwrap()
+                .messages
+                .iter()
+                .map(|m| m.id)
+                .collect()
+        };
+        assert_eq!(ids(&s), vec![local, 100]);
+        // The server's list still has the old top message: the local one stays.
+        s.write(|w| w.put_dialog(&dialog(100, 1000))).unwrap();
+        assert_eq!(ids(&s), vec![local, 100]);
+        // A newer real message takes over.
+        s.write(|w| {
+            w.put_message(&msg(tg, 101, 3000, false, "new"))?;
+            w.put_dialog(&dialog(101, 3000))
+        })
+        .unwrap();
+        assert_eq!(ids(&s)[0], 101);
+        // Ids keep counting up.
+        let next = s.write(|w| w.next_local_message_id()).unwrap();
+        assert_eq!(next, local + 1);
+    }
+
+    #[test]
     fn drafts_are_stored_and_lift_their_chat() {
         let mut s = Storage::open_in_memory().unwrap();
         let (a, b) = (PeerKey::user(1), PeerKey::user(2));
@@ -757,6 +934,9 @@ mod tests {
                     folder_id: 0,
                     unread_count: 0,
                     pts: None,
+                    read_inbox_max_id: 0,
+                    read_outbox_max_id: 0,
+                    mute_until: None,
                 })?;
             }
             Ok(())
@@ -886,6 +1066,9 @@ mod tests {
             folder_id: 0,
             unread_count: 0,
             pts: None,
+            read_inbox_max_id: 0,
+            read_outbox_max_id: 0,
+            mute_until: None,
         };
         // Chat list load: only the top message is known.
         s.write(|w| {

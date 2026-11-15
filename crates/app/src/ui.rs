@@ -4,22 +4,26 @@
 //! `chat_helpers.style`, `window/window.style`, `lib_ui/ui/widgets/widgets.style`),
 //! colors come from its palette (`tdr-theme`), icons from its resources (`icons`).
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight, ListAlignment, ListOffset,
-    ListState, MouseButton, PathBuilder, Pixels, Rgba, SharedString, TextRun, Window,
-    WindowControlArea, canvas, div, font, linear_color_stop, linear_gradient, list, point,
-    prelude::*, px, rgba, uniform_list,
+    ListState, MouseButton, PathBuilder, Pixels, RenderImage, Rgba, SharedString, TextRun,
+    UniformListScrollHandle, Window, WindowControlArea, canvas, div, font, img, linear_color_stop,
+    linear_gradient, list, point, prelude::*, px, rgba, uniform_list,
 };
+use tdr_data::describe::PeerKind as ChatKind;
 use tdr_data::tdr_storage::PeerKey;
 use tdr_theme::{Color, Palette};
 use tokio::sync::mpsc;
 
-use crate::bridge::{Author, Command, DialogItem, MessageItem, Update};
+use crate::bridge::{Command, DialogItem, MessageItem, Update};
 use crate::icons::{Icon, icon};
 use crate::one_line::one_line;
+use crate::present;
 use crate::text_input::{LINE_HEIGHT, Submit, TextInput};
 
 gpui::actions!(main_view, [Escape]);
@@ -39,6 +43,10 @@ const DIALOG_PADDING_X: f32 = 10.;
 const DIALOG_PADDING_Y: f32 = 8.;
 const DIALOGS_WIDTH: f32 = 320.;
 const TOP_BAR_HEIGHT: f32 = 54.;
+// dialogs.style: dialogsChatTypeSkip, dialogsUnread*
+const CHAT_TYPE_SKIP: f32 = 3.;
+const UNREAD_HEIGHT: f32 = 19.;
+const UNREAD_PADDING: f32 = 5.;
 // window.style: adaptiveChatWideWidth
 const CHAT_WIDE_WIDTH: f32 = 880.;
 // window_main_menu.style: mainMenuWidth
@@ -55,6 +63,19 @@ const MSG_SIDE: f32 = 16.;
 const MSG_MARGIN_FAR: f32 = 56.;
 const MSG_PHOTO_SIZE: f32 = 33.;
 const MSG_PHOTO_SKIP: f32 = 40.;
+// msgServicePadding, msgServiceMargin
+const SERVICE_PADDING_X: f32 = 12.;
+const SERVICE_PADDING_TOP: f32 = 3.;
+const SERVICE_PADDING_BOTTOM: f32 = 4.;
+const SERVICE_MARGIN_TOP: f32 = 10.;
+const SERVICE_MARGIN_BOTTOM: f32 = 2.;
+const SERVICE_MAX_WIDTH: f32 = 320.;
+// historyUnreadBarHeight, historyUnreadBarMargin
+const UNREAD_BAR_HEIGHT: f32 = 32.;
+const UNREAD_BAR_MARGIN: f32 = 8.;
+/// Room after the time for the ✓ / ✓✓ of outgoing messages (`historySendStateSpace`
+/// minus the gap already there).
+const SEND_STATE_SPACE: f32 = 18.;
 /// Messages of one author closer than this are drawn as a group
 /// (tdesktop: `kAttachMessageToPreviousSecondsDelta`).
 const ATTACH_SECONDS: i32 = 900;
@@ -104,7 +125,7 @@ fn text_width(window: &Window, text: &str, size: f32, weight: FontWeight) -> f32
         .fold(0., f32::max)
 }
 
-/// tdesktop's two-color userpic gradients, in `color_index` order
+/// tdesktop's two-color userpic gradients, by color index
 /// (`ColorIndexToPaletteIndex`: 0, 7, 4, 1, 6, 3, 5).
 fn userpic_colors(p: &Palette, index: u8) -> (Color, Color) {
     [
@@ -132,7 +153,7 @@ fn name_color(p: &Palette, index: u8) -> Color {
 
 /// An empty userpic: gradient circle with initials (`Ui::EmptyUserpic::paint`), or the
 /// Saved Messages bookmark (`PaintSavedMessages`).
-fn userpic(p: &Palette, size: f32, initials: &str, color: u8, saved: bool) -> gpui::Div {
+fn empty_userpic(p: &Palette, size: f32, initials: &str, color: u8, saved: bool) -> gpui::Div {
     let (top, bottom) = if saved {
         (
             p.history_peer_saved_messages_bg,
@@ -198,15 +219,55 @@ fn paint_bookmark(bounds: gpui::Bounds<Pixels>, size: f32, fg: Color, window: &m
     }
 }
 
+/// A grey rounded "service" pill (dates, service messages, `msgServiceBg`).
+fn service_pill(p: &Palette, text: String, width: f32) -> gpui::Div {
+    div()
+        .flex_none()
+        .w(px(width + 2. * SERVICE_PADDING_X))
+        .px(px(SERVICE_PADDING_X))
+        .pt(px(SERVICE_PADDING_TOP))
+        .pb(px(SERVICE_PADDING_BOTTOM))
+        .rounded(px(11.))
+        .bg(c(p.msg_service_bg))
+        .text_color(c(p.msg_service_fg))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_center()
+        .child(text)
+}
+
 /// Scrollbar drag in progress: where it started.
 struct ScrollDrag {
     start_mouse_y: Pixels,
     start_offset: Pixels,
 }
 
+/// One overlay scrollbar (tdesktop's `ScrollArea`): shown while scrolling and on hover.
+#[derive(Default)]
+struct Scrollbar {
+    last_scroll: Option<Instant>,
+    hovered: bool,
+    drag: Option<ScrollDrag>,
+}
+
+impl Scrollbar {
+    fn visible(&self) -> bool {
+        self.last_scroll
+            .is_some_and(|t| t.elapsed() < SCROLL_HIDE_AFTER)
+            || self.hovered
+            || self.drag.is_some()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Area {
+    History,
+    Dialogs,
+}
+
 pub struct MainView {
     dark: bool,
     dialogs: Vec<DialogItem>,
+    dialogs_scroll: UniformListScrollHandle,
     selected: Option<PeerKey>,
     messages: Vec<MessageItem>,
     messages_state: ListState,
@@ -215,9 +276,22 @@ pub struct MainView {
     /// Keep the newest message in view (true until the user scrolls up, and again once
     /// they scroll back to the bottom).
     stick_to_bottom: bool,
-    last_scroll: Option<Instant>,
-    scroll_hovered: bool,
-    scroll_drag: Option<ScrollDrag>,
+    history_bar: Scrollbar,
+    dialogs_bar: Scrollbar,
+    /// Opening a chat with unread messages: its `read_inbox_max_id`, until the history
+    /// arrives and the view is placed at the first unread message.
+    unread_target: Option<i32>,
+    /// The "Unread messages" bar goes above this message (while the chat is open).
+    unread_bar: Option<i32>,
+    /// The newest message id already reported as read.
+    read_till: i32,
+    window_active: bool,
+    /// Member counts from full chat info ("906 members").
+    members: HashMap<PeerKey, String>,
+    /// Decoded userpics by peer, with their photo id.
+    userpics: HashMap<PeerKey, (i64, Arc<RenderImage>)>,
+    /// Photos already asked for.
+    userpic_requests: RefCell<HashSet<i64>>,
     /// Draft edits made here or pushed from the server since the chat list was last
     /// loaded (`None`: cleared). They win over the list's own `DialogItem::draft`,
     /// which may lag behind the data thread.
@@ -262,6 +336,8 @@ impl MainView {
                 this.draft_dirty_since = None;
                 this.draft_generation += 1;
                 this.stick_to_bottom = true;
+                // tdesktop drops the bar once you write.
+                this.unread_bar = None;
                 let _ = this.commands.send(Command::Send {
                     peer,
                     text: text.clone(),
@@ -286,11 +362,13 @@ impl MainView {
         messages_state.set_scroll_handler(move |event, _window, cx| {
             let near_top = event.visible_range.start <= LOAD_OLDER_THRESHOLD;
             let at_bottom = event.visible_range.end >= event.count;
+            let visible_end = event.visible_range.end;
             let view = view.clone();
             cx.defer(move |cx| {
                 let _ = view.update(cx, |v, cx| {
                     v.stick_to_bottom = at_bottom;
-                    v.scrolled(cx);
+                    v.scrolled(Area::History, cx);
+                    v.mark_read(visible_end);
                     if near_top {
                         v.load_older();
                     }
@@ -307,15 +385,22 @@ impl MainView {
         Self {
             dark,
             dialogs: Vec::new(),
+            dialogs_scroll: UniformListScrollHandle::new(),
             selected: None,
             messages: Vec::new(),
             messages_state,
             history_complete: false,
             loading_older: false,
             stick_to_bottom: true,
-            last_scroll: None,
-            scroll_hovered: false,
-            scroll_drag: None,
+            history_bar: Scrollbar::default(),
+            dialogs_bar: Scrollbar::default(),
+            unread_target: None,
+            unread_bar: None,
+            read_till: 0,
+            window_active: true,
+            members: HashMap::new(),
+            userpics: HashMap::new(),
+            userpic_requests: RefCell::new(HashSet::new()),
             drafts: HashMap::new(),
             input_text: String::new(),
             draft_generation: 0,
@@ -347,6 +432,14 @@ impl MainView {
         }
     }
 
+    /// The window gained or lost focus: messages count as seen only in an active window.
+    pub fn window_activation_changed(&mut self, active: bool) {
+        self.window_active = active;
+        if active && self.stick_to_bottom {
+            self.mark_read(self.messages.len());
+        }
+    }
+
     fn apply(&mut self, update: Update, cx: &mut Context<Self>) {
         match update {
             Update::Dialogs(list) => {
@@ -357,8 +450,7 @@ impl MainView {
                 if let Some(i) = self.open_on_start.take()
                     && let Some(peer) = self.dialogs.get(i).map(|d| d.peer)
                 {
-                    self.selected = Some(peer);
-                    let _ = self.commands.send(Command::OpenChat(peer));
+                    self.start_opening(peer);
                 }
             }
             Update::History {
@@ -385,24 +477,53 @@ impl MainView {
                     self.set_input_text(text.unwrap_or_default(), cx);
                 }
             }
+            Update::Members { peer, text } => {
+                self.members.insert(peer, text);
+            }
+            Update::Userpic {
+                peer,
+                photo_id,
+                image,
+            } => {
+                self.userpics.insert(peer, (photo_id, image));
+            }
             Update::Status(s) => self.status = s,
             Update::Fatal(e) => self.fatal = Some(e),
         }
         cx.notify();
     }
 
-    /// Replaces the shown messages, keeping the scroll position (or the bottom).
+    /// Replaces the shown messages, keeping the scroll position (or the bottom). The
+    /// first history of a chat with unread messages opens at the first unread one with
+    /// the "Unread messages" bar, as in tdesktop.
     fn set_messages(&mut self, new: Vec<MessageItem>) {
+        let mut reveal = None;
+        if let Some(read_till) = self.unread_target
+            && !new.is_empty()
+        {
+            self.unread_target = None;
+            if let Some(ix) = new.iter().position(|m| m.id > read_till && !m.out) {
+                self.unread_bar = Some(new[ix].id);
+                self.stick_to_bottom = false;
+                reveal = Some(ix);
+            }
+        }
         self.update_list(new);
-        if self.stick_to_bottom && !self.messages.is_empty() {
+        if let Some(ix) = reveal {
+            self.messages_state.scroll_to(ListOffset {
+                item_ix: ix,
+                offset_in_item: px(0.),
+            });
+        } else if self.stick_to_bottom && !self.messages.is_empty() {
             self.messages_state
                 .scroll_to_reveal_item(self.messages.len() - 1);
+            self.mark_read(self.messages.len());
         }
     }
 
     /// Tells the list exactly what changed: older messages prepended, new ones appended,
     /// edits in place. (A full reset would lose the position.) Neighbours of changed
-    /// messages are re-measured too: grouping changes their margins and corners.
+    /// messages are re-measured too: grouping and date dividers depend on them.
     fn update_list(&mut self, new: Vec<MessageItem>) {
         let old = std::mem::take(&mut self.messages);
         let same_block = old.first().and_then(|first| {
@@ -456,6 +577,28 @@ impl MainView {
         }
     }
 
+    /// The messages before `visible_end` were seen: tell the server (tdesktop's
+    /// `readInboxTill`), if the window is active.
+    fn mark_read(&mut self, visible_end: usize) {
+        let Some(peer) = self.selected else { return };
+        if !self.window_active || visible_end == 0 {
+            return;
+        }
+        let Some(last) = self.messages.get(visible_end.min(self.messages.len()) - 1) else {
+            return;
+        };
+        let has_unread = self.messages[..visible_end.min(self.messages.len())]
+            .iter()
+            .any(|m| !m.out && m.id > self.read_till);
+        if last.id > self.read_till && has_unread {
+            self.read_till = last.id;
+            let _ = self.commands.send(Command::Read {
+                peer,
+                max_id: last.id,
+            });
+        }
+    }
+
     fn load_older(&mut self) {
         if self.loading_older || self.history_complete || self.messages.is_empty() {
             return;
@@ -466,9 +609,23 @@ impl MainView {
         }
     }
 
-    /// The list scrolled: show the scrollbar for a moment.
-    fn scrolled(&mut self, cx: &mut Context<Self>) {
-        self.last_scroll = Some(Instant::now());
+    fn bar_mut(&mut self, area: Area) -> &mut Scrollbar {
+        match area {
+            Area::History => &mut self.history_bar,
+            Area::Dialogs => &mut self.dialogs_bar,
+        }
+    }
+
+    fn bar(&self, area: Area) -> &Scrollbar {
+        match area {
+            Area::History => &self.history_bar,
+            Area::Dialogs => &self.dialogs_bar,
+        }
+    }
+
+    /// A list scrolled: show its scrollbar (and the floating date) for a moment.
+    fn scrolled(&mut self, area: Area, cx: &mut Context<Self>) {
+        self.bar_mut(area).last_scroll = Some(Instant::now());
         cx.notify();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -569,13 +726,31 @@ impl MainView {
             self.selected = None;
             self.messages.clear();
             self.messages_state.reset(0);
-            self.scroll_drag = None;
+            self.history_bar.drag = None;
+            self.unread_bar = None;
+            self.unread_target = None;
             let _ = self.commands.send(Command::CloseChat);
             window.focus(&self.focus);
         } else {
             return;
         }
         cx.notify();
+    }
+
+    /// Selects a chat and asks for its history.
+    fn start_opening(&mut self, peer: PeerKey) {
+        let dialog = self.dialogs.iter().find(|d| d.peer == peer);
+        let read_till = dialog.map_or(0, |d| d.read_inbox_max_id);
+        self.unread_target = dialog.filter(|d| d.unread > 0).map(|_| read_till);
+        self.unread_bar = None;
+        self.read_till = read_till;
+        self.selected = Some(peer);
+        self.messages.clear();
+        self.messages_state.reset(0);
+        self.history_complete = false;
+        self.loading_older = false;
+        self.stick_to_bottom = true;
+        let _ = self.commands.send(Command::OpenChat(peer));
     }
 
     fn open(&mut self, peer: PeerKey, window: &mut Window, cx: &mut Context<Self>) {
@@ -586,14 +761,7 @@ impl MainView {
         self.save_draft(cx);
         let draft = self.draft_of(peer).unwrap_or_default();
         self.set_input_text(draft, cx);
-
-        self.selected = Some(peer);
-        self.messages.clear();
-        self.messages_state.reset(0);
-        self.history_complete = false;
-        self.loading_older = false;
-        self.stick_to_bottom = true;
-        let _ = self.commands.send(Command::OpenChat(peer));
+        self.start_opening(peer);
         window.focus(&self.input.focus_handle(cx));
         cx.notify();
     }
@@ -611,17 +779,76 @@ impl MainView {
         if !self.messages.is_empty() {
             self.messages_state
                 .scroll_to_reveal_item(self.messages.len() - 1);
+            self.mark_read(self.messages.len());
         }
         cx.notify();
     }
 
-    /// Content height and scroll offset of the message list (loaded messages only, as in
-    /// tdesktop).
-    fn scroll_metrics(&self) -> (f32, f32, f32) {
-        let viewport = f32::from(self.messages_state.viewport_bounds().size.height);
-        let max = f32::from(self.messages_state.max_offset_for_scrollbar().height);
-        let offset = -f32::from(self.messages_state.scroll_px_offset_for_scrollbar().y);
-        (viewport, max, offset.clamp(0., max))
+    /// Viewport height, scrollable height and offset of a list (the history counts
+    /// loaded messages only, as in tdesktop).
+    fn scroll_metrics(&self, area: Area) -> (f32, f32, f32) {
+        let (viewport, max, offset) = match area {
+            Area::History => (
+                f32::from(self.messages_state.viewport_bounds().size.height),
+                f32::from(self.messages_state.max_offset_for_scrollbar().height),
+                -f32::from(self.messages_state.scroll_px_offset_for_scrollbar().y),
+            ),
+            Area::Dialogs => {
+                let base = self.dialogs_scroll.0.borrow().base_handle.clone();
+                (
+                    f32::from(base.bounds().size.height),
+                    f32::from(base.max_offset().height),
+                    -f32::from(base.offset().y),
+                )
+            }
+        };
+        (viewport, max, offset.clamp(0., max.max(0.)))
+    }
+
+    fn set_scroll(&mut self, area: Area, target: f32) {
+        match area {
+            Area::History => {
+                self.messages_state
+                    .set_offset_from_scrollbar(point(px(0.), px(-target)));
+            }
+            Area::Dialogs => {
+                let base = self.dialogs_scroll.0.borrow().base_handle.clone();
+                base.set_offset(point(px(0.), px(-target)));
+            }
+        }
+    }
+
+    /// A userpic: the photo when it is loaded (asked for on first sight), the empty
+    /// userpic meanwhile.
+    fn userpic(
+        &self,
+        size: f32,
+        peer: Option<PeerKey>,
+        photo: Option<(i64, i32)>,
+        initials: &str,
+        color: u8,
+        saved: bool,
+    ) -> AnyElement {
+        let p = self.palette();
+        if !saved && let (Some(peer), Some((photo_id, dc_id))) = (peer, photo) {
+            if let Some((loaded, image)) = self.userpics.get(&peer)
+                && *loaded == photo_id
+            {
+                return img(image.clone())
+                    .flex_none()
+                    .size(px(size))
+                    .rounded_full()
+                    .into_any_element();
+            }
+            if self.userpic_requests.borrow_mut().insert(photo_id) {
+                let _ = self.commands.send(Command::LoadUserpic {
+                    peer,
+                    photo_id,
+                    dc_id,
+                });
+            }
+        }
+        empty_userpic(p, size, initials, color, saved).into_any_element()
     }
 
     /// The custom title bar of tdesktop on Windows: no text, caption buttons on the right.
@@ -719,6 +946,7 @@ impl MainView {
             ))
     }
 
+    /// A chat-list row (`Dialogs::Ui::PaintRow`).
     fn render_dialog(
         &self,
         item: &DialogItem,
@@ -727,14 +955,16 @@ impl MainView {
     ) -> AnyElement {
         let p = self.palette();
         let active = self.selected == Some(item.peer);
-        let (bg, name_fg, text_fg, date_fg, draft_fg, pin_fg) = if active {
+        let (bg, name_fg, text_fg, date_fg, draft_fg, service_fg, icon_fg, sent_fg) = if active {
             (
                 p.dialogs_bg_active,
                 p.dialogs_name_fg_active,
                 p.dialogs_text_fg_active,
                 p.dialogs_date_fg_active,
                 p.dialogs_draft_fg_active,
-                p.dialogs_unread_bg_muted_active,
+                p.dialogs_text_fg_service_active,
+                p.dialogs_chat_icon_fg_active,
+                p.dialogs_sent_icon_fg_active,
             )
         } else {
             (
@@ -743,27 +973,37 @@ impl MainView {
                 p.dialogs_text_fg,
                 p.dialogs_date_fg,
                 p.dialogs_draft_fg,
-                p.dialogs_unread_bg_muted,
+                p.dialogs_text_fg_service,
+                p.dialogs_chat_icon_fg,
+                p.dialogs_sent_icon_fg,
             )
         };
         let peer = item.peer;
         let draft = (!active).then(|| self.draft_of(peer)).flatten();
+        let has_draft = draft.is_some();
+        // Unread badge: grey for muted chats (`UnreadBadgeStyle::muted`).
         let badge = (item.unread > 0).then(|| {
-            let (badge_bg, badge_fg) = if active {
-                (p.dialogs_unread_bg_active, p.dialogs_unread_fg_active)
+            let badge_bg = match (active, item.muted) {
+                (true, true) => p.dialogs_unread_bg_muted_active,
+                (true, false) => p.dialogs_unread_bg_active,
+                (false, true) => p.dialogs_unread_bg_muted,
+                (false, false) => p.dialogs_unread_bg,
+            };
+            let badge_fg = if active {
+                p.dialogs_unread_fg_active
             } else {
-                (p.dialogs_unread_bg, p.dialogs_unread_fg)
+                p.dialogs_unread_fg
             };
             div()
                 .flex_none()
-                .min_w(px(20.))
-                .h(px(20.))
-                .px(px(6.))
-                .rounded(px(10.))
+                .min_w(px(UNREAD_HEIGHT))
+                .h(px(UNREAD_HEIGHT))
+                .px(px(UNREAD_PADDING))
+                .rounded(px(UNREAD_HEIGHT / 2.))
                 .bg(c(badge_bg))
                 .text_color(c(badge_fg))
                 .text_size(px(12.))
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_weight(FontWeight::BOLD)
                 .flex()
                 .items_center()
                 .justify_center()
@@ -783,12 +1023,59 @@ impl MainView {
                         .flex_1()
                         .min_w(px(0.))
                         .text_color(c(text_fg))
-                        .child(one_line(d.replace('\n', " "))),
+                        .child(one_line(d)),
                 ),
-            None => div()
-                .text_color(c(text_fg))
-                .child(one_line(item.last.clone())),
+            None => {
+                let last = &item.last;
+                let rest = match &last.accent {
+                    Some(accent) => div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_color(c(service_fg))
+                        .child(one_line(accent.clone())),
+                    None => div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_color(c(text_fg))
+                        .child(one_line(last.text.clone())),
+                };
+                div()
+                    .flex()
+                    .min_w(px(0.))
+                    .children(last.prefix.as_ref().map(|name| {
+                        // A short first name: plain text (one_line needs a sized parent).
+                        div()
+                            .flex_none()
+                            .text_color(c(service_fg))
+                            .child(format!("{name}:\u{a0}"))
+                    }))
+                    .child(rest)
+            }
         };
+        // Group / channel / bot icon before the name (`ChatTypeIcon`).
+        let type_icon = match item.kind {
+            ChatKind::Group => Some((Icon::ChatGroup, 1.)),
+            ChatKind::Channel => Some((Icon::ChatChannel, 3.)),
+            ChatKind::Bot => Some((Icon::ChatBot, 1.)),
+            ChatKind::User => None,
+        }
+        .filter(|_| !item.is_saved)
+        .map(|(kind, left)| {
+            div()
+                .flex_none()
+                .pl(px(left))
+                .pr(px(CHAT_TYPE_SKIP))
+                .child(icon(kind, icon_fg, window))
+        });
+        // ✓ / ✓✓ of our last message, left of the time.
+        let send_state = item.last_read.filter(|_| !has_draft).map(|read| {
+            let kind = if read {
+                Icon::DialogsReceived
+            } else {
+                Icon::DialogsSent
+            };
+            div().flex_none().child(icon(kind, sent_fg, window))
+        });
         div()
             .id(SharedString::from(format!(
                 "dialog-{:?}-{}",
@@ -805,9 +1092,10 @@ impl MainView {
             .when(!active, |d| d.hover(|s| s.bg(c(p.dialogs_bg_over))))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, window, cx| this.open(peer, window, cx)))
-            .child(userpic(
-                p,
+            .child(self.userpic(
                 DIALOG_PHOTO,
+                Some(peer),
+                item.photo,
                 &item.initials,
                 item.color,
                 item.is_saved,
@@ -823,7 +1111,8 @@ impl MainView {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(6.))
+                            .gap(px(5.))
+                            .children(type_icon)
                             .child(
                                 div()
                                     .flex_1()
@@ -832,6 +1121,7 @@ impl MainView {
                                     .text_color(c(name_fg))
                                     .child(one_line(item.name.clone())),
                             )
+                            .children(send_state)
                             .child(
                                 div()
                                     .flex_none()
@@ -848,6 +1138,11 @@ impl MainView {
                             .child(div().flex_1().min_w(px(0.)).child(last_line))
                             .children(badge)
                             .when(item.unread == 0 && item.pinned, |d| {
+                                let pin_fg = if active {
+                                    p.dialogs_unread_bg_muted_active
+                                } else {
+                                    p.dialogs_unread_bg_muted
+                                };
                                 d.child(icon(Icon::DialogsPinned, pin_fg, window))
                             }),
                     ),
@@ -855,37 +1150,112 @@ impl MainView {
             .into_any_element()
     }
 
-    /// Whether messages `a` and `b` (in this order) belong to one group.
-    fn attached(a: &MessageItem, b: &MessageItem) -> bool {
-        a.out == b.out && a.author == b.author && (b.date - a.date).abs() < ATTACH_SECONDS
+    /// Whether messages `a` and `b` (in this order) belong to one group: same author,
+    /// close in time, same day, no service message or unread bar between.
+    fn attached(&self, a: &MessageItem, b: &MessageItem) -> bool {
+        a.service.is_none()
+            && b.service.is_none()
+            && a.out == b.out
+            && a.author == b.author
+            && (b.date - a.date).abs() < ATTACH_SECONDS
+            && present::day_of(a.date) == present::day_of(b.date)
+            && self.unread_bar != Some(b.id)
     }
 
-    /// A message row. tdesktop's layouts: in a wide chat (≥ 880 px) every message is on
-    /// the left with userpics; in a narrow one outgoing messages go right and userpics
-    /// are shown for group members only. Consecutive messages of one author form a
-    /// group: no gap, small corners on the group side, userpic and name once.
-    ///
-    /// Bubbles get an explicit width from the measured text: GPUI 0.2.2 otherwise
-    /// measures wrapped text at one width and paints it at another.
+    /// A message row: a date divider when the day changes, the "Unread messages" bar,
+    /// then the message — a bubble or a service line.
     fn render_message(&self, i: usize, window: &Window) -> AnyElement {
         let Some(item) = self.messages.get(i) else {
             return div().into_any_element();
         };
         let p = self.palette();
+        let chat_width = f32::from(window.viewport_size().width) - DIALOGS_WIDTH;
+        let day = present::day_of(item.date);
+        let new_day = i == 0 || present::day_of(self.messages[i - 1].date) != day;
+        let today = chrono::Local::now().date_naive();
+        let divider = new_day.then_some(day).flatten().map(|day| {
+            let text = present::day_divider(day, today);
+            let w = text_width(window, &text, FONT_SIZE, FontWeight::SEMIBOLD).ceil() + 1.;
+            div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .pt(px(SERVICE_MARGIN_TOP))
+                .pb(px(SERVICE_MARGIN_BOTTOM))
+                .child(service_pill(p, text, w))
+        });
+        let unread_bar = (self.unread_bar == Some(item.id)).then(|| {
+            div()
+                .w_full()
+                .mt(px(UNREAD_BAR_MARGIN))
+                .h(px(UNREAD_BAR_HEIGHT))
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(c(p.history_unread_bar_bg))
+                .border_t_1()
+                .border_b_1()
+                .border_color(c(p.history_unread_bar_border))
+                .text_color(c(p.history_unread_bar_fg))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child("Unread messages")
+        });
+        let body = match &item.service {
+            Some(text) => {
+                let max =
+                    SERVICE_MAX_WIDTH.min(chat_width - 2. * MSG_SIDE - 2. * SERVICE_PADDING_X);
+                let w = (text_width(window, text, FONT_SIZE, FontWeight::SEMIBOLD) + 1.)
+                    .min(max)
+                    .ceil();
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .pt(px(SERVICE_MARGIN_TOP))
+                    .pb(px(SERVICE_MARGIN_BOTTOM))
+                    .child(service_pill(p, text.clone(), w))
+                    .into_any_element()
+            }
+            None => self.render_bubble(i, item, chat_width, window),
+        };
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .children(divider)
+            .children(unread_bar)
+            .child(body)
+            .into_any_element()
+    }
+
+    /// A message bubble. tdesktop's layouts: in a wide chat (≥ 880 px) every message is
+    /// on the left with userpics; in a narrow one outgoing messages go right and userpics
+    /// are shown for group members only. Consecutive messages of one author form a
+    /// group: no gap, small corners on the group side, userpic and name once.
+    ///
+    /// Bubbles get an explicit width from the measured text: GPUI 0.2.2 otherwise
+    /// measures wrapped text at one width and paints it at another.
+    fn render_bubble(
+        &self,
+        i: usize,
+        item: &MessageItem,
+        chat_width: f32,
+        window: &Window,
+    ) -> AnyElement {
+        let p = self.palette();
         let chat = self
             .selected
             .and_then(|peer| self.dialogs.iter().find(|d| d.peer == peer));
-        let is_group = chat.is_some_and(|d| d.is_group);
-        let chat_width = f32::from(window.viewport_size().width) - DIALOGS_WIDTH;
+        let is_group = chat.is_some_and(|d| d.is_group());
         let wide = chat_width >= CHAT_WIDE_WIDTH;
         let right_side = item.out && !wide;
         let with_userpic = if wide { true } else { is_group && !item.out };
 
-        let prev_attached = i > 0 && Self::attached(&self.messages[i - 1], item);
+        let prev_attached = i > 0 && self.attached(&self.messages[i - 1], item);
         let next_attached = self
             .messages
             .get(i + 1)
-            .is_some_and(|n| Self::attached(item, n));
+            .is_some_and(|n| self.attached(item, n));
 
         let (bg, fg, date_fg) = if item.out {
             (p.msg_out_bg, p.history_text_out_fg, p.msg_out_date_fg)
@@ -895,21 +1265,43 @@ impl MainView {
         let reserved = MSG_SIDE + MSG_MARGIN_FAR + if with_userpic { MSG_PHOTO_SKIP } else { 0. };
         let max_inner = MSG_MAX_WIDTH.min(chat_width - reserved).max(120.) - 2. * MSG_PADDING_X;
         let sender = item.sender.as_ref().filter(|_| !prev_attached);
-        let text_w = text_width(window, &item.text, FONT_SIZE, FontWeight::NORMAL);
-        let time_w = text_width(window, &item.time, DATE_FONT_SIZE, FontWeight::NORMAL);
+        // Media is not drawn yet: its caption stands in ("Photo", "Voice message").
+        let media = item.media.as_ref();
+        let text = if item.text.is_empty() {
+            media.cloned().unwrap_or_default()
+        } else {
+            item.text.clone()
+        };
+        let media_line = media.filter(|_| !item.text.is_empty());
+        let time_text = if item.edited {
+            format!("edited {}", item.time)
+        } else {
+            item.time.clone()
+        };
+        let text_w = text_width(window, &text, FONT_SIZE, FontWeight::NORMAL);
+        let send_state_w = if item.read.is_some() {
+            SEND_STATE_SPACE
+        } else {
+            0.
+        };
+        let time_w =
+            text_width(window, &time_text, DATE_FONT_SIZE, FontWeight::NORMAL) + send_state_w;
         let name_w = sender.map_or(0., |(name, _)| {
             text_width(window, name, FONT_SIZE, FontWeight::SEMIBOLD)
         });
+        let media_w =
+            media_line.map_or(0., |m| text_width(window, m, FONT_SIZE, FontWeight::NORMAL));
         // The time sits on the last line when it fits there (single-line text), as in
         // tdesktop; otherwise on its own line.
         let time_gap = 8.;
-        let inline_time = !item.text.contains('\n') && text_w + time_gap + time_w <= max_inner;
+        let inline_time = !text.contains('\n') && text_w + time_gap + time_w <= max_inner;
         let natural = if inline_time {
             text_w + time_gap + time_w
         } else {
             text_w.max(time_w)
         }
-        .max(name_w);
+        .max(name_w)
+        .max(media_w);
         // +1 px: sub-pixel rounding must not push the last word to a new line.
         let inner = (natural + 1.).min(max_inner).ceil();
 
@@ -935,9 +1327,28 @@ impl MainView {
 
         let time = div()
             .flex_none()
+            .flex()
+            .items_center()
             .text_size(px(DATE_FONT_SIZE))
             .text_color(c(date_fg))
-            .child(item.time.clone());
+            .child(time_text)
+            .children(item.read.map(|read| {
+                let kind = if read {
+                    Icon::HistoryReceived
+                } else {
+                    Icon::HistorySent
+                };
+                div()
+                    .flex_none()
+                    .pl(px(3.))
+                    .child(icon(kind, p.history_out_icon_fg, window))
+            }));
+        // Captions stand in for media: in the date color when they are the whole text.
+        let text_color = if item.text.is_empty() && media.is_some() {
+            date_fg
+        } else {
+            fg
+        };
         let body = if inline_time {
             div()
                 .w(px(inner))
@@ -945,14 +1356,14 @@ impl MainView {
                 .items_end()
                 .justify_between()
                 .gap(px(time_gap))
-                .child(div().child(item.text.clone()))
+                .child(div().text_color(c(text_color)).child(text))
                 .child(time)
         } else {
             div()
                 .w(px(inner))
                 .flex()
                 .flex_col()
-                .child(div().w(px(inner)).child(item.text.clone()))
+                .child(div().w(px(inner)).text_color(c(text_color)).child(text))
                 .child(div().w(px(inner)).flex().justify_end().child(time))
         };
         let bubble = div()
@@ -975,19 +1386,30 @@ impl MainView {
                     .text_color(c(name_color(p, *color)))
                     .child(one_line(name.clone()))
             }))
+            .children(media_line.map(|m| {
+                div()
+                    .w(px(inner))
+                    .text_color(c(date_fg))
+                    .child(one_line(m.clone()))
+            }))
             .child(body);
 
         let avatar_slot = with_userpic.then(|| {
-            let Author {
-                initials, color, ..
-            } = &item.author;
+            let author = &item.author;
             div()
                 .flex_none()
                 .w(px(MSG_PHOTO_SKIP))
                 .flex()
                 .items_end()
                 .when(!next_attached, |d| {
-                    d.child(userpic(p, MSG_PHOTO_SIZE, initials, *color, false))
+                    d.child(self.userpic(
+                        MSG_PHOTO_SIZE,
+                        author.key,
+                        author.photo,
+                        &author.initials,
+                        author.color,
+                        false,
+                    ))
                 })
         });
         div()
@@ -1086,43 +1508,59 @@ impl MainView {
             )
     }
 
-    /// The overlay scrollbar of the message list (`historyScroll`): shown while scrolling
-    /// and on hover, measured over the loaded messages.
-    fn render_scrollbar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+    /// An overlay scrollbar (`historyScroll` in the chat, the default `ScrollArea` style
+    /// in the chat list): shown while scrolling and on hover.
+    fn render_scrollbar(
+        &self,
+        area: Area,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
         let p = self.palette();
-        let (viewport, max, offset) = self.scroll_metrics();
+        let (viewport, max, offset) = self.scroll_metrics(area);
         if max <= 1. || viewport <= 0. {
             return None;
         }
-        let recently = self
-            .last_scroll
-            .is_some_and(|t| t.elapsed() < SCROLL_HIDE_AFTER);
-        let visible = recently || self.scroll_hovered || self.scroll_drag.is_some();
+        let bar_state = self.bar(area);
+        let visible = bar_state.visible();
+        let over = bar_state.hovered || bar_state.drag.is_some();
+        let (track_bg, bar_bg, bar_bg_over) = match area {
+            Area::History => (
+                p.history_scroll_bg_over,
+                p.history_scroll_bar_bg,
+                p.history_scroll_bar_bg_over,
+            ),
+            Area::Dialogs => (p.scroll_bg_over, p.scroll_bar_bg, p.scroll_bar_bg_over),
+        };
         let track = viewport - 2. * SCROLL_DELTA;
         let bar = (track * viewport / (viewport + max)).max(SCROLL_MIN_BAR);
         let bar_top = SCROLL_DELTA + (track - bar) * (offset / max);
-        let over = self.scroll_hovered || self.scroll_drag.is_some();
+        let id = match area {
+            Area::History => "history-scroll",
+            Area::Dialogs => "dialogs-scroll",
+        };
         Some(
             div()
-                .id("history-scroll")
+                .id(id)
                 .absolute()
                 .top_0()
                 .right_0()
                 .w(px(SCROLL_WIDTH))
                 .h_full()
-                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                    this.scroll_hovered = *hovered;
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    this.bar_mut(area).hovered = *hovered;
                     cx.notify();
                 }))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
-                        let (_, _, offset) = this.scroll_metrics();
-                        this.scroll_drag = Some(ScrollDrag {
+                        let (_, _, offset) = this.scroll_metrics(area);
+                        this.bar_mut(area).drag = Some(ScrollDrag {
                             start_mouse_y: e.position.y,
                             start_offset: px(offset),
                         });
-                        this.messages_state.scrollbar_drag_started();
+                        if area == Area::History {
+                            this.messages_state.scrollbar_drag_started();
+                        }
                         cx.stop_propagation();
                         cx.notify();
                     }),
@@ -1136,7 +1574,7 @@ impl MainView {
                             .w(px(SCROLL_WIDTH - 2. * SCROLL_DELTA))
                             .h(px(track))
                             .rounded(px(3.))
-                            .when(over, |d| d.bg(c(p.history_scroll_bg_over))),
+                            .when(over, |d| d.bg(c(track_bg))),
                     )
                     .child(
                         div()
@@ -1146,31 +1584,86 @@ impl MainView {
                             .w(px(SCROLL_WIDTH - 2. * SCROLL_DELTA))
                             .h(px(bar))
                             .rounded(px(3.))
-                            .bg(c(if over {
-                                p.history_scroll_bar_bg_over
-                            } else {
-                                p.history_scroll_bar_bg
-                            })),
+                            .bg(c(if over { bar_bg_over } else { bar_bg })),
                     )
                 }),
         )
     }
 
-    fn drag_scrollbar(&mut self, mouse_y: Pixels, cx: &mut Context<Self>) {
-        let Some(drag) = &self.scroll_drag else {
+    fn drag_scrollbar(&mut self, area: Area, mouse_y: Pixels, cx: &mut Context<Self>) {
+        let Some(drag) = &self.bar(area).drag else {
             return;
         };
-        let (viewport, max, _) = self.scroll_metrics();
+        let (start_mouse_y, start_offset) = (drag.start_mouse_y, drag.start_offset);
+        let (viewport, max, _) = self.scroll_metrics(area);
         let track = viewport - 2. * SCROLL_DELTA;
         let bar = (track * viewport / (viewport + max)).max(SCROLL_MIN_BAR);
         let movable = (track - bar).max(1.);
-        let delta = f32::from(mouse_y - drag.start_mouse_y) * max / movable;
-        let target = (f32::from(drag.start_offset) + delta).clamp(0., max);
-        self.messages_state
-            .set_offset_from_scrollbar(point(px(0.), px(-target)));
-        self.stick_to_bottom = target >= max - 1.;
-        self.last_scroll = Some(Instant::now());
+        let delta = f32::from(mouse_y - start_mouse_y) * max / movable;
+        let target = (f32::from(start_offset) + delta).clamp(0., max);
+        self.set_scroll(area, target);
+        if area == Area::History {
+            self.stick_to_bottom = target >= max - 1.;
+        }
+        self.bar_mut(area).last_scroll = Some(Instant::now());
         cx.notify();
+    }
+
+    fn end_drag(&mut self, area: Area, cx: &mut Context<Self>) {
+        if self.bar_mut(area).drag.take().is_some() {
+            if area == Area::History {
+                self.messages_state.scrollbar_drag_ended();
+            }
+            cx.notify();
+        }
+    }
+
+    /// While scrolling, the date of the topmost visible message floats at the top
+    /// (tdesktop's `_scrollDateShown`).
+    fn floating_date(&self) -> Option<String> {
+        if !self.history_bar.visible() || self.history_bar.hovered {
+            return None;
+        }
+        let top = self.messages_state.logical_scroll_top();
+        let item = self
+            .messages
+            .get(top.item_ix)
+            .or_else(|| self.messages.last())?;
+        let today = chrono::Local::now().date_naive();
+        present::day_of(item.date).map(|day| present::day_divider(day, today))
+    }
+
+    fn render_header(&self, chat: &DialogItem, border: Rgba) -> impl IntoElement + use<> {
+        let p = self.palette();
+        let status = self
+            .members
+            .get(&chat.peer)
+            .cloned()
+            .unwrap_or_else(|| chat.status.clone());
+        let status_fg = if status == "online" {
+            p.window_active_text_fg
+        } else {
+            p.window_sub_text_fg
+        };
+        div()
+            .h(px(TOP_BAR_HEIGHT))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .px(px(16.))
+            .bg(c(p.window_bg))
+            .border_b_1()
+            .border_color(border)
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(c(p.window_bold_fg))
+                    .child(one_line(chat.name.clone())),
+            )
+            .when(!status.is_empty(), |d| {
+                d.child(div().text_color(c(status_fg)).child(one_line(status)))
+            })
     }
 }
 
@@ -1235,7 +1728,28 @@ impl Render for MainView {
                     .collect::<Vec<_>>()
             }),
         )
-        .flex_1();
+        .track_scroll(self.dialogs_scroll.clone())
+        .size_full();
+
+        let dialogs_area = div()
+            .id("dialogs-area")
+            .relative()
+            .flex_1()
+            .min_h(px(0.))
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| this.scrolled(Area::Dialogs, cx)))
+            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
+                this.drag_scrollbar(Area::Dialogs, e.position.y, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_drag(Area::Dialogs, cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_drag(Area::Dialogs, cx)),
+            )
+            .child(dialogs)
+            .children(self.render_scrollbar(Area::Dialogs, cx));
 
         let left = div()
             .w(px(DIALOGS_WIDTH))
@@ -1247,7 +1761,7 @@ impl Render for MainView {
             .border_r_1()
             .border_color(border)
             .child(top_bar)
-            .child(dialogs);
+            .child(dialogs_area);
 
         let right = match self
             .selected
@@ -1274,32 +1788,14 @@ impl Render for MainView {
                         ),
                 ),
             Some(chat) => {
-                let header = div()
-                    .h(px(TOP_BAR_HEIGHT))
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .justify_center()
-                    .px(px(16.))
-                    .bg(c(p.window_bg))
-                    .border_b_1()
-                    .border_color(border)
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(c(p.window_bold_fg))
-                            .child(chat.name.clone()),
-                    )
-                    .when(chat.is_channel, |d| {
-                        d.child(div().text_color(c(p.window_sub_text_fg)).child("channel"))
-                    });
+                let header = self.render_header(chat, border);
                 let view = cx.entity();
                 let messages = list(self.messages_state.clone(), move |i, window, cx| {
                     view.read(cx).render_message(i, window)
                 })
                 .size_full()
                 .pb(px(8.));
-                let (_, max, offset) = self.scroll_metrics();
+                let (_, max, offset) = self.scroll_metrics(Area::History);
                 let show_to_down = max - offset > TO_DOWN_SHOWN_AFTER;
                 let to_down = show_to_down.then(|| {
                     div()
@@ -1327,7 +1823,18 @@ impl Render for MainView {
                             window,
                         )))
                 });
-                let scrollbar = self.render_scrollbar(cx);
+                let floating_date = self.floating_date().map(|text| {
+                    let w = text_width(window, &text, FONT_SIZE, FontWeight::SEMIBOLD).ceil() + 1.;
+                    div()
+                        .absolute()
+                        .top(px(SERVICE_MARGIN_TOP))
+                        .left_0()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .child(service_pill(p, text, w))
+                });
+                let scrollbar = self.render_scrollbar(Area::History, cx);
                 let feed = self
                     .with_chat_background(div())
                     .id("history")
@@ -1335,29 +1842,18 @@ impl Render for MainView {
                     .flex_1()
                     .min_h(px(0.))
                     .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
-                        if this.scroll_drag.is_some() {
-                            this.drag_scrollbar(e.position.y, cx);
-                        }
+                        this.drag_scrollbar(Area::History, e.position.y, cx);
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            if this.scroll_drag.take().is_some() {
-                                this.messages_state.scrollbar_drag_ended();
-                                cx.notify();
-                            }
-                        }),
+                        cx.listener(|this, _, _, cx| this.end_drag(Area::History, cx)),
                     )
                     .on_mouse_up_out(
                         MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            if this.scroll_drag.take().is_some() {
-                                this.messages_state.scrollbar_drag_ended();
-                                cx.notify();
-                            }
-                        }),
+                        cx.listener(|this, _, _, cx| this.end_drag(Area::History, cx)),
                     )
                     .child(messages)
+                    .children(floating_date)
                     .children(scrollbar)
                     .children(to_down);
                 let composer = div()

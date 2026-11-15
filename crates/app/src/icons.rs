@@ -19,6 +19,16 @@ pub enum Icon {
     DownArrow,
     DownCircle,
     DownShadow,
+    /// Before a group's name in the chat list.
+    ChatGroup,
+    ChatChannel,
+    ChatBot,
+    /// Send state of the last message in the chat list: sent (✓), read (✓✓).
+    DialogsSent,
+    DialogsReceived,
+    /// The same in an outgoing bubble.
+    HistorySent,
+    HistoryReceived,
 }
 
 macro_rules! icon_bytes {
@@ -41,6 +51,13 @@ impl Icon {
             Icon::DownArrow => icon_bytes!("history_down_arrow"),
             Icon::DownCircle => icon_bytes!("history_down_circle"),
             Icon::DownShadow => icon_bytes!("history_down_shadow"),
+            Icon::ChatGroup => icon_bytes!("dialogs__dialogs_chat"),
+            Icon::ChatChannel => icon_bytes!("dialogs__dialogs_channel"),
+            Icon::ChatBot => icon_bytes!("dialogs__dialogs_bot"),
+            Icon::DialogsSent => icon_bytes!("dialogs__dialogs_sent"),
+            Icon::DialogsReceived => icon_bytes!("dialogs__dialogs_received"),
+            Icon::HistorySent => icon_bytes!("history_sent"),
+            Icon::HistoryReceived => icon_bytes!("history_received"),
         }
     }
 }

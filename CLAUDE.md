@@ -43,6 +43,10 @@
 - Demo runs keep their window placement in `data/window-demo.txt`, the real app in
   `data/window.txt`. Files that must survive a crash are written with
   `tdr_api::write_atomic`.
+- Message/peer details for the UI (media kind, service action, edited, peer kind, color,
+  members, status, userpic) are parsed from the cached TL blobs by `tdr_data::describe`;
+  the English strings with tdesktop's rules live in `crates/app/src/present.rs`.
+- Proven improvements over tdesktop go to `docs/IMPROVEMENTS.md`.
 - Drafts: `tdr_data::drafts` is a pure state machine ported from tdesktop, with one
   intended difference (an empty cloud draft never wipes the local one), see
   `docs/ARCHITECTURE.md`.
