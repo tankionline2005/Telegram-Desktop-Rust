@@ -59,6 +59,11 @@
 - GPUI 0.2.2 never truncates `nowrap` text (stale measure cache), and its
   `text_ellipsis()` panics on multi-byte text (it shortens runs in place across measure
   passes): never use either; use `one_line::one_line` for cut single lines.
+- GPUI 0.2.2 samples atlas images with linear filtering: at a fractional scale an image
+  touching its edge bleeds its atlas neighbour (a stripe). `icons` pads every mask.
+- Drags (scrollbars, the column edge) follow the mouse through window-level listeners
+  and a full-window capture layer (`render_drag_capture`), not the element's own
+  `on_mouse_move`, which stops when the mouse leaves the element.
 - Live checks against Telegram use the user's session in `data/` (git-ignored):
   `tdr me`, `tdr selftest reconnect|unknown-key|dc N`. Run cargo with
   `--manifest-path` if the shell cannot `cd` into the bracketed folder.

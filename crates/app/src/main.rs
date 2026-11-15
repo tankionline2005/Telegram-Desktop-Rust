@@ -238,6 +238,11 @@ fn main() {
                     cx.new(|cx| {
                         let mut view = ui::MainView::new(commands, updates, dark, cx);
                         view.open_on_start = open_on_start.map(|n| n.saturating_sub(1));
+                        view.set_columns_path(data_dir().join(if demo {
+                            "columns-demo.txt"
+                        } else {
+                            "columns.txt"
+                        }));
                         // Keys (Esc) need a focused element from the start.
                         window.focus(&gpui::Focusable::focus_handle(&view, cx));
                         watch_placement(placement_path.clone(), window, cx);

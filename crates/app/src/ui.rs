@@ -6,6 +6,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,7 @@ use tokio::sync::mpsc;
 use crate::bridge::{Command, DialogItem, MessageItem, Update};
 use crate::icons::{Icon, icon};
 use crate::one_line::one_line;
+use crate::placement::{COLUMN_MIN_LEFT, Columns};
 use crate::present;
 use crate::text_input::{LINE_HEIGHT, Submit, TextInput};
 
@@ -41,7 +43,6 @@ const DIALOG_ROW_HEIGHT: f32 = 62.;
 const DIALOG_PHOTO: f32 = 46.;
 const DIALOG_PADDING_X: f32 = 10.;
 const DIALOG_PADDING_Y: f32 = 8.;
-const DIALOGS_WIDTH: f32 = 320.;
 const TOP_BAR_HEIGHT: f32 = 54.;
 // dialogs.style: dialogsChatTypeSkip, dialogsUnread*
 const CHAT_TYPE_SKIP: f32 = 3.;
@@ -49,6 +50,8 @@ const UNREAD_HEIGHT: f32 = 19.;
 const UNREAD_PADDING: f32 = 5.;
 // window.style: adaptiveChatWideWidth
 const CHAT_WIDE_WIDTH: f32 = 880.;
+// chat.style: historyResizeWidth (the column edge you drag)
+const RESIZE_WIDTH: f32 = 6.;
 // window_main_menu.style: mainMenuWidth
 const MAIN_MENU_WIDTH: f32 = 274.;
 // chat.style
@@ -63,6 +66,9 @@ const MSG_SIDE: f32 = 16.;
 const MSG_MARGIN_FAR: f32 = 56.;
 const MSG_PHOTO_SIZE: f32 = 33.;
 const MSG_PHOTO_SKIP: f32 = 40.;
+/// A wide chat lays everything out in a column this wide at its left edge
+/// (`HistoryView::WideChatWidth`: msgMaxWidth + 2 msgPhotoSkip + 2 msgMargin.left).
+const WIDE_CHAT_COLUMN: f32 = MSG_MAX_WIDTH + 2. * MSG_PHOTO_SKIP + 2. * MSG_SIDE;
 // msgServicePadding, msgServiceMargin
 const SERVICE_PADDING_X: f32 = 12.;
 const SERVICE_PADDING_TOP: f32 = 3.;
@@ -79,13 +85,18 @@ const SEND_STATE_SPACE: f32 = 18.;
 /// Messages of one author closer than this are drawn as a group
 /// (tdesktop: `kAttachMessageToPreviousSecondsDelta`).
 const ATTACH_SECONDS: i32 = 900;
-// chat_helpers.style: historyToDown*, historyScroll
+// chat_helpers.style: historyToDown*
 const TO_DOWN_WIDTH: f32 = 52.;
 const TO_DOWN_HEIGHT: f32 = 62.;
 const TO_DOWN_RIGHT: f32 = 12.;
 const TO_DOWN_BOTTOM: f32 = 10.;
+const TO_DOWN_ICON_TOP: f32 = 10.;
 const TO_DOWN_SHOWN_AFTER: f32 = 480.;
-const SCROLL_WIDTH: f32 = 12.;
+/// The chat list's "scroll to top" button sits this far above the list's bottom
+/// (`connectingMargin.top`).
+const TO_UP_BOTTOM: f32 = 2.;
+// ScrollArea styles: deltax/deltat/deltab and minHeight are shared; width and round
+// differ (`historyScroll` in the chat, `defaultScrollArea` in the chat list).
 const SCROLL_DELTA: f32 = 3.;
 const SCROLL_MIN_BAR: f32 = 20.;
 const SCROLL_HIDE_AFTER: Duration = Duration::from_millis(1000);
@@ -235,6 +246,24 @@ fn service_pill(p: &Palette, text: String, width: f32) -> gpui::Div {
         .child(text)
 }
 
+/// The column edge being dragged: where it started.
+struct ColumnDrag {
+    start_mouse_x: Pixels,
+    start_width: f32,
+}
+
+/// The width dates, service messages and the "Unread messages" text are centered in:
+/// the whole chat, or in a wide chat (≥ 880 px) the message column at its left edge,
+/// where every message is (`ServiceMessagePainter::PaintPreparedDate`,
+/// `Service::countGeometry`).
+fn service_column(chat_width: f32) -> f32 {
+    if chat_width >= CHAT_WIDE_WIDTH {
+        chat_width.min(WIDE_CHAT_COLUMN)
+    } else {
+        chat_width
+    }
+}
+
 /// Scrollbar drag in progress: where it started.
 struct ScrollDrag {
     start_mouse_y: Pixels,
@@ -264,6 +293,16 @@ enum Area {
     Dialogs,
 }
 
+impl Area {
+    /// The scrollbar's (width, corner radius).
+    fn bar_style(self) -> (f32, f32) {
+        match self {
+            Area::History => (12., 3.),
+            Area::Dialogs => (10., 2.),
+        }
+    }
+}
+
 pub struct MainView {
     dark: bool,
     dialogs: Vec<DialogItem>,
@@ -278,6 +317,10 @@ pub struct MainView {
     stick_to_bottom: bool,
     history_bar: Scrollbar,
     dialogs_bar: Scrollbar,
+    /// The chat list's share of the window (tdesktop's dialogs width ratios).
+    columns: Columns,
+    columns_path: Option<PathBuf>,
+    column_drag: Option<ColumnDrag>,
     /// Opening a chat with unread messages: its `read_inbox_max_id`, until the history
     /// arrives and the view is placed at the first unread message.
     unread_target: Option<i32>,
@@ -305,6 +348,8 @@ pub struct MainView {
     main_menu_open: bool,
     /// The caption button under the mouse.
     title_hovered: Option<&'static str>,
+    /// The "scroll down" / "scroll to top" button under the mouse.
+    jump_hovered: Option<&'static str>,
     input: Entity<TextInput>,
     status: String,
     fatal: Option<String>,
@@ -394,6 +439,9 @@ impl MainView {
             stick_to_bottom: true,
             history_bar: Scrollbar::default(),
             dialogs_bar: Scrollbar::default(),
+            columns: Columns::default(),
+            columns_path: None,
+            column_drag: None,
             unread_target: None,
             unread_bar: None,
             read_till: 0,
@@ -407,6 +455,7 @@ impl MainView {
             draft_dirty_since: None,
             main_menu_open: false,
             title_hovered: None,
+            jump_hovered: None,
             input,
             status: String::new(),
             fatal: None,
@@ -420,6 +469,120 @@ impl MainView {
 
     fn palette(&self) -> &'static Palette {
         tdr_theme::palette(self.dark)
+    }
+
+    /// Where the chat list widths are kept; loads them.
+    pub fn set_columns_path(&mut self, path: PathBuf) {
+        self.columns = Columns::load(&path);
+        self.columns_path = Some(path);
+    }
+
+    /// The chat list's width in this window.
+    fn dialogs_width(&self, window: &Window) -> f32 {
+        self.columns.width(
+            self.selected.is_none(),
+            f32::from(window.viewport_size().width),
+        )
+    }
+
+    /// The chat list shows userpics only (tdesktop's `narrow` row context).
+    fn narrow(&self, window: &Window) -> bool {
+        self.dialogs_width(window) < COLUMN_MIN_LEFT / 2.
+    }
+
+    /// The open chat's width.
+    fn chat_width(&self, window: &Window) -> f32 {
+        f32::from(window.viewport_size().width) - self.dialogs_width(window)
+    }
+
+    fn dragging(&self) -> bool {
+        self.column_drag.is_some()
+            || self.history_bar.drag.is_some()
+            || self.dialogs_bar.drag.is_some()
+    }
+
+    /// The mouse moved while something is dragged: wherever it is, like Qt's mouse grab
+    /// in tdesktop.
+    fn drag_moved(&mut self, e: &gpui::MouseMoveEvent, window: &Window, cx: &mut Context<Self>) {
+        if e.pressed_button != Some(MouseButton::Left) {
+            // Released outside the window: no mouse up came.
+            self.drag_ended(window, cx);
+            return;
+        }
+        if let Some(drag) = &self.column_drag {
+            let width = drag.start_width + f32::from(e.position.x - drag.start_mouse_x);
+            let body = f32::from(window.viewport_size().width);
+            self.columns.drag_to(width, self.selected.is_none(), body);
+            cx.notify();
+        }
+        self.drag_scrollbar(Area::History, e.position.y, cx);
+        self.drag_scrollbar(Area::Dialogs, e.position.y, cx);
+    }
+
+    fn drag_ended(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.column_drag.take().is_some() {
+            let body = f32::from(window.viewport_size().width);
+            self.columns.drag_finished(self.selected.is_none(), body);
+            if let Some(path) = &self.columns_path {
+                self.columns.save(path);
+            }
+            cx.notify();
+        }
+        self.end_drag(Area::History, cx);
+        self.end_drag(Area::Dialogs, cx);
+    }
+
+    /// While dragging: one layer over the whole window takes the mouse (no hover effects
+    /// underneath, the drag cursor everywhere), and window-level listeners follow the
+    /// mouse even outside it.
+    fn render_drag_capture(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        if !self.dragging() {
+            return None;
+        }
+        let view = cx.entity().downgrade();
+        let cursor = if self.column_drag.is_some() {
+            gpui::CursorStyle::ResizeLeftRight
+        } else {
+            gpui::CursorStyle::Arrow
+        };
+        Some(
+            div()
+                .id("drag-capture")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .occlude()
+                .cursor(cursor)
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        move |_, _, window, _| {
+                            let moved = view.clone();
+                            window.on_mouse_event(
+                                move |e: &gpui::MouseMoveEvent, phase, window, cx| {
+                                    if phase == gpui::DispatchPhase::Capture {
+                                        let _ = moved
+                                            .update(cx, |this, cx| this.drag_moved(e, window, cx));
+                                    }
+                                },
+                            );
+                            let released = view.clone();
+                            window.on_mouse_event(
+                                move |e: &gpui::MouseUpEvent, phase, window, cx| {
+                                    if phase == gpui::DispatchPhase::Capture
+                                        && e.button == MouseButton::Left
+                                    {
+                                        let _ = released
+                                            .update(cx, |this, cx| this.drag_ended(window, cx));
+                                    }
+                                },
+                            );
+                        },
+                    )
+                    .size_full(),
+                ),
+        )
     }
 
     /// The chat background (under messages and the empty-chat placeholder): the night
@@ -979,9 +1142,11 @@ impl MainView {
             )
         };
         let peer = item.peer;
+        let narrow = self.narrow(window);
         let draft = (!active).then(|| self.draft_of(peer)).flatten();
         let has_draft = draft.is_some();
-        // Unread badge: grey for muted chats (`UnreadBadgeStyle::muted`).
+        // Unread badge: grey for muted chats (`UnreadBadgeStyle::muted`), the number as
+        // `FormatUnreadCounter` writes it.
         let badge = (item.unread > 0).then(|| {
             let badge_bg = match (active, item.muted) {
                 (true, true) => p.dialogs_unread_bg_muted_active,
@@ -1007,12 +1172,52 @@ impl MainView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(if item.unread > 9999 {
-                    "9999+".to_string()
+                .child(if narrow && item.unread > 999_999 {
+                    "99999+".to_string()
                 } else {
                     item.unread.to_string()
                 })
         });
+        let row = div()
+            .id(SharedString::from(format!(
+                "dialog-{:?}-{}",
+                peer.kind, peer.id
+            )))
+            .h(px(DIALOG_ROW_HEIGHT))
+            .w_full()
+            .bg(c(bg))
+            .when(!active, |d| d.hover(|s| s.bg(c(p.dialogs_bg_over))))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| this.open(peer, window, cx)));
+        let userpic = self.userpic(
+            DIALOG_PHOTO,
+            Some(peer),
+            item.photo,
+            &item.initials,
+            item.color,
+            item.is_saved,
+        );
+        if narrow {
+            // Userpics only; the counter sits on the userpic's bottom right corner
+            // (`PaintNarrowCounter`), hidden while there is a draft.
+            return row
+                .relative()
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(DIALOG_PADDING_X))
+                        .top(px(DIALOG_PADDING_Y))
+                        .child(userpic),
+                )
+                .children(badge.filter(|_| !has_draft).map(|b| {
+                    div()
+                        .absolute()
+                        .top(px(DIALOG_PADDING_Y + DIALOG_PHOTO - UNREAD_HEIGHT))
+                        .right(px(DIALOG_PADDING_X))
+                        .child(b)
+                }))
+                .into_any_element();
+        }
         let last_line = match draft {
             Some(d) => div()
                 .flex()
@@ -1076,30 +1281,12 @@ impl MainView {
             };
             div().flex_none().child(icon(kind, sent_fg, window))
         });
-        div()
-            .id(SharedString::from(format!(
-                "dialog-{:?}-{}",
-                peer.kind, peer.id
-            )))
-            .h(px(DIALOG_ROW_HEIGHT))
-            .w_full()
-            .flex()
+        row.flex()
             .items_center()
             .px(px(DIALOG_PADDING_X))
             .py(px(DIALOG_PADDING_Y))
             .gap(px(12.))
-            .bg(c(bg))
-            .when(!active, |d| d.hover(|s| s.bg(c(p.dialogs_bg_over))))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, window, cx| this.open(peer, window, cx)))
-            .child(self.userpic(
-                DIALOG_PHOTO,
-                Some(peer),
-                item.photo,
-                &item.initials,
-                item.color,
-                item.is_saved,
-            ))
+            .child(userpic)
             .child(
                 div()
                     .flex_1()
@@ -1112,14 +1299,23 @@ impl MainView {
                             .flex()
                             .items_center()
                             .gap(px(5.))
-                            .children(type_icon)
+                            // The name starts right after the type icon and
+                            // `dialogsChatTypeSkip`, without the row's gap.
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w(px(0.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(c(name_fg))
-                                    .child(one_line(item.name.clone())),
+                                    .flex()
+                                    .items_center()
+                                    .children(type_icon)
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(c(name_fg))
+                                            .child(one_line(item.name.clone())),
+                                    ),
                             )
                             .children(send_state)
                             .child(
@@ -1169,7 +1365,8 @@ impl MainView {
             return div().into_any_element();
         };
         let p = self.palette();
-        let chat_width = f32::from(window.viewport_size().width) - DIALOGS_WIDTH;
+        let chat_width = self.chat_width(window);
+        let column = service_column(chat_width);
         let day = present::day_of(item.date);
         let new_day = i == 0 || present::day_of(self.messages[i - 1].date) != day;
         let today = chrono::Local::now().date_naive();
@@ -1177,13 +1374,14 @@ impl MainView {
             let text = present::day_divider(day, today);
             let w = text_width(window, &text, FONT_SIZE, FontWeight::SEMIBOLD).ceil() + 1.;
             div()
-                .w_full()
+                .w(px(column))
                 .flex()
                 .justify_center()
                 .pt(px(SERVICE_MARGIN_TOP))
                 .pb(px(SERVICE_MARGIN_BOTTOM))
                 .child(service_pill(p, text, w))
         });
+        // The bar spans the chat; its text is centered in the service column.
         let unread_bar = (self.unread_bar == Some(item.id)).then(|| {
             div()
                 .w_full()
@@ -1191,24 +1389,28 @@ impl MainView {
                 .h(px(UNREAD_BAR_HEIGHT))
                 .flex()
                 .items_center()
-                .justify_center()
                 .bg(c(p.history_unread_bar_bg))
                 .border_t_1()
                 .border_b_1()
                 .border_color(c(p.history_unread_bar_border))
                 .text_color(c(p.history_unread_bar_fg))
                 .font_weight(FontWeight::SEMIBOLD)
-                .child("Unread messages")
+                .child(
+                    div()
+                        .w(px(column))
+                        .flex()
+                        .justify_center()
+                        .child("Unread messages"),
+                )
         });
         let body = match &item.service {
             Some(text) => {
-                let max =
-                    SERVICE_MAX_WIDTH.min(chat_width - 2. * MSG_SIDE - 2. * SERVICE_PADDING_X);
+                let max = SERVICE_MAX_WIDTH.min(column - 2. * MSG_SIDE - 2. * SERVICE_PADDING_X);
                 let w = (text_width(window, text, FONT_SIZE, FontWeight::SEMIBOLD) + 1.)
                     .min(max)
                     .ceil();
                 div()
-                    .w_full()
+                    .w(px(column))
                     .flex()
                     .justify_center()
                     .pt(px(SERVICE_MARGIN_TOP))
@@ -1531,6 +1733,7 @@ impl MainView {
             ),
             Area::Dialogs => (p.scroll_bg_over, p.scroll_bar_bg, p.scroll_bar_bg_over),
         };
+        let (width, round) = area.bar_style();
         let track = viewport - 2. * SCROLL_DELTA;
         let bar = (track * viewport / (viewport + max)).max(SCROLL_MIN_BAR);
         let bar_top = SCROLL_DELTA + (track - bar) * (offset / max);
@@ -1544,7 +1747,7 @@ impl MainView {
                 .absolute()
                 .top_0()
                 .right_0()
-                .w(px(SCROLL_WIDTH))
+                .w(px(width))
                 .h_full()
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     this.bar_mut(area).hovered = *hovered;
@@ -1571,9 +1774,9 @@ impl MainView {
                             .absolute()
                             .top(px(SCROLL_DELTA))
                             .left(px(SCROLL_DELTA))
-                            .w(px(SCROLL_WIDTH - 2. * SCROLL_DELTA))
+                            .w(px(width - 2. * SCROLL_DELTA))
                             .h(px(track))
-                            .rounded(px(3.))
+                            .rounded(px(round))
                             .when(over, |d| d.bg(c(track_bg))),
                     )
                     .child(
@@ -1581,13 +1784,58 @@ impl MainView {
                             .absolute()
                             .top(px(bar_top))
                             .left(px(SCROLL_DELTA))
-                            .w(px(SCROLL_WIDTH - 2. * SCROLL_DELTA))
+                            .w(px(width - 2. * SCROLL_DELTA))
                             .h(px(bar))
-                            .rounded(px(3.))
+                            .rounded(px(round))
                             .bg(c(if over { bar_bg_over } else { bar_bg })),
                     )
                 }),
         )
+    }
+
+    /// The round "scroll down" button of the chat (`historyToDown`), or the chat list's
+    /// "scroll to top" one (`dialogsToUp`: the same with the arrow flipped, 1 px lower).
+    fn render_jump_button(
+        &self,
+        id: &'static str,
+        arrow: Icon,
+        arrow_shift: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let p = self.palette();
+        let hovered = self.jump_hovered == Some(id);
+        let (bg, fg) = if hovered {
+            (p.history_to_down_bg_over, p.history_to_down_fg_over)
+        } else {
+            (p.history_to_down_bg, p.history_to_down_fg)
+        };
+        let layer =
+            |top: f32, element: gpui::Img| div().absolute().top(px(top)).left_0().child(element);
+        div()
+            .id(id)
+            .absolute()
+            .right(px(TO_DOWN_RIGHT))
+            .w(px(TO_DOWN_WIDTH))
+            .h(px(TO_DOWN_HEIGHT))
+            .cursor_pointer()
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.jump_hovered = Some(id);
+                } else if this.jump_hovered == Some(id) {
+                    this.jump_hovered = None;
+                }
+                cx.notify();
+            }))
+            .child(layer(
+                TO_DOWN_ICON_TOP,
+                icon(Icon::DownShadow, p.history_to_down_shadow, window),
+            ))
+            .child(layer(TO_DOWN_ICON_TOP, icon(Icon::DownCircle, bg, window)))
+            .child(layer(
+                TO_DOWN_ICON_TOP + arrow_shift,
+                icon(arrow, fg, window),
+            ))
     }
 
     fn drag_scrollbar(&mut self, area: Area, mouse_y: Pixels, cx: &mut Context<Self>) {
@@ -1685,13 +1933,20 @@ impl Render for MainView {
         }
         let p = self.palette();
         let border = c(p.shadow_fg);
+        let dialogs_width = self.dialogs_width(window);
+        let narrow = self.narrow(window);
 
         let top_bar = div()
             .h(px(TOP_BAR_HEIGHT))
             .flex_none()
             .flex()
             .items_center()
-            .px(px(8.))
+            // Narrow: the menu button alone, centered over the userpics.
+            .px(px(if narrow {
+                (dialogs_width - 40.) / 2.
+            } else {
+                8.
+            }))
             .gap(px(8.))
             .border_b_1()
             .border_color(border)
@@ -1711,12 +1966,14 @@ impl Render for MainView {
                     }))
                     .child(icon(Icon::DialogsMenu, p.dialogs_menu_icon_fg, window)),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .text_color(c(p.window_sub_text_fg))
-                    .child(self.status.clone()),
-            );
+            .when(!narrow, |d| {
+                d.child(
+                    div()
+                        .flex_1()
+                        .text_color(c(p.window_sub_text_fg))
+                        .child(self.status.clone()),
+                )
+            });
 
         let dialogs = uniform_list(
             "dialogs",
@@ -1731,28 +1988,34 @@ impl Render for MainView {
         .track_scroll(self.dialogs_scroll.clone())
         .size_full();
 
+        // "Scroll to top" (`Dialogs::Widget::_scrollToTop`): once the list is scrolled
+        // down by half of `historyToDownShownAfter`, and not at its very end; never in
+        // the narrow column.
+        let (_, dialogs_max, dialogs_offset) = self.scroll_metrics(Area::Dialogs);
+        let show_to_up = !narrow
+            && dialogs_offset > TO_DOWN_SHOWN_AFTER / 2.
+            && dialogs_offset < dialogs_max - 0.5;
+        let to_up = show_to_up.then(|| {
+            self.render_jump_button("dialogs-to-up", Icon::UpArrow, 1., window, cx)
+                .bottom(px(TO_UP_BOTTOM))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.set_scroll(Area::Dialogs, 0.);
+                    this.scrolled(Area::Dialogs, cx);
+                }))
+        });
+
         let dialogs_area = div()
             .id("dialogs-area")
             .relative()
             .flex_1()
             .min_h(px(0.))
             .on_scroll_wheel(cx.listener(|this, _, _, cx| this.scrolled(Area::Dialogs, cx)))
-            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
-                this.drag_scrollbar(Area::Dialogs, e.position.y, cx);
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.end_drag(Area::Dialogs, cx)),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.end_drag(Area::Dialogs, cx)),
-            )
             .child(dialogs)
-            .children(self.render_scrollbar(Area::Dialogs, cx));
+            .children(self.render_scrollbar(Area::Dialogs, cx))
+            .children(to_up);
 
         let left = div()
-            .w(px(DIALOGS_WIDTH))
+            .w(px(dialogs_width))
             .flex_none()
             .h_full()
             .flex()
@@ -1798,38 +2061,18 @@ impl Render for MainView {
                 let (_, max, offset) = self.scroll_metrics(Area::History);
                 let show_to_down = max - offset > TO_DOWN_SHOWN_AFTER;
                 let to_down = show_to_down.then(|| {
-                    div()
-                        .id("history-to-down")
-                        .absolute()
-                        .right(px(TO_DOWN_RIGHT))
+                    self.render_jump_button("history-to-down", Icon::DownArrow, 0., window, cx)
                         .bottom(px(TO_DOWN_BOTTOM))
-                        .w(px(TO_DOWN_WIDTH))
-                        .h(px(TO_DOWN_HEIGHT))
-                        .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| this.scroll_to_bottom(cx)))
-                        .child(div().absolute().top(px(10.)).left_0().child(icon(
-                            Icon::DownShadow,
-                            p.history_to_down_shadow,
-                            window,
-                        )))
-                        .child(div().absolute().top(px(10.)).left_0().child(icon(
-                            Icon::DownCircle,
-                            p.history_to_down_bg,
-                            window,
-                        )))
-                        .child(div().absolute().top(px(10.)).left_0().child(icon(
-                            Icon::DownArrow,
-                            p.history_to_down_fg,
-                            window,
-                        )))
                 });
+                let column = service_column(self.chat_width(window));
                 let floating_date = self.floating_date().map(|text| {
                     let w = text_width(window, &text, FONT_SIZE, FontWeight::SEMIBOLD).ceil() + 1.;
                     div()
                         .absolute()
                         .top(px(SERVICE_MARGIN_TOP))
                         .left_0()
-                        .w_full()
+                        .w(px(column))
                         .flex()
                         .justify_center()
                         .child(service_pill(p, text, w))
@@ -1841,17 +2084,6 @@ impl Render for MainView {
                     .relative()
                     .flex_1()
                     .min_h(px(0.))
-                    .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
-                        this.drag_scrollbar(Area::History, e.position.y, cx);
-                    }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.end_drag(Area::History, cx)),
-                    )
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.end_drag(Area::History, cx)),
-                    )
                     .child(messages)
                     .children(floating_date)
                     .children(scrollbar)
@@ -1935,9 +2167,32 @@ impl Render for MainView {
                     .track_focus(&self.focus)
                     .child(left)
                     .child(right)
+                    // The column edge (`_firstColumnResizeArea`): at the chat's left side.
+                    .child(
+                        div()
+                            .id("column-resize")
+                            .absolute()
+                            .top_0()
+                            .left(px(dialogs_width))
+                            .w(px(RESIZE_WIDTH))
+                            .h_full()
+                            .cursor(gpui::CursorStyle::ResizeLeftRight)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
+                                    this.column_drag = Some(ColumnDrag {
+                                        start_mouse_x: e.position.x,
+                                        start_width: dialogs_width,
+                                    });
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ),
+                    )
                     .when(self.main_menu_open, |d| {
                         d.child(self.render_main_menu(window, cx))
                     }),
             )
+            .children(self.render_drag_capture(cx))
     }
 }

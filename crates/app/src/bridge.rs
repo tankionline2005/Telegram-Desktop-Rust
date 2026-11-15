@@ -896,6 +896,33 @@ pub fn start_demo() -> (
             },
         )
         .collect();
+    // Older quiet chats below, so the list scrolls (scrollbar, "scroll to top").
+    let fillers = [
+        "Anna", "Boris", "Clara", "Dmitry", "Elena", "Felix", "Gleb", "Hanna",
+    ];
+    let mut dialogs = dialogs;
+    for k in 0..30 {
+        let id = rows.len() as i64 + 1 + k;
+        let name = format!("{} {}", fillers[k as usize % fillers.len()], k + 1);
+        dialogs.push(DialogItem {
+            peer: PeerKey::user(id),
+            initials: initials(&name),
+            name,
+            color: color_index(id),
+            photo: None,
+            kind: ChatKind::User,
+            is_saved: false,
+            last: line(None, None, "ok"),
+            last_read: None,
+            time: present::dialogs_date(today(12, 0) - (30 + k as i32) * day, now),
+            unread: if k == 3 { 1_234_567 } else { 0 },
+            muted: false,
+            pinned: false,
+            draft: None,
+            read_inbox_max_id: 1005,
+            status: "last seen a long time ago".into(),
+        });
+    }
     let _ = up_tx.send(Update::Dialogs(dialogs));
     std::thread::spawn(move || {
         let text =
