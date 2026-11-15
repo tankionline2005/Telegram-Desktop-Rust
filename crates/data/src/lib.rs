@@ -21,6 +21,14 @@ use tracing::{debug, info, warn};
 
 pub use tdr_storage;
 
+/// A bank card's data (`payments.bankCardData`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BankCard {
+    pub title: String,
+    /// (name, url) of places that open the card.
+    pub links: Vec<(String, String)>,
+}
+
 /// Random bytes for `random_id` (the server deduplicates sends by it).
 fn tdr_crypto_random() -> [u8; 8] {
     let mut b = [0u8; 8];
@@ -205,6 +213,58 @@ impl Sync {
             Ok(())
         })?;
         Ok(Some(convert::peer_key(&answer.peer)))
+    }
+
+    /// `contacts.resolvePhone` (a phone number's menu): the user with this number,
+    /// stored in the cache; `None` when it is not on Telegram (or hidden).
+    pub async fn resolve_phone(&mut self, phone: &str) -> Result<Option<PeerKey>> {
+        let request = functions::contacts::ResolvePhone {
+            phone: phone.to_string(),
+        };
+        let enums::contacts::ResolvedPeer::ResolvedPeer(answer) =
+            match self.client.invoke(&request).await {
+                Ok(answer) => answer,
+                Err(ApiError::Rpc(e)) if e.code == 400 => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+        let rows: Vec<_> = answer
+            .users
+            .iter()
+            .filter_map(convert::user_row)
+            .chain(answer.chats.iter().filter_map(convert::chat_row))
+            .collect();
+        self.store.write(|w| {
+            for p in &rows {
+                w.put_peer(p)?;
+            }
+            Ok(())
+        })?;
+        Ok(Some(convert::peer_key(&answer.peer)))
+    }
+
+    /// `payments.getBankCardData` (a card number's menu): the bank's name and
+    /// links to open the card in, `None` when the server does not know it.
+    pub async fn bank_card(&mut self, number: &str) -> Result<Option<BankCard>> {
+        let request = functions::payments::GetBankCardData {
+            number: number.to_string(),
+        };
+        let enums::payments::BankCardData::BankCardData(data) =
+            match self.client.invoke(&request).await {
+                Ok(answer) => answer,
+                Err(ApiError::Rpc(e)) if e.code == 400 => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+        Ok(Some(BankCard {
+            title: data.title,
+            links: data
+                .open_urls
+                .into_iter()
+                .map(|u| {
+                    let enums::BankCardOpenUrl::BankCardOpenUrl(u) = u;
+                    (u.name, u.url)
+                })
+                .collect(),
+        }))
     }
 
     pub async fn request_dialog_entry(&mut self, peer: PeerKey) -> Result<bool> {

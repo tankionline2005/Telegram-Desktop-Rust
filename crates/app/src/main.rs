@@ -13,6 +13,7 @@ mod instance;
 mod lottie;
 mod one_line;
 mod placement;
+mod popup_menu;
 mod present;
 mod rich_text;
 mod scale;
@@ -21,6 +22,8 @@ mod text_input;
 mod toast;
 #[cfg(windows)]
 mod tray;
+#[cfg(windows)]
+mod tray_menu;
 mod ui;
 mod wallpaper;
 
@@ -120,6 +123,7 @@ fn setup_tray(window: gpui::WindowHandle<ui::MainView>, placement_path: PathBuf,
         .flatten();
     let Some(hwnd) = hwnd else { return };
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let menu_events = tx.clone();
     let Some(icon) = tray::Tray::new(hwnd, APP_NAME, tx) else {
         tracing::warn!("tray icon could not be created");
         return;
@@ -144,6 +148,11 @@ fn setup_tray(window: gpui::WindowHandle<ui::MainView>, placement_path: PathBuf,
                     } else {
                         tray::Tray::show_window();
                     }
+                }
+                tray::TrayEvent::Menu { cursor, work } => {
+                    let active = tray::Tray::window_is_active();
+                    let events = menu_events.clone();
+                    let _ = cx.update(|cx| tray_menu::open(cursor, work, active, events, cx));
                 }
                 tray::TrayEvent::Quit => {
                     let _ = window.update(cx, |_, window, _| {
@@ -283,6 +292,23 @@ fn main() {
         tracing::info!(elapsed = ?STARTED.elapsed(), "ui: window opened");
         #[cfg(windows)]
         setup_tray(window, placement_path, cx);
+        // Demo helper for screenshots: the tray menu in the middle of the screen.
+        #[cfg(windows)]
+        if demo && std::env::args().any(|a| a == "--tray-menu") {
+            let _ = window.update(cx, |_, window, _| {
+                crate::scale::set(window.scale_factor());
+            });
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1200))
+                    .await;
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                std::mem::forget(rx);
+                let _ =
+                    cx.update(|cx| tray_menu::open((900, 500), (0, 0, 1800, 1000), true, tx, cx));
+            })
+            .detach();
+        }
         cx.activate(true);
     });
 }

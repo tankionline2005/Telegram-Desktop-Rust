@@ -29,6 +29,7 @@ use crate::present;
 use crate::scale::{self, dpx, lg, px};
 use crate::text_input::{Submit, TextInput};
 
+mod menus;
 mod message_text;
 
 gpui::actions!(main_view, [Escape]);
@@ -1580,6 +1581,8 @@ impl MainView {
             }
             Update::Status(s) => self.status = s,
             Update::Toast(text) => self.show_toast(&text, None),
+            Update::PhoneResolved { phone, user } => self.phone_resolved(&phone, user),
+            Update::BankCard { number, data } => self.bank_card_resolved(&number, data),
             Update::Resolved { peer, msg_id } => {
                 self.text_ui.pending_open = Some((peer, msg_id));
             }
@@ -1843,7 +1846,7 @@ impl MainView {
     /// Esc: closes the main menu, or else the open chat (back to "Select a chat"), as
     /// in tdesktop.
     fn escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
-        if self.clear_text_selection() {
+        if self.hide_menu() || self.clear_text_selection() {
         } else if self.main_menu_open {
             self.main_menu_open = false;
         } else if !self.back_stack.is_empty() {
@@ -2866,12 +2869,49 @@ impl MainView {
                     }
                 })
         });
+        // "Click to copy" beside the bubble, at the hovered line of one-line code.
+        let code_pill = pane
+            .live
+            .then(|| {
+                let text_top = pad_y
+                    + text_font.height
+                        * (sender.is_some() as u8
+                            + forwarded.is_some() as u8
+                            + media_line.is_some() as u8) as f32;
+                let gap = lg(FAST_SHARE_LEFT)
+                    + if original.is_some() {
+                        lg(FAST_SHARE_SIZE) + lg(FAST_SHARE_LEFT)
+                    } else {
+                        0.
+                    };
+                self.code_hint_pill(
+                    text_key,
+                    text_top,
+                    inner + 2. * pad_x,
+                    gap,
+                    right_side,
+                    window,
+                )
+            })
+            .flatten();
+        let menu_view = view.clone();
+        let live = pane.live;
         let bubble = div()
             .relative()
             .flex_none()
             .child(bubble)
             .children(tail)
-            .children(go_to);
+            .children(go_to)
+            .children(code_pill)
+            // The message's menu (over the text the text answers it, with links).
+            .on_mouse_down(MouseButton::Right, move |e, _, cx| {
+                if live {
+                    let _ = menu_view.update(cx, |this, cx| {
+                        this.open_message_menu(text_key, None, None, e.position);
+                        cx.notify();
+                    });
+                }
+            });
         // The jumped-to message's highlight (`paintHighlight`): the row, from
         // `min(marginTop, marginBottom)` above the bubble to as much below it.
         let top_margin = if prev_attached {
@@ -3516,6 +3556,12 @@ impl Render for MainView {
         if let Some((peer, msg_id)) = self.text_ui.pending_open.take() {
             self.go_to_original(peer, msg_id, window, cx);
         }
+        self.hide_spoilers_on_chat_change();
+        #[cfg(windows)]
+        crate::tray_menu::DARK.store(self.dark, std::sync::atomic::Ordering::Relaxed);
+        if self.tick_code_hint() {
+            window.request_animation_frame();
+        }
         if self
             .text_ui
             .toast
@@ -3944,6 +3990,7 @@ impl Render for MainView {
                     }),
             )
             .children(self.render_drag_capture(cx))
+            .children(self.render_menu(window, cx))
             .children(self.text_ui.toast.as_ref().and_then(|t| {
                 let size = window.viewport_size();
                 let title = lg(TITLE_HEIGHT);

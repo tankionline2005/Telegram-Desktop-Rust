@@ -1,6 +1,6 @@
 //! The notification-area (tray) icon on Windows, as in tdesktop (`platform/win/tray_win`):
-//! the window closes to the tray, a click on the icon shows or hides it, and the
-//! context menu has the show/hide item and "Quit Telegram".
+//! the window closes to the tray, a click on the icon shows or hides it, the right
+//! button opens the app's own menu (`tray_menu`).
 //!
 //! The icon is tdesktop's monochrome tray plane (`tray_monochrome.svg`) painted in our
 //! brand orange. It is drawn at `SM_CXSMICON`, like tdesktop's.
@@ -16,7 +16,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
-    DeleteObject, HGDIOBJ,
+    DeleteObject, GetMonitorInfoW, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromPoint,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
@@ -24,12 +25,11 @@ use windows::Win32::UI::Shell::{
     NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DestroyWindow, GetCursorPos, GetForegroundWindow, GetSystemMetrics, HICON,
-    HWND_MESSAGE, ICONINFO, IsIconic, IsWindowVisible, MF_SEPARATOR, MF_STRING, PostMessageW,
-    RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SW_HIDE, SW_RESTORE, SW_SHOW,
-    SetForegroundWindow, ShowWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, WINDOW_EX_STYLE, WM_APP, WM_CONTEXTMENU, WM_NULL, WNDCLASSW, WS_OVERLAPPED,
+    CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetCursorPos,
+    GetForegroundWindow, GetSystemMetrics, HICON, HWND_MESSAGE, ICONINFO, IsIconic,
+    IsWindowVisible, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SW_HIDE, SW_RESTORE,
+    SW_SHOW, SetForegroundWindow, ShowWindow, WINDOW_EX_STYLE, WM_APP, WM_CONTEXTMENU, WNDCLASSW,
+    WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, w};
 
@@ -39,13 +39,17 @@ pub enum TrayEvent {
     /// Click, or the first menu item: show the window, or hide it when it is active.
     Toggle,
     Quit,
+    /// The right button: our menu at the cursor (device pixels), inside the work
+    /// area of its screen (left, top, right, bottom).
+    Menu {
+        cursor: (i32, i32),
+        work: (i32, i32, i32, i32),
+    },
 }
 
 const CALLBACK: u32 = WM_APP + 1;
 const NIN_SELECT: u32 = 0x400; // WM_USER
 const NIN_KEYSELECT: u32 = NIN_SELECT + 1;
-const MENU_TOGGLE: usize = 1;
-const MENU_QUIT: usize = 2;
 const ICON_ID: u32 = 1;
 
 /// tdesktop's `Telegram/Resources/icons/tray_monochrome.svg` (vendored).
@@ -222,7 +226,7 @@ unsafe extern "system" fn window_proc(
         // NOTIFYICON_VERSION_4: the event is in the low word of lparam.
         match (lparam.0 as u32) & 0xffff {
             NIN_SELECT | NIN_KEYSELECT => send(TrayEvent::Toggle),
-            WM_CONTEXTMENU => unsafe { show_menu(hwnd) },
+            WM_CONTEXTMENU => unsafe { request_menu() },
             _ => {}
         }
         return LRESULT(0);
@@ -239,39 +243,26 @@ unsafe extern "system" fn window_proc(
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-/// tdesktop's tray menu: "Minimize to tray" / "Open Telegram", then "Quit Telegram".
-/// (Its "Disable notifications" item comes with notifications.)
-unsafe fn show_menu(hwnd: HWND) {
+/// The right button on the icon: the app shows its menu (`tray_menu`).
+unsafe fn request_menu() {
     unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return };
-        let toggle = if Tray::window_is_active() {
-            w!("Minimize to tray")
-        } else {
-            w!("Open Telegram")
-        };
-        let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, toggle);
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("Quit Telegram"));
         let mut at = POINT::default();
         let _ = GetCursorPos(&mut at);
-        // The menu closes on outside clicks only when its owner is the foreground window.
-        let _ = SetForegroundWindow(hwnd);
-        let chosen = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
-            at.x,
-            at.y,
-            None,
-            hwnd,
-            None,
-        );
-        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
-        let _ = DestroyMenu(menu);
-        match chosen.0 as usize {
-            MENU_TOGGLE => send(TrayEvent::Toggle),
-            MENU_QUIT => send(TrayEvent::Quit),
-            _ => {}
-        }
+        let monitor = MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let work = if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            let r = info.rcWork;
+            (r.left, r.top, r.right, r.bottom)
+        } else {
+            (0, 0, i32::MAX / 4, i32::MAX / 4)
+        };
+        send(TrayEvent::Menu {
+            cursor: (at.x, at.y),
+            work,
+        });
     }
 }
 

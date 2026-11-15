@@ -47,6 +47,10 @@ pub enum Command {
         username: String,
         post: Option<i32>,
     },
+    /// A phone number's menu: who has it (`contacts.resolvePhone`).
+    ResolvePhone(String),
+    /// A card number's menu: its bank (`payments.getBankCardData`).
+    BankCard(String),
     /// A chat shown around an older message was scrolled to its bottom: load newer.
     LoadNewer(PeerKey),
     /// Back to the chat open before the last `OpenChatAt`, with the same history.
@@ -116,6 +120,16 @@ pub enum Update {
     },
     /// Show a toast with this text.
     Toast(String),
+    /// Who has this phone number: `None` when it is not on Telegram.
+    PhoneResolved {
+        phone: String,
+        user: Option<(PeerKey, String, Author)>,
+    },
+    /// A card's bank: `None` when it could not be found.
+    BankCard {
+        number: String,
+        data: Option<tdr_data::BankCard>,
+    },
     Fatal(String),
 }
 
@@ -189,6 +203,10 @@ pub struct MessageItem {
     pub original: Option<(PeerKey, i32)>,
     /// Formatting and links of `text`, as byte ranges of it.
     pub entities: Vec<TextEntity>,
+    /// When the original of a forward was sent, when it was edited (its menu
+    /// shows the date).
+    pub forward_date: Option<i32>,
+    pub edit_date: Option<i32>,
 }
 
 /// The "Forwarded from" line (`HistoryMessageForwarded::text`).
@@ -608,6 +626,8 @@ fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec
                 date: m.date,
                 text,
                 entities,
+                forward_date: info.forward.as_ref().map(|f| f.date),
+                edit_date: info.edit_date,
                 media,
                 service: service.filter(|_| !call),
                 edited: info.edited,
@@ -1324,6 +1344,25 @@ async fn run(
                             Err(e) => error!("resolve: {e}"),
                         }
                     }
+                    Command::ResolvePhone(phone) => match sync.resolve_phone(&phone).await {
+                        Ok(found) => {
+                            let user = found.map(|peer| {
+                                (peer, peer_name(sync.store(), peer), author_of(sync.store(), peer))
+                            });
+                            let _ = tx.send(Update::PhoneResolved { phone, user });
+                        }
+                        Err(e) => error!("resolve phone: {e}"),
+                    },
+                    Command::BankCard(number) => {
+                        let data = match sync.bank_card(&number).await {
+                            Ok(data) => data,
+                            Err(e) => {
+                                error!("bank card: {e}");
+                                None
+                            }
+                        };
+                        let _ = tx.send(Update::BankCard { number, data });
+                    }
                     Command::Send { peer, text } => {
                         match sync.send_text(peer, &text).await {
                             Ok(_) => {
@@ -1435,6 +1474,16 @@ fn demo_formatted(date: i32) -> Vec<(bool, String, Vec<TextEntity>)> {
         ),
         ("\nAnd one without a language:\n", &[]),
         ("line one\nline two", &[K::Pre(String::new())]),
+        ("\nCall ", &[]),
+        ("+1 555 0100", &[K::Phone]),
+        (", pay to ", &[]),
+        ("4242 4242 4242 4242", &[K::BankCard]),
+        (", write to ", &[]),
+        ("hello@example.com", &[K::Email]),
+        ("\n", &[]),
+        ("one-line code", &[K::Code]),
+        ("\n", &[]),
+        ("another code line", &[K::Code]),
     ]);
     vec![(false, a, ae), (true, b, be)]
 }
@@ -1686,6 +1735,8 @@ pub fn start_demo() -> (
                     forwarded: None,
                     original: None,
                     entities: Vec::new(),
+                    forward_date: None,
+                    edit_date: None,
                 }
             })
             .collect();
@@ -1707,6 +1758,8 @@ pub fn start_demo() -> (
                 forwarded: None,
                 original: None,
                 entities,
+                forward_date: None,
+                edit_date: None,
             });
         }
         // Older demo messages appear 20 at a time when the user scrolls up.
@@ -1730,6 +1783,23 @@ pub fn start_demo() -> (
                 Command::OpenChatAt { peer, msg_id } => focus = msg_id.map(|m| (peer, m)),
                 Command::OpenUsername { username, .. } => {
                     let _ = up_tx.send(Update::Toast(format!("Username @{username} not found.")));
+                    continue;
+                }
+                // The demo has no server: a number nobody has, a known card.
+                Command::ResolvePhone(phone) => {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    let _ = up_tx.send(Update::PhoneResolved { phone, user: None });
+                    continue;
+                }
+                Command::BankCard(number) => {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    let _ = up_tx.send(Update::BankCard {
+                        number,
+                        data: Some(tdr_data::BankCard {
+                            title: "Demo Bank, Visa".into(),
+                            links: vec![("Open in Demo Bank".into(), "https://example.com".into())],
+                        }),
+                    });
                     continue;
                 }
                 Command::OpenChat(_)
@@ -1759,6 +1829,8 @@ pub fn start_demo() -> (
                                 forwarded: None,
                                 original: None,
                                 entities: Vec::new(),
+                                forward_date: None,
+                                edit_date: None,
                             }
                         })
                         .collect();
@@ -1784,6 +1856,8 @@ pub fn start_demo() -> (
                         forwarded: None,
                         original: None,
                         entities: Vec::new(),
+                        forward_date: None,
+                        edit_date: None,
                     });
                 }
             }

@@ -42,6 +42,19 @@ pub enum Icon {
     MiniQuote,
     /// In the top right corner of a code block (`chat/mini_copy`).
     MiniCopy,
+    // Popup menu items (`menuIcon*`, `whenEdited`, `whenOriginal`).
+    MenuReply,
+    MenuEdit,
+    MenuPin,
+    MenuCopy,
+    MenuForward,
+    MenuDelete,
+    MenuSelect,
+    MenuInvite,
+    MenuCalendar,
+    MenuPayment,
+    MenuEdited,
+    MenuForwarded,
 }
 
 macro_rules! icon_bytes {
@@ -76,6 +89,18 @@ impl Icon {
             Icon::SlideShadow => icon_bytes!("slide_shadow"),
             Icon::MiniQuote => icon_bytes!("chat__mini_quote"),
             Icon::MiniCopy => icon_bytes!("chat__mini_copy"),
+            Icon::MenuReply => icon_bytes!("menu__reply"),
+            Icon::MenuEdit => icon_bytes!("menu__edit"),
+            Icon::MenuPin => icon_bytes!("menu__pin"),
+            Icon::MenuCopy => icon_bytes!("menu__copy"),
+            Icon::MenuForward => icon_bytes!("menu__forward"),
+            Icon::MenuDelete => icon_bytes!("menu__delete"),
+            Icon::MenuSelect => icon_bytes!("menu__select"),
+            Icon::MenuInvite => icon_bytes!("menu__invite"),
+            Icon::MenuCalendar => icon_bytes!("menu__calendar"),
+            Icon::MenuPayment => icon_bytes!("payments__payment_card"),
+            Icon::MenuEdited => icon_bytes!("menu__edited_status"),
+            Icon::MenuForwarded => icon_bytes!("menu__forwarded_status"),
         }
     }
 }

@@ -81,6 +81,8 @@ pub struct MessageInfo {
     pub service: Option<Service>,
     /// Shown as "edited" next to the time (`edit_date` without `edit_hide`).
     pub edited: bool,
+    /// When it was last edited (shown in its context menu).
+    pub edit_date: Option<i32>,
     /// Messages of one album share it.
     pub grouped_id: Option<i64>,
     /// A channel post (views, signature).
@@ -255,6 +257,8 @@ pub struct Forward {
     /// The message this copy was saved from (`saved_from_peer`, `saved_from_msg_id`):
     /// the "go to original" button opens it.
     pub original: Option<(PeerKey, i32)>,
+    /// When the original was sent (`fwd_from.date`).
+    pub date: i32,
 }
 
 impl Forward {
@@ -287,6 +291,7 @@ pub fn message_info(row: &MessageRow) -> MessageInfo {
             media: m.media.as_ref().and_then(media),
             service: None,
             edited: m.edit_date.is_some() && !m.edit_hide,
+            edit_date: m.edit_date.filter(|_| !m.edit_hide),
             grouped_id: m.grouped_id,
             post: m.post,
             forward: m.fwd_from.as_ref().map(|f| {
@@ -304,6 +309,7 @@ pub fn message_info(row: &MessageRow) -> MessageInfo {
                         .as_ref()
                         .zip(f.saved_from_msg_id)
                         .map(|(p, id)| (crate::convert::peer_key(p), id)),
+                    date: f.date,
                 }
             }),
             entities: m.entities.as_deref().map(entities).unwrap_or_default(),

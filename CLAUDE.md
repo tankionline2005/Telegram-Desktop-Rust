@@ -74,6 +74,11 @@
   cache, selection, link clicks and toasts. Spoiler particles (`spoiler`) and toast
   icons (`lottie`, a tiny Lottie player) are generated once per scale/color.
 - One running copy per data folder (`instance`, a named pipe); `--demo` is exempt.
+- Menus: `popup_menu` draws `Ui::PopupMenu` (geometry, unroll animation, ripple)
+  for any area; `ui/menus.rs` builds the chat's menus, `tray_menu` shows the same
+  menu in a frameless transparent popup window. Its colors are `defaultMenu`'s
+  window colors, not `menuBg*` (the night theme's `menuBgOver` is white).
+  `--demo --tray-menu` opens the tray menu for screenshots.
 - `uniform_list` lays out each item as its own root, where a `top` offset is
   ignored: animate an item inside a fixed-size wrapper.
 - Live checks against Telegram use the user's session in `data/` (git-ignored):

@@ -60,6 +60,10 @@ pub(super) struct TextUi {
     /// Open this chat at the next frame (a resolved username; needs the window).
     pub(super) pending_open: Option<(PeerKey, Option<i32>)>,
     pub(super) toast: Option<Toast>,
+    pub(super) menu: Option<super::menus::OpenMenu>,
+    pub(super) code_hint: Option<super::menus::CodeHint>,
+    /// The chat the revealed spoilers belong to.
+    revealed_peer: Option<PeerKey>,
 }
 
 fn ordered(a: usize, b: usize) -> Range<usize> {
@@ -273,6 +277,7 @@ impl MainView {
                     .filter(|p| p.key == key)
                     .and_then(|p| p.hit.link),
                 revealed: t.revealed.get(&key).copied(),
+                code_highlight: self.code_highlight(key),
             },
             selection.is_some_and(|s| s.dragging),
         )
@@ -331,13 +336,16 @@ impl MainView {
                 hit,
                 inside,
                 pressed,
+                origin,
             } => {
+                let code = hit.code.filter(|_| inside && !pressed);
+                let code_changed = self.code_hover(key, code, origin);
                 let hover = if inside && !(hit.spoiler && !revealed) {
                     hit.link.map(|l| (key, l))
                 } else {
                     None
                 };
-                let mut changed = false;
+                let mut changed = code_changed;
                 let mine = self.text_ui.hover.is_some_and(|(k, _)| k == key);
                 if hover.is_some() || mine {
                     changed |= self.text_ui.hover != hover;
@@ -404,7 +412,7 @@ impl MainView {
                         && hit.link == Some(link)
                         && let Some(link) = layout.rich().link(link).cloned()
                     {
-                        self.activate_link(key, link, window, cx);
+                        self.activate_link(key, link, &hit, layout, window, cx);
                     }
                 }
                 if let Some(s) = &mut self.text_ui.selection
@@ -415,6 +423,11 @@ impl MainView {
                         self.text_ui.selection = None;
                     }
                 }
+                cx.notify();
+            }
+            TextEvent::Context { hit, position } => {
+                self.text_ui.press = None;
+                self.open_message_menu(key, Some(&hit), Some(layout.rich()), position);
                 cx.notify();
             }
             TextEvent::DownOutside => {
@@ -452,6 +465,30 @@ impl MainView {
         true
     }
 
+    /// The selected range of this message's text, if any.
+    pub(super) fn text_selection_range(&self, key: TextKey) -> Option<Range<usize>> {
+        self.text_ui
+            .selection
+            .as_ref()
+            .filter(|s| s.key == key && !s.range.is_empty())
+            .map(|s| s.range.clone())
+    }
+
+    /// A message's shown text ("Copy Text").
+    pub(super) fn message_text(&self, key: TextKey) -> Option<String> {
+        let cache = self.text_ui.cache.borrow();
+        cache.get(&key).map(|e| e.measured.rich.text.clone())
+    }
+
+    /// `Data::Session::hideShownSpoilers`: showing another chat hides every spoiler
+    /// that was clicked open.
+    pub(super) fn hide_spoilers_on_chat_change(&mut self) {
+        if self.text_ui.revealed_peer != self.selected {
+            self.text_ui.revealed_peer = self.selected;
+            self.text_ui.revealed.clear();
+        }
+    }
+
     /// Esc: a selection goes first.
     pub(super) fn clear_text_selection(&mut self) -> bool {
         self.text_ui.selection.take().is_some()
@@ -461,16 +498,21 @@ impl MainView {
         &mut self,
         key: TextKey,
         link: Link,
+        hit: &Hit,
+        layout: &Layout,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let at = window.mouse_position();
         match link {
             Link::Code(code) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(code));
                 self.show_toast("Text copied to clipboard.", Some(ToastIcon::Copy));
             }
             Link::Url(url) => self.open_url(&url, window, cx),
-            Link::Email(email) => cx.open_url(&format!("mailto:{email}")),
+            // tdesktop opens the mail app; we show the menu the right button shows
+            // (an intended difference).
+            Link::Email(_) => self.open_message_menu(key, Some(hit), Some(layout.rich()), at),
             Link::Mention(username) => {
                 let _ = self.commands.send(Command::OpenUsername {
                     username,
@@ -487,16 +529,11 @@ impl MainView {
                     text: command,
                 });
             }
-            Link::Date(date) => {
-                // tdesktop opens a menu (Copy Date, Add to Calendar); copying is the
-                // first item.
-                cx.write_to_clipboard(ClipboardItem::new_string(crate::present::long_date_time(
-                    date,
-                )));
-                self.show_toast("Date copied to clipboard.", Some(ToastIcon::Copy));
-            }
-            // Search by hashtag and the phone / card menus come later.
-            Link::Hashtag(_) | Link::Cashtag(_) | Link::Phone(_) | Link::BankCard(_) => {}
+            Link::Date(date) => self.open_date_menu(date, at),
+            Link::Phone(phone) => self.open_phone_menu(phone, at),
+            Link::BankCard(card) => self.open_card_menu(card, at),
+            // Search by hashtag comes later.
+            Link::Hashtag(_) | Link::Cashtag(_) => {}
         }
         cx.notify();
     }

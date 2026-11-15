@@ -35,8 +35,11 @@ const PRE_HEADER_POSITION: (f32, f32) = (10., 2.);
 /// `chat/mini_quote` at (4, 4) and `chat/mini_copy` at (4, 2) from the top right.
 const BLOCKQUOTE_ICON_POSITION: (f32, f32) = (4., 4.);
 const PRE_ICON_POSITION: (f32, f32) = (4., 2.);
-/// `lng_code_block_header_copy`.
-const PRE_HEADER_COPY: &str = "copy";
+/// Our code blocks say how to copy them on the right of the header (an intended
+/// difference: tdesktop shows "copy" where the language goes and only an icon).
+const PRE_COPY_HINT: &str = "click to copy";
+/// Between the hint and the icon.
+const PRE_COPY_HINT_SKIP: f32 = 4.;
 
 // Span flags (`TextBlockFlag`).
 const BOLD: u8 = 1;
@@ -106,7 +109,7 @@ struct Span {
 #[derive(Debug, Clone, PartialEq)]
 struct Quote {
     pre: bool,
-    /// The code block's header: its language or "copy".
+    /// The code block's header: its language (may be empty).
     header: String,
     /// What the header copies.
     code: String,
@@ -263,7 +266,7 @@ pub fn prepare(text: &str, entities: &[TextEntity]) -> Rich {
             }
             let (pre, header) = match &q.kind {
                 Kind::Pre(language) if !language.is_empty() => (true, language.clone()),
-                Kind::Pre(_) => (true, PRE_HEADER_COPY.to_string()),
+                Kind::Pre(_) => (true, String::new()),
                 _ => (false, String::new()),
             };
             quotes.push(Quote {
@@ -431,8 +434,8 @@ fn quote_icon_size(pre: bool) -> (f32, f32) {
     if pre { (16., 16.) } else { (16., 12.) }
 }
 
-/// `String::quoteMinWidth`: room for the header and the icon.
-fn quote_min_width(quote: &Quote, mono_header_width: f32) -> f32 {
+/// `String::quoteMinWidth`: room for the header, the copy hint and the icon.
+fn quote_min_width(quote: &Quote, mono_header_width: f32, hint_width: f32) -> f32 {
     let [l, _, r, _] = if quote.pre {
         PRE_PADDING
     } else {
@@ -451,8 +454,13 @@ fn quote_min_width(quote: &Quote, mono_header_width: f32) -> f32 {
         .max(scale::lg(QUOTE_OUTLINE))
         .max(iconsize);
     let top = scale::lg(l)
-        + if quote.pre {
+        + if quote.pre && mono_header_width > 0. {
             mono_header_width + scale::lg(PRE_HEADER_POSITION.0)
+        } else {
+            0.
+        }
+        + if quote.pre {
+            hint_width + scale::lg(PRE_COPY_HINT_SKIP)
         } else {
             0.
         }
@@ -567,14 +575,33 @@ impl Measured {
                     underline: None,
                     strikethrough: None,
                 };
+                if q.header.is_empty() {
+                    return 0.;
+                }
                 f32::from(text_system.layout_line(&q.header, size, &[run], None).width)
             })
             .collect();
+        let hint_width = {
+            let run = TextRun {
+                len: PRE_COPY_HINT.len(),
+                font: mono_font.clone(),
+                color: gpui::black(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(
+                text_system
+                    .layout_line(PRE_COPY_HINT, size, &[run], None)
+                    .width,
+            )
+            .ceil()
+        };
         let quote_min: Vec<f32> = rich
             .quotes
             .iter()
             .zip(&mono_header_widths)
-            .map(|(q, w)| quote_min_width(q, *w))
+            .map(|(q, w)| quote_min_width(q, *w, hint_width))
             .collect();
         let mut quote_max = quote_min.clone();
         for (p, w) in rich.paragraphs.iter().zip(&natural) {
@@ -827,6 +854,8 @@ pub struct Hit {
     pub spoiler: bool,
     /// Over a code block's header: copies its code.
     pub pre_header: Option<usize>,
+    /// Over one-line code: its part on this line, relative to the text.
+    pub code: Option<Bounds<Pixels>>,
 }
 
 impl Layout {
@@ -889,6 +918,17 @@ impl Layout {
                 hit.over_text = true;
                 hit.link = span.link;
                 hit.spoiler = span.flags & SPOILER != 0;
+                if let Some(Link::Code(_)) = span.link.and_then(|l| rich.link(l)) {
+                    let a = span.range.start.max(line.range.start);
+                    let b = span.range.end.min(line.range.end);
+                    hit.code = Some(Bounds::from_corners(
+                        point(px(line.x + self.line_x(line, a)), px(line.y)),
+                        point(
+                            px(line.x + self.line_x(line, b)),
+                            px(line.y + self.line_height),
+                        ),
+                    ));
+                }
             }
         }
         hit
@@ -932,7 +972,15 @@ pub struct TextState {
     pub pressed_link: Option<u16>,
     /// When the spoilers were revealed (a click on one shows all, 200 ms fade).
     pub revealed: Option<Instant>,
+    /// The "click to copy" highlight under one-line code: where (relative to the
+    /// text, it may be on its way from another line) and how much it is shown.
+    pub code_highlight: Option<(Bounds<Pixels>, f32)>,
 }
+
+/// The code highlight reaches this far beside the code, rounded like small buttons
+/// (`roundRadiusSmall`).
+const CODE_HIGHLIGHT_PAD: f32 = 3.;
+const CODE_HIGHLIGHT_RADIUS: f32 = 3.;
 
 /// Spoiler reveal fade (`st::fadeWrapDuration`).
 const SPOILER_REVEAL_MS: f32 = 200.;
@@ -949,6 +997,8 @@ pub enum TextEvent {
         hit: Hit,
         inside: bool,
         pressed: bool,
+        /// The text's top left in the window.
+        origin: Point<Pixels>,
     },
     Up {
         hit: Hit,
@@ -956,6 +1006,11 @@ pub enum TextEvent {
     },
     /// The left button went down outside this text.
     DownOutside,
+    /// The right button went down over the text: its menu.
+    Context {
+        hit: Hit,
+        position: Point<Pixels>,
+    },
 }
 
 type Handler = Rc<dyn Fn(TextEvent, &mut Window, &mut App)>;
@@ -1067,13 +1122,57 @@ impl Element for RichText {
         }
 
         self.paint_quotes(bounds, window, cx);
+        // "Click to copy" under one-line code: a soft rounded band (ours).
+        if let Some((rect, level)) = self.state.code_highlight
+            && level > 0.
+        {
+            let pad = px(scale::lg(CODE_HIGHLIGHT_PAD));
+            let r = Bounds::from_corners(
+                point(
+                    bounds.origin.x + rect.origin.x - pad,
+                    bounds.origin.y + rect.origin.y,
+                ),
+                point(
+                    bounds.origin.x + rect.right() + pad,
+                    bounds.origin.y + rect.bottom(),
+                ),
+            );
+            let mut color = if self.colors.dark {
+                gpui::hsla(0., 0., 0., 0.25)
+            } else {
+                with_alpha(self.colors.mono, 0.12)
+            };
+            color.a *= level;
+            window.paint_quad(
+                gpui::fill(r, color)
+                    .corner_radii(Corners::all(px(scale::lg(CODE_HIGHLIGHT_RADIUS)))),
+            );
+        }
         self.paint_lines(bounds, window, cx);
 
         let handler = self.handler.clone();
         let hb = hitbox.clone();
         let l = layout.clone();
         window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
-            if !phase.bubble() || e.button != MouseButton::Left {
+            if !phase.bubble() {
+                return;
+            }
+            if e.button == MouseButton::Right {
+                if hb.is_hovered(window) {
+                    cx.stop_propagation();
+                    let hit = l.hit(local(e.position));
+                    handler(
+                        TextEvent::Context {
+                            hit,
+                            position: e.position,
+                        },
+                        window,
+                        cx,
+                    );
+                }
+                return;
+            }
+            if e.button != MouseButton::Left {
                 return;
             }
             if hb.is_hovered(window) {
@@ -1095,13 +1194,13 @@ impl Element for RichText {
         let hb = hitbox.clone();
         let l = layout.clone();
         let dragging = self.dragging;
-        let hovered_link = self.state.hovered_link;
+        let hovered = self.state.hovered_link.is_some() || self.state.code_highlight.is_some();
         window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
             if !phase.bubble() {
                 return;
             }
             let inside = hb.is_hovered(window);
-            if !inside && !dragging && hovered_link.is_none() {
+            if !inside && !dragging && !hovered {
                 return;
             }
             let hit = l.hit(local(e.position));
@@ -1110,6 +1209,7 @@ impl Element for RichText {
                     hit,
                     inside,
                     pressed: e.pressed_button == Some(MouseButton::Left),
+                    origin,
                 },
                 window,
                 cx,
@@ -1223,8 +1323,35 @@ impl RichText {
                 );
                 let _ = window.paint_image(image_bounds, Corners::default(), image, 0, false);
             }
-            // The header: the language or "copy" (`fillParagraphBg`).
+            // The header: the language (`fillParagraphBg`) and our copy hint.
             if q.pre {
+                let mono = mono_family(window);
+                let font_size = scale::font(FONT_SIZE).size;
+                let hint_run = TextRun {
+                    len: PRE_COPY_HINT.len(),
+                    font: font(mono.clone()),
+                    color: icon,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let hint = window.text_system().shape_line(
+                    PRE_COPY_HINT.into(),
+                    font_size,
+                    &[hint_run],
+                    None,
+                );
+                let lh = px(scale::font(FONT_SIZE).height);
+                let (iw, _) = quote_icon_size(true);
+                let right = r.right()
+                    - px(scale::lg(PRE_ICON_POSITION.0))
+                    - px(scale::lg(iw))
+                    - px(scale::lg(PRE_COPY_HINT_SKIP));
+                let baseline = r.origin.y + px(scale::lg(PRE_HEADER_POSITION.1)) + hint.ascent;
+                let top = baseline - (lh + hint.ascent - hint.descent) / 2.;
+                let _ = hint.paint(point(right - hint.width, top), lh, window, cx);
+            }
+            if q.pre && !q.header.is_empty() {
                 let mono = mono_family(window);
                 let font_size = scale::font(FONT_SIZE).size;
                 let run = TextRun {
@@ -1493,7 +1620,7 @@ mod tests {
         assert_eq!(r.quotes[0].code, "fn main() {}");
         assert!(r.spans.iter().any(|s| s.flags & MONO != 0));
         let r = prepare("x", &[e(0..1, Kind::Pre(String::new()))]);
-        assert_eq!(r.quotes[0].header, "copy");
+        assert_eq!(r.quotes[0].header, "");
     }
 
     #[test]

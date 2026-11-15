@@ -232,6 +232,22 @@ pub fn long_date_time(date: i32) -> String {
         .unwrap_or_default()
 }
 
+/// `FormatReadDate`: "today at 20:29", "yesterday at 9:05", "Nov 2 at 21:14" (a
+/// message menu's forwarded / edited line).
+pub fn read_date(date: i32, now: DateTime<Local>) -> String {
+    let Some(t) = local(date) else {
+        return String::new();
+    };
+    let time = t.format(&FORMATS.time);
+    if t.date_naive() == now.date_naive() {
+        format!("today at {time}")
+    } else if t.date_naive().succ_opt() == Some(now.date_naive()) {
+        format!("yesterday at {time}")
+    } else {
+        format!("{} at {time}", t.format("%b %-d"))
+    }
+}
+
 /// The local calendar day of a message (for date dividers).
 pub fn day_of(date: i32) -> Option<chrono::NaiveDate> {
     local(date).map(|t| t.date_naive())
