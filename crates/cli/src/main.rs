@@ -213,8 +213,11 @@ fn is_rpc(e: &Error, name: &str) -> bool {
 }
 
 async fn login(method: LoginMethod) -> Result<()> {
-    if load_session()?.is_some_and(|s| s.is_authorized()) {
-        bail!("already logged in; run `tdr logout` first");
+    match load_session() {
+        Ok(Some(s)) if s.is_authorized() => bail!("already logged in; run `tdr logout` first"),
+        Ok(_) => {}
+        // A damaged session (e.g. cut short by a crash) is as good as none: log in anew.
+        Err(e) => eprintln!("The saved session is damaged ({e}); logging in again."),
     }
     let client = Client::new(config()?, SessionData::new(2));
     let authorization = match method {

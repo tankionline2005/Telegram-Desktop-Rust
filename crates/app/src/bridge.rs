@@ -324,7 +324,11 @@ async fn run(
     info!(elapsed = ?crate::STARTED.elapsed(), "data: cached chat list sent");
 
     let session = match std::fs::read(&paths.session) {
-        Ok(d) => SessionData::from_bytes(&d)?,
+        Ok(d) => SessionData::from_bytes(&d).map_err(|e| {
+            anyhow::anyhow!(
+                "The saved session is damaged ({e}). Run `tdr login` once, then start the app again."
+            )
+        })?,
         Err(_) => anyhow::bail!(
             "Not logged in. Run `tdr login` once (the console client), then start the app again."
         ),
