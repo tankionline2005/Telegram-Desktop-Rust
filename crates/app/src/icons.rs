@@ -25,6 +25,13 @@ pub enum Icon {
     ChatGroup,
     ChatChannel,
     ChatBot,
+    /// The round "go to original" button of forwarded messages
+    /// (`historyGoToOriginalIcon`).
+    GoToOriginal,
+    /// The chat header's back arrow (`infoTopBarBackIcon`).
+    Back,
+    /// The shadow at the edge of a chat sliding in (`slideShadow`), stretched.
+    SlideShadow,
     /// Send state of the last message in the chat list: sent (✓), read (✓✓).
     DialogsSent,
     DialogsReceived,
@@ -60,6 +67,9 @@ impl Icon {
             Icon::DialogsReceived => icon_bytes!("dialogs__dialogs_received"),
             Icon::HistorySent => icon_bytes!("history_sent"),
             Icon::HistoryReceived => icon_bytes!("history_received"),
+            Icon::GoToOriginal => icon_bytes!("filled_go_to_message"),
+            Icon::Back => icon_bytes!("info__info_back"),
+            Icon::SlideShadow => icon_bytes!("slide_shadow"),
         }
     }
 }
@@ -210,4 +220,14 @@ pub fn bubble_tail_outline() -> &'static [(f32, f32)] {
         points
     });
     &OUTLINE
+}
+
+/// An icon stretched over its parent's height (the 1 px tall `slide_shadow`).
+pub fn stretched(icon: Icon, color: Color, window: &Window) -> gpui::Img {
+    let scale = window.scale_factor();
+    let t = tinted(icon, color, scale);
+    img(t.image.clone())
+        .w(px(t.width / scale))
+        .h_full()
+        .object_fit(gpui::ObjectFit::Fill)
 }

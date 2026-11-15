@@ -336,6 +336,45 @@ impl Storage {
             .optional()
     }
 
+    /// How many messages of the cached segment are at `id` or newer, if the segment
+    /// reaches down to `id` (so showing them shows that message).
+    pub fn count_from(&self, peer: PeerKey, id: i32) -> Result<Option<usize>> {
+        let seg: Option<(i32, Option<i32>)> = self
+            .conn
+            .prepare_cached(
+                "SELECT top_message, cached_from FROM dialogs WHERE kind = ?1 AND id = ?2",
+            )?
+            .query_row(params![peer.kind as i64, peer.id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        let Some((top, Some(from))) = seg else {
+            return Ok(None);
+        };
+        if id < from || id > top {
+            return Ok(None);
+        }
+        let n: i64 = self
+            .conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM messages WHERE kind = ?1 AND peer_id = ?2 AND id BETWEEN ?3 AND ?4",
+            )?
+            .query_row(params![peer.kind as i64, peer.id, id, top], |r| r.get(0))?;
+        Ok(Some(n as usize))
+    }
+
+    /// The oldest message of the cached segment.
+    pub fn cached_from(&self, peer: PeerKey) -> Result<Option<i32>> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT cached_from FROM dialogs WHERE kind = ?1 AND id = ?2")?
+            .query_row(params![peer.kind as i64, peer.id], |r| {
+                r.get::<_, Option<i32>>(0)
+            })
+            .optional()?
+            .flatten())
+    }
+
     pub fn access_hash(&self, key: PeerKey) -> Result<Option<i64>> {
         Ok(self.peer(key)?.and_then(|p| p.access_hash))
     }

@@ -275,3 +275,51 @@ sha256 = "d1c5eefe2fe866d50c941d0a1be6704983bf025dd950f4e2fe8bc1574bc5144f"
 path = "assets/tdesktop-art/background.tgv"
 upstream = "Telegram/Resources/art/background.tgv"
 sha256 = "3c5ef666d033ce9effe703b80348b9d7363323f0076b2856ec041923c78b0ab8"
+
+[[vendored]]
+path = "assets/tdesktop-icons/filled_go_to_message.png"
+upstream = "Telegram/Resources/icons/filled_go_to_message.png"
+sha256 = "3ef611d1bab0034f60609caa59400cef7843514e88e1ffa756128cc231387d27"
+
+[[vendored]]
+path = "assets/tdesktop-icons/info__info_back.png"
+upstream = "Telegram/Resources/icons/info/info_back.png"
+sha256 = "1a4ce560591a6b57fa930305bb66e0b4945edca8c7571e0b35e50efd7224f76d"
+
+[[vendored]]
+path = "assets/tdesktop-icons/slide_shadow.png"
+upstream = "icons/slide_shadow.png"
+submodule = "Telegram/lib_ui"
+sha256 = "5d81581f2d2628a852ed8f2860b7749ce472a07f1c36a1d6646f616ea1eda266"
+
+[[vendored]]
+path = "assets/tdesktop-icons/filled_go_to_message@2x.png"
+upstream = "Telegram/Resources/icons/filled_go_to_message@2x.png"
+sha256 = "c0297194cb56b196d01ca39806f7c4b9c944308f7701c986b808b7accd4533c7"
+
+[[vendored]]
+path = "assets/tdesktop-icons/info__info_back@2x.png"
+upstream = "Telegram/Resources/icons/info/info_back@2x.png"
+sha256 = "d8a841b9c48a00de00381e0ab81eb7dd5bbe19b842a15cec208a8eca83859ac6"
+
+[[vendored]]
+path = "assets/tdesktop-icons/slide_shadow@2x.png"
+upstream = "icons/slide_shadow@2x.png"
+submodule = "Telegram/lib_ui"
+sha256 = "da8bdff0f41689dcd54521ede69f2a1502c9eae122bb690c97b866945e9dac6b"
+
+[[vendored]]
+path = "assets/tdesktop-icons/filled_go_to_message@3x.png"
+upstream = "Telegram/Resources/icons/filled_go_to_message@3x.png"
+sha256 = "f4029e8e1380366ef5b5f3c54d91eba79304be03447b3e2cbdcbd074b22ae300"
+
+[[vendored]]
+path = "assets/tdesktop-icons/info__info_back@3x.png"
+upstream = "Telegram/Resources/icons/info/info_back@3x.png"
+sha256 = "3f59d66342d97b85845182ee1819e03e721df9c88a44992c7debde3cccf427d2"
+
+[[vendored]]
+path = "assets/tdesktop-icons/slide_shadow@3x.png"
+upstream = "icons/slide_shadow@3x.png"
+submodule = "Telegram/lib_ui"
+sha256 = "131ae0d6542e4cf6ebc29835f92fb643e4954c7b52a13f07a94e36b51d81926a"

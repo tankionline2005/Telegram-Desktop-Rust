@@ -1194,6 +1194,88 @@ impl Sync {
     /// loaded from the server only if the cache does not have enough. For a channel its
     /// difference is fetched first (as tdesktop does when a channel is opened), since
     /// channel updates do not come through the common difference.
+    /// One page of history around `offset_id` (`messages.getHistory` with
+    /// `add_offset`), stored as plain messages (outside the cached segment). Newest
+    /// first.
+    pub async fn history_page(
+        &mut self,
+        peer: PeerKey,
+        offset_id: i32,
+        add_offset: i32,
+        limit: i32,
+    ) -> Result<Vec<MessageRow>> {
+        let access_hash = self.store.access_hash(peer)?;
+        let Some(input) = convert::input_peer(peer, access_hash) else {
+            return Ok(Vec::new());
+        };
+        let answer = self
+            .client
+            .invoke(&functions::messages::GetHistory {
+                peer: input,
+                offset_id,
+                offset_date: 0,
+                add_offset,
+                limit,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            })
+            .await?;
+        let (messages, chats, users) = match answer {
+            enums::messages::Messages::Messages(m) => (m.messages, m.chats, m.users),
+            enums::messages::Messages::Slice(m) => (m.messages, m.chats, m.users),
+            enums::messages::Messages::ChannelMessages(m) => (m.messages, m.chats, m.users),
+            enums::messages::Messages::NotModified(_) => return Ok(Vec::new()),
+        };
+        let mut rows: Vec<MessageRow> = messages.iter().filter_map(convert::message_row).collect();
+        rows.sort_by_key(|m| std::cmp::Reverse(m.id));
+        let peers: Vec<_> = users
+            .iter()
+            .filter_map(convert::user_row)
+            .chain(chats.iter().filter_map(convert::chat_row))
+            .collect();
+        self.store.write(|w| {
+            for p in &peers {
+                w.put_peer(p)?;
+            }
+            for m in &rows {
+                w.put_message(m)?;
+            }
+            Ok(())
+        })?;
+        Ok(rows)
+    }
+
+    /// A window of history around `id` for a message the cached segment does not
+    /// reach (tdesktop's jump to a message): `None` when the segment has it.
+    pub async fn history_around(
+        &mut self,
+        peer: PeerKey,
+        id: i32,
+        limit: i32,
+    ) -> Result<Option<Vec<MessageRow>>> {
+        if self.store.count_from(peer, id)?.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(self.history_page(peer, id, -limit / 2, limit).await?))
+    }
+
+    /// A window (newest first) that reached the newest messages joins the cached
+    /// segment: the part below the segment continues it downwards.
+    pub fn join_window(&mut self, peer: PeerKey, window: &[MessageRow]) -> Result<()> {
+        let Some(from) = self.store.cached_from(peer)? else {
+            return Ok(());
+        };
+        let older: Vec<MessageRow> = window.iter().filter(|m| m.id < from).cloned().collect();
+        if older.is_empty() {
+            return Ok(());
+        }
+        // Not fewer than asked for: this is not the start of the chat.
+        self.store
+            .write(|w| w.extend_history(peer, from, older.len(), &older))?;
+        Ok(())
+    }
+
     pub async fn history(&mut self, peer: PeerKey, limit: usize) -> Result<History> {
         if peer.kind == PeerKind::Channel
             && let Some(pts) = self.engine.channel_pts(peer.id)

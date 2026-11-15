@@ -98,6 +98,14 @@ pub struct Forward {
     pub forward_of_forward: bool,
     pub saved_from: Option<PeerKey>,
     pub saved_out: bool,
+    /// A hidden original sender (`from_name`), a channel post's signature.
+    pub from_name: Option<String>,
+    pub post_author: Option<String>,
+    /// Who it was saved from when hidden (`saved_from_name`).
+    pub saved_from_name: Option<String>,
+    /// The message this copy was saved from (`saved_from_peer`, `saved_from_msg_id`):
+    /// the "go to original" button opens it.
+    pub original: Option<(PeerKey, i32)>,
 }
 
 impl Forward {
@@ -139,6 +147,14 @@ pub fn message_info(row: &MessageRow) -> MessageInfo {
                     forward_of_forward: f.saved_from_id.is_some() || f.saved_from_name.is_some(),
                     saved_from: f.saved_from_id.as_ref().map(crate::convert::peer_key),
                     saved_out: f.saved_out,
+                    from_name: f.from_name.clone(),
+                    post_author: f.post_author.clone(),
+                    saved_from_name: f.saved_from_name.clone(),
+                    original: f
+                        .saved_from_peer
+                        .as_ref()
+                        .zip(f.saved_from_msg_id)
+                        .map(|(p, id)| (crate::convert::peer_key(p), id)),
                 }
             }),
         },
@@ -395,6 +411,7 @@ mod tests {
             forward_of_forward: fof,
             saved_from,
             saved_out,
+            ..Default::default()
         };
         // Forwarded from someone else: incoming; from yourself: outgoing.
         assert!(!fwd(Some(other), false, None, false).outgoing_in_saved(me));

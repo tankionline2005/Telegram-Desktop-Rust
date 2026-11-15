@@ -31,6 +31,14 @@ pub enum Command {
     CloseChat,
     /// The user scrolled to the top of the open chat: load older messages.
     LoadOlder(PeerKey),
+    /// Open a chat at a message (the "go to original" button): its history around
+    /// it, the message focused.
+    OpenChatAt {
+        peer: PeerKey,
+        msg_id: i32,
+    },
+    /// A chat shown around an older message was scrolled to its bottom: load newer.
+    LoadNewer(PeerKey),
     Send {
         peer: PeerKey,
         text: String,
@@ -63,6 +71,10 @@ pub enum Update {
         messages: Vec<MessageItem>,
         /// The first message of the chat is loaded: nothing older to ask for.
         complete: bool,
+        /// Newer messages exist below these (a window around an older message).
+        newer: bool,
+        /// Show this message (and highlight it).
+        focus: Option<i32>,
     },
     /// The draft of `peer` was changed from another device: the input field of that
     /// chat shows `text` now (`None`: empty).
@@ -150,6 +162,18 @@ pub struct MessageItem {
     /// Sender name and color in groups (incoming messages only).
     pub sender: Option<(String, u8)>,
     pub author: Author,
+    /// "Forwarded from" line: the original sender's name and userpic.
+    pub forwarded: Option<ForwardLine>,
+    /// The "go to original" button's target (`saved_from_peer`, `saved_from_msg_id`).
+    pub original: Option<(PeerKey, i32)>,
+}
+
+/// The "Forwarded from" line (`HistoryMessageForwarded::text`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForwardLine {
+    pub name: String,
+    /// The original sender (hidden senders have no userpic there).
+    pub author: Option<Author>,
 }
 
 /// Who wrote a message: for the userpic next to it and for grouping.
@@ -400,29 +424,82 @@ fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec
         .rev()
         .map(|m| {
             let (media, service, info) = message_content(store, m, is_channel);
-            let key = if m.out {
-                PeerKey::user(ctx.self_id)
-            } else {
-                m.from.unwrap_or(peer)
-            };
-            let author = authors
-                .entry(key)
-                .or_insert_with(|| author_of(store, key))
-                .clone();
-            let sender = (is_group && !m.out)
-                .then(|| m.from.map(|from| (peer_name(store, from), author.color)))
-                .flatten();
-            // Calls are bubbles with their caption, not service lines.
-            let call = info.service.as_ref().is_some_and(present::is_call);
+            let fwd = info.forward.as_ref();
+            let me = PeerKey::user(ctx.self_id);
             // `Message::hasOutLayout`: in Saved Messages everything is drawn as
             // outgoing except forwards from others.
             let out = if is_saved {
-                info.forward
-                    .as_ref()
-                    .is_none_or(|f| f.outgoing_in_saved(PeerKey::user(ctx.self_id)))
+                fwd.is_none_or(|f| f.outgoing_in_saved(me))
             } else {
                 m.out
             };
+            // `HistoryItem::displayFrom`: Saved Messages show forwards under their
+            // original sender (or whom they were saved from).
+            let saved_from = fwd.filter(|_| is_saved && !out).map(|f| {
+                if f.forward_of_forward {
+                    (f.saved_from, f.saved_from_name.clone())
+                } else {
+                    (f.from, f.from_name.clone())
+                }
+            });
+            let (author, sender) = match &saved_from {
+                Some((Some(key), _)) => {
+                    let author = authors
+                        .entry(*key)
+                        .or_insert_with(|| author_of(store, *key))
+                        .clone();
+                    let name = peer_name(store, *key);
+                    let color = author.color;
+                    (author, Some((name, color)))
+                }
+                Some((None, name)) => {
+                    let name = name.clone().unwrap_or_default();
+                    let author = hidden_author(&name);
+                    let color = author.color;
+                    (author, Some((name, color)))
+                }
+                None => {
+                    let key = if m.out { me } else { m.from.unwrap_or(peer) };
+                    let author = authors
+                        .entry(key)
+                        .or_insert_with(|| author_of(store, key))
+                        .clone();
+                    let sender = (is_group && !m.out)
+                        .then(|| m.from.map(|from| (peer_name(store, from), author.color)))
+                        .flatten();
+                    (author, sender)
+                }
+            };
+            // `displayForwardedFrom`: in Saved Messages only when it was saved from
+            // someone else than its original sender.
+            let forwarded = fwd
+                .filter(|f| {
+                    !is_saved
+                        || (f.forward_of_forward
+                            && (f.saved_from_name.is_some() || f.saved_from != f.from))
+                })
+                .map(|f| {
+                    let name = f
+                        .from
+                        .map(|k| peer_name(store, k))
+                        .or_else(|| f.from_name.clone())
+                        .unwrap_or_default();
+                    ForwardLine {
+                        // `lng_forwarded_signed`: "Channel (Author)".
+                        name: match &f.post_author {
+                            Some(a) => format!("{name} ({a})"),
+                            None => name,
+                        },
+                        author: f.from.map(|k| {
+                            authors
+                                .entry(k)
+                                .or_insert_with(|| author_of(store, k))
+                                .clone()
+                        }),
+                    }
+                });
+            // Calls are bubbles with their caption, not service lines.
+            let call = info.service.as_ref().is_some_and(present::is_call);
             MessageItem {
                 id: m.id,
                 out,
@@ -444,9 +521,25 @@ fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec
                 time: present::message_time(m.date),
                 sender,
                 author,
+                forwarded,
+                original: fwd.and_then(|f| f.original),
             }
         })
         .collect()
+}
+
+/// A hidden sender ("Forwarded from" a name only): initials and a color from the
+/// name (tdesktop derives a fake peer id from it).
+fn hidden_author(name: &str) -> Author {
+    let hash = name
+        .bytes()
+        .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b.into()));
+    Author {
+        key: None,
+        initials: initials(name),
+        color: (hash % 7) as u8,
+        photo: None,
+    }
 }
 
 /// Chats shown at first; every `LoadMoreDialogs` adds a page.
@@ -554,18 +647,48 @@ fn send_dialogs(
     Ok(())
 }
 
+/// What part of the open chat's history is shown.
+enum Shown {
+    /// The newest messages of the cached segment.
+    Latest(usize),
+    /// A window around a message the segment does not reach (newest first), grown by
+    /// scrolling until it meets the newest messages.
+    Window {
+        rows: Vec<MessageRow>,
+        older_done: bool,
+    },
+}
+
+/// Messages per page of a window.
+const WINDOW_PAGE: i32 = 50;
+
 fn send_history(
     store: &Storage,
     peer: PeerKey,
-    count: usize,
+    shown: &Shown,
+    focus: Option<i32>,
     tx: &mpsc::UnboundedSender<Update>,
 ) -> anyhow::Result<()> {
-    let h = store.history(peer, count)?;
-    let _ = tx.send(Update::History {
-        peer,
-        messages: message_items(store, peer, &h.messages),
-        complete: h.complete,
-    });
+    let update = match shown {
+        Shown::Latest(count) => {
+            let h = store.history(peer, *count)?;
+            Update::History {
+                peer,
+                messages: message_items(store, peer, &h.messages),
+                complete: h.complete,
+                newer: false,
+                focus,
+            }
+        }
+        Shown::Window { rows, older_done } => Update::History {
+            peer,
+            messages: message_items(store, peer, rows),
+            complete: *older_done,
+            newer: true,
+            focus,
+        },
+    };
+    let _ = tx.send(update);
     Ok(())
 }
 
@@ -622,8 +745,8 @@ async fn run(
     }
     let store = Storage::open(&paths.cache)?;
     // How many chats the list shows (grows as it is scrolled down).
-    let mut shown = DIALOGS;
-    send_dialogs(&store, shown, &tx)?;
+    let mut shown_dialogs = DIALOGS;
+    send_dialogs(&store, shown_dialogs, &tx)?;
     info!(elapsed = ?crate::STARTED.elapsed(), "data: cached chat list sent");
 
     let session = match std::fs::read(&paths.session) {
@@ -660,12 +783,12 @@ async fn run(
     sync_clock(&client);
     info!(elapsed = ?started.elapsed(), "synced");
     save(&client);
-    send_dialogs(sync.store(), shown, &tx)?;
+    send_dialogs(sync.store(), shown_dialogs, &tx)?;
     send_draft_changes(&applied, &tx);
     let _ = tx.send(Update::Status(String::new()));
     // The shown part of the cached list may be stale below what the start refreshed.
-    if confirm_dialogs(&mut sync, shown).await {
-        send_dialogs(sync.store(), shown, &tx)?;
+    if confirm_dialogs(&mut sync, shown_dialogs).await {
+        send_dialogs(sync.store(), shown_dialogs, &tx)?;
     }
     // When to save drafts to the cloud. Drafts left unsaved last time (the app quit
     // first) go up right away.
@@ -682,38 +805,39 @@ async fn run(
     // 3. Commands and live updates.
     let mut open: Option<PeerKey> = None;
     // How many messages of the open chat are shown (grows as the user scrolls up).
-    let mut count = HISTORY;
+    let mut shown = Shown::Latest(HISTORY);
     loop {
         tokio::select! {
             cmd = commands.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
                     Command::LoadMoreDialogs => {
-                        shown += DIALOGS_STEP;
-                        send_dialogs(sync.store(), shown, &tx)?;
-                        if confirm_dialogs(&mut sync, shown).await {
-                            send_dialogs(sync.store(), shown, &tx)?;
+                        shown_dialogs += DIALOGS_STEP;
+                        send_dialogs(sync.store(), shown_dialogs, &tx)?;
+                        if confirm_dialogs(&mut sync, shown_dialogs).await {
+                            send_dialogs(sync.store(), shown_dialogs, &tx)?;
                         }
                     }
                     Command::ReorderPinned(order) => {
                         if let Err(e) = sync.reorder_pinned(order).await {
                             error!("pinned order: {e}");
                         }
-                        send_dialogs(sync.store(), shown, &tx)?;
+                        send_dialogs(sync.store(), shown_dialogs, &tx)?;
                     }
                     Command::OpenChat(peer) => {
                         open = Some(peer);
-                        count = open_count(sync.store(), peer);
-                        send_history(sync.store(), peer, count, &tx)?;
+                        let count = open_count(sync.store(), peer);
+                        shown = Shown::Latest(count);
+                        send_history(sync.store(), peer, &shown, None, &tx)?;
                         match sync.history(peer, count).await {
-                            Ok(_) => send_history(sync.store(), peer, count, &tx)?,
+                            Ok(_) => send_history(sync.store(), peer, &shown, None, &tx)?,
                             Err(e) => error!("history: {e}"),
                         }
                         // A private chat's status, fresh from the server.
                         if let Err(e) = sync.refresh_user(peer).await {
                             error!("user: {e}");
                         }
-                        send_dialogs(sync.store(), shown, &tx)?;
+                        send_dialogs(sync.store(), shown_dialogs, &tx)?;
                         // Supergroups and channels: the member count is in the full info.
                         match sync.member_count(peer).await {
                             Ok(Some(n)) => {
@@ -725,7 +849,7 @@ async fn run(
                         }
                     }
                     Command::Read { peer, max_id } => match sync.read_history(peer, max_id).await {
-                        Ok(_) => send_dialogs(sync.store(), shown, &tx)?,
+                        Ok(_) => send_dialogs(sync.store(), shown_dialogs, &tx)?,
                         Err(e) => error!("read: {e}"),
                     },
                     Command::LoadUserpic { peer, photo_id, dc_id } => {
@@ -751,27 +875,103 @@ async fn run(
                     Command::CloseChat => open = None,
                     Command::SaveDraft { peer, text, cloud } => {
                         if sync.set_draft(peer, &text)? {
-                            send_dialogs(sync.store(), shown, &tx)?;
+                            send_dialogs(sync.store(), shown_dialogs, &tx)?;
                         }
                         if cloud && sync.has_unsaved_drafts() && cloud_save_at.is_none() {
                             cloud_save_at = Some(tokio::time::Instant::now() + SAVE_CLOUD_DRAFT_DELAY);
                         }
                     }
-                    Command::LoadOlder(peer) => {
-                        if open == Some(peer) {
-                            count += HISTORY;
+                    Command::LoadOlder(peer) if open == Some(peer) => match &mut shown {
+                        Shown::Latest(count) => {
+                            *count += HISTORY;
+                            let count = *count;
                             if let Err(e) = sync.history(peer, count).await {
                                 error!("history: {e}");
                             }
-                            send_history(sync.store(), peer, count, &tx)?;
+                            send_history(sync.store(), peer, &shown, None, &tx)?;
+                        }
+                        Shown::Window { rows, older_done } => {
+                            if let Some(oldest) = rows.last().map(|m| m.id) {
+                                match sync.history_page(peer, oldest, 0, WINDOW_PAGE).await {
+                                    Ok(page) => {
+                                        *older_done = page.len() < WINDOW_PAGE as usize;
+                                        rows.extend(page.into_iter().filter(|m| m.id < oldest));
+                                    }
+                                    Err(e) => error!("history: {e}"),
+                                }
+                            }
+                            send_history(sync.store(), peer, &shown, None, &tx)?;
+                        }
+                    },
+                    Command::LoadOlder(_) => {}
+                    Command::LoadNewer(peer) if open == Some(peer) => {
+                        if let Shown::Window { rows, .. } = &mut shown
+                            && let Some(newest) = rows.first().map(|m| m.id)
+                        {
+                            match sync.history_page(peer, newest, -WINDOW_PAGE, WINDOW_PAGE).await {
+                                Ok(page) => {
+                                    let mut newer: Vec<MessageRow> =
+                                        page.into_iter().filter(|m| m.id > newest).collect();
+                                    newer.append(rows);
+                                    *rows = newer;
+                                }
+                                Err(e) => error!("history: {e}"),
+                            }
+                            // The window met the newest message: it joins the cached
+                            // history and the chat is shown as usual from here.
+                            let top = sync.store().history(peer, 1)?.messages.first().map(|m| m.id);
+                            let reached = rows.first().map(|m| m.id) >= top;
+                            if reached {
+                                let window = std::mem::take(rows);
+                                if let Err(e) = sync.join_window(peer, &window) {
+                                    error!("history: {e}");
+                                }
+                                shown = Shown::Latest(window.len().max(HISTORY));
+                            }
+                            send_history(sync.store(), peer, &shown, None, &tx)?;
+                        }
+                    }
+                    Command::LoadNewer(_) => {}
+                    Command::OpenChatAt { peer, msg_id } => {
+                        open = Some(peer);
+                        // In the cached history: shown from the newest down to it.
+                        if let Some(n) = sync.store().count_from(peer, msg_id)? {
+                            shown = Shown::Latest(open_count(sync.store(), peer).max(n + 30));
+                        } else {
+                            match sync.history_around(peer, msg_id, WINDOW_PAGE * 2).await {
+                                Ok(Some(rows)) => {
+                                    shown = Shown::Window { rows, older_done: false };
+                                }
+                                Ok(None) => {
+                                    let n = sync.store().count_from(peer, msg_id)?.unwrap_or(0);
+                                    shown = Shown::Latest(HISTORY.max(n + 30));
+                                }
+                                Err(e) => {
+                                    error!("history: {e}");
+                                    shown = Shown::Latest(open_count(sync.store(), peer));
+                                }
+                            }
+                        }
+                        send_history(sync.store(), peer, &shown, Some(msg_id), &tx)?;
+                        if let Err(e) = sync.refresh_user(peer).await {
+                            error!("user: {e}");
+                        }
+                        send_dialogs(sync.store(), shown_dialogs, &tx)?;
+                        match sync.member_count(peer).await {
+                            Ok(Some(n)) => {
+                                let text = members_text(sync.store(), peer, n);
+                                let _ = tx.send(Update::Members { peer, text });
+                            }
+                            Ok(None) => {}
+                            Err(e) => error!("full info: {e}"),
                         }
                     }
                     Command::Send { peer, text } => {
                         match sync.send_text(peer, &text).await {
                             Ok(_) => {
-                                send_dialogs(sync.store(), shown, &tx)?;
+                                send_dialogs(sync.store(), shown_dialogs, &tx)?;
                                 if open == Some(peer) {
-                                    send_history(sync.store(), peer, count, &tx)?;
+                                    send_history(sync.store(), peer, &shown, None, &tx)?;
                                 }
                             }
                             Err(e) => {
@@ -806,14 +1006,14 @@ async fn run(
                 let applied = sync.process(event).await?;
                 sync_clock(&client);
                 if changed(&applied) {
-                    send_dialogs(sync.store(), shown, &tx)?;
+                    send_dialogs(sync.store(), shown_dialogs, &tx)?;
                     send_draft_changes(&applied, &tx);
                     if let Some(peer) = open {
                         let touched = applied.new_messages.iter().any(|m| m.peer == peer)
                             || applied.edited + applied.deleted > 0
                             || applied.marks_changed;
                         if touched {
-                            send_history(sync.store(), peer, count, &tx)?;
+                            send_history(sync.store(), peer, &shown, None, &tx)?;
                         }
                     }
                     save(&client);
@@ -1069,12 +1269,16 @@ pub fn start_demo() -> (
                     date,
                     sender: None,
                     author: demo_author(out),
+                    forwarded: None,
+                    original: None,
                 }
             })
             .collect();
         // Older demo messages appear 20 at a time when the user scrolls up.
         let mut older_left = 60;
         let mut next_id = 2000;
+        // A "go to original" target, sent once with the next histories.
+        let mut focus: Option<(PeerKey, i32)> = None;
         while let Some(cmd) = cmd_rx.blocking_recv() {
             match cmd {
                 Command::ReorderPinned(order) => {
@@ -1084,7 +1288,8 @@ pub fn start_demo() -> (
                     let _ = up_tx.send(Update::Dialogs(dialogs.clone()));
                     continue;
                 }
-                Command::LoadMoreDialogs => continue,
+                Command::LoadMoreDialogs | Command::LoadNewer(_) => continue,
+                Command::OpenChatAt { peer, msg_id } => focus = Some((peer, msg_id)),
                 Command::OpenChat(_)
                 | Command::CloseChat
                 | Command::SaveDraft { .. }
@@ -1109,6 +1314,8 @@ pub fn start_demo() -> (
                                 date,
                                 sender: None,
                                 author: demo_author(k % 3 == 0),
+                                forwarded: None,
+                                original: None,
                             }
                         })
                         .collect();
@@ -1131,6 +1338,8 @@ pub fn start_demo() -> (
                         date,
                         sender: None,
                         author: demo_author(true),
+                        forwarded: None,
+                        original: None,
                     });
                 }
             }
@@ -1145,12 +1354,41 @@ pub fn start_demo() -> (
                         m.sender = Some(("Bob Smith".into(), m.author.color));
                     }
                 }
+                // Saved Messages: incoming ones are forwards from Alice's chat, one
+                // of them saved from Bob (a forward of a forward).
+                if i + 1 == 3 {
+                    for (k, m) in messages
+                        .iter_mut()
+                        .enumerate()
+                        .filter(|(_, m)| !m.out && m.service.is_none())
+                    {
+                        m.original = Some((PeerKey::user(1), m.id));
+                        m.author = demo_author(false);
+                        m.sender = Some(("Bob Smith".into(), m.author.color));
+                        if k % 2 == 0 {
+                            m.forwarded = Some(ForwardLine {
+                                name: "Alice Johnson".into(),
+                                author: Some(Author {
+                                    key: Some(PeerKey::user(1)),
+                                    initials: "AJ".into(),
+                                    color: color_index(1),
+                                    photo: None,
+                                }),
+                            });
+                        }
+                    }
+                }
                 let _ = up_tx.send(Update::History {
                     peer: PeerKey::user(i + 1),
                     messages,
                     complete: older_left == 0,
+                    newer: false,
+                    focus: focus
+                        .filter(|(p, _)| *p == PeerKey::user(i + 1))
+                        .map(|(_, id)| id),
                 });
             }
+            focus = None;
         }
     });
     (cmd_tx, up_rx)

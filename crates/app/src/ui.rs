@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight, ListAlignment, ListOffset,
     ListState, MouseButton, PathBuilder, Pixels, RenderImage, Rgba, SharedString, TextRun,
-    UniformListScrollHandle, Window, WindowControlArea, canvas, div, font, img, linear_color_stop,
-    linear_gradient, list, point, prelude::*, rgba, uniform_list,
+    UniformListScrollHandle, WeakEntity, Window, WindowControlArea, canvas, div, font, img,
+    linear_color_stop, linear_gradient, list, point, prelude::*, rgba, uniform_list,
 };
 use tdr_data::describe::PeerKind as ChatKind;
 use tdr_data::tdr_storage::PeerKey;
@@ -374,6 +374,63 @@ fn service_pill(p: &Palette, text: String, width: f32) -> gpui::Div {
         .child(text)
 }
 
+// chat.style: historyFastShareSize (topPeersSelectorUserpicSize), historyFastShareLeft,
+// historyFastShareBottom
+const FAST_SHARE_SIZE: f32 = 31.;
+const FAST_SHARE_LEFT: f32 = 13.;
+const FAST_SHARE_BOTTOM: f32 = 5.;
+/// The sender's userpic in "Forwarded from" (a userpic emoji with
+/// `fwdTextUserpicPadding`: 1 px above, 3 px after it).
+const FWD_USERPIC: f32 = 17.;
+const FWD_USERPIC_SKIP: f32 = 3.;
+// basic.style: activeFadeInDuration, activeFadeOutDuration (a jumped-to message)
+const HIGHLIGHT_IN: Duration = Duration::from_millis(500);
+const HIGHLIGHT_OUT: Duration = Duration::from_millis(3000);
+/// basic.style: slideShift, how far the chat underneath moves while another slides in.
+const SLIDE_SHIFT: f32 = 100.;
+/// `historyTopBarBack`: 52 px wide, the arrow at `infoTopBarBack`'s 11 px.
+const BACK_WIDTH: f32 = 52.;
+const BACK_ICON_LEFT: f32 = 11.;
+
+fn ease_out_circ(t: f32) -> f32 {
+    (1. - (t - 1.) * (t - 1.)).max(0.).sqrt()
+}
+
+/// A chat set aside, with its list and scroll position: in the back stack
+/// (`SessionController`'s section stack), or drawn while another slides over it.
+#[derive(Clone)]
+struct SavedPane {
+    peer: PeerKey,
+    messages: Vec<MessageItem>,
+    state: ListState,
+    history_complete: bool,
+    stick_to_bottom: bool,
+    unread_bar: Option<i32>,
+    read_till: i32,
+    newer_available: bool,
+}
+
+/// A chat sliding in from the right (forward) or out to the right (back), as
+/// `Window::SlideAnimation` does.
+struct Slide {
+    /// The other chat: under the arriving one, or the one leaving.
+    pane: SavedPane,
+    forward: bool,
+    start: Instant,
+}
+
+/// What a message list is drawn from: the open chat or a set-aside one.
+#[derive(Clone, Copy)]
+struct PaneRef<'a> {
+    peer: Option<PeerKey>,
+    messages: &'a [MessageItem],
+    unread_bar: Option<i32>,
+    /// The jumped-to message and its highlight's opacity.
+    highlight: Option<(i32, f32)>,
+    /// Clicks act (the open chat); a sliding copy only shows.
+    live: bool,
+}
+
 /// `slideDuration`: the "scroll to top" / "scroll down" animations.
 const SLIDE_DURATION: Duration = Duration::from_millis(240);
 /// `stickersRowDuration`: pinned chats sliding into place while one is dragged.
@@ -677,6 +734,18 @@ pub struct MainView {
     more_dialogs_requested: usize,
     /// The main menu's "Night Mode" row is under the mouse.
     menu_hovered: bool,
+    /// Chats to go back to (`showBackFromStack`), the last on top.
+    back_stack: Vec<SavedPane>,
+    slide: Option<Slide>,
+    /// The open chat shows a window around an older message: newer ones load at its
+    /// bottom.
+    newer_available: bool,
+    loading_newer: bool,
+    /// Show this message when the history arrives, and the highlighted one.
+    pending_focus: Option<i32>,
+    highlight: Option<(i32, Instant)>,
+    /// Center this list item once it is laid out.
+    center_on: Option<usize>,
     /// The day wallpaper for a chat area of this many device pixels.
     day_background: Option<((u32, u32), Arc<RenderImage>)>,
     day_background_busy: bool,
@@ -781,25 +850,7 @@ impl MainView {
         })
         .detach();
 
-        let messages_state = ListState::new(0, ListAlignment::Bottom, px(600.));
-        let view = cx.entity().downgrade();
-        messages_state.set_scroll_handler(move |event, _window, cx| {
-            let near_top = event.visible_range.start <= LOAD_OLDER_THRESHOLD;
-            let at_bottom = event.visible_range.end >= event.count;
-            let visible_end = event.visible_range.end;
-            let view = view.clone();
-            cx.defer(move |cx| {
-                let _ = view.update(cx, |v, cx| {
-                    v.stick_to_bottom = at_bottom;
-                    v.stop_scroll_anim(Area::History);
-                    v.scrolled(Area::History, cx);
-                    v.mark_read(visible_end);
-                    if near_top {
-                        v.load_older();
-                    }
-                });
-            });
-        });
+        let messages_state = Self::new_messages_state(cx);
 
         let fonts = cx.text_system().all_font_names();
         let icon_font = ["Segoe Fluent Icons", "Segoe MDL2 Assets"]
@@ -830,6 +881,13 @@ impl MainView {
             scroll_anim: None,
             more_dialogs_requested: 0,
             menu_hovered: false,
+            back_stack: Vec::new(),
+            slide: None,
+            newer_available: false,
+            loading_newer: false,
+            pending_focus: None,
+            highlight: None,
+            center_on: None,
             day_background: None,
             day_background_busy: false,
             unread_target: None,
@@ -862,6 +920,179 @@ impl MainView {
 
     fn palette(&self) -> &'static Palette {
         tdr_theme::palette(self.dark)
+    }
+
+    /// A chat's message list: loads older messages near its top, newer ones (in a
+    /// window around an older message) at its bottom.
+    fn new_messages_state(cx: &mut Context<Self>) -> ListState {
+        let state = ListState::new(0, ListAlignment::Bottom, px(600.));
+        let view = cx.entity().downgrade();
+        state.set_scroll_handler(move |event, _window, cx| {
+            let near_top = event.visible_range.start <= LOAD_OLDER_THRESHOLD;
+            let at_bottom = event.visible_range.end >= event.count;
+            let visible_end = event.visible_range.end;
+            let view = view.clone();
+            cx.defer(move |cx| {
+                let _ = view.update(cx, |v, cx| {
+                    v.stick_to_bottom = at_bottom && !v.newer_available;
+                    v.stop_scroll_anim(Area::History);
+                    v.scrolled(Area::History, cx);
+                    v.mark_read(visible_end);
+                    if near_top {
+                        v.load_older();
+                    }
+                    if at_bottom {
+                        v.load_newer();
+                    }
+                });
+            });
+        });
+        state
+    }
+
+    fn load_newer(&mut self) {
+        if self.loading_newer || !self.newer_available {
+            return;
+        }
+        if let Some(peer) = self.selected {
+            self.loading_newer = true;
+            let _ = self.commands.send(Command::LoadNewer(peer));
+        }
+    }
+
+    /// The open chat, set aside with its list (a fresh list takes its place).
+    fn take_current_pane(&mut self, cx: &mut Context<Self>) -> Option<SavedPane> {
+        let peer = self.selected?;
+        let state = std::mem::replace(&mut self.messages_state, Self::new_messages_state(cx));
+        Some(SavedPane {
+            peer,
+            messages: std::mem::take(&mut self.messages),
+            state,
+            history_complete: self.history_complete,
+            stick_to_bottom: self.stick_to_bottom,
+            unread_bar: self.unread_bar.take(),
+            read_till: self.read_till,
+            newer_available: self.newer_available,
+        })
+    }
+
+    /// A set-aside chat open again, where it was scrolled.
+    fn restore_pane(&mut self, pane: SavedPane) {
+        self.selected = Some(pane.peer);
+        self.messages = pane.messages;
+        self.messages_state = pane.state;
+        self.history_complete = pane.history_complete;
+        self.stick_to_bottom = pane.stick_to_bottom;
+        self.unread_bar = pane.unread_bar;
+        self.read_till = pane.read_till;
+        self.newer_available = pane.newer_available;
+        self.unread_target = None;
+        self.loading_older = false;
+        self.loading_newer = false;
+        self.pending_focus = None;
+        self.highlight = None;
+        self.center_on = None;
+        self.scroll_anim = None;
+        self.history_bar.drag = None;
+    }
+
+    /// The "go to original" button: the chat the message was saved from slides in,
+    /// open at that message (`showPeerHistory(..., Way::Forward, msgId)`); the current
+    /// one waits in the back stack.
+    fn go_to_original(
+        &mut self,
+        peer: PeerKey,
+        msg_id: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected == Some(peer) {
+            self.pending_focus = Some(msg_id);
+            self.stick_to_bottom = false;
+            let _ = self.commands.send(Command::OpenChatAt { peer, msg_id });
+            cx.notify();
+            return;
+        }
+        self.save_draft(cx);
+        if let Some(pane) = self.take_current_pane(cx) {
+            self.back_stack.push(pane.clone());
+            self.slide = Some(Slide {
+                pane,
+                forward: true,
+                start: Instant::now(),
+            });
+        }
+        let draft = self.draft_of(peer).unwrap_or_default();
+        self.set_input_text(draft, cx);
+        let read_till = self
+            .dialogs
+            .iter()
+            .find(|d| d.peer == peer)
+            .map_or(0, |d| d.read_inbox_max_id);
+        self.selected = Some(peer);
+        self.history_complete = false;
+        self.loading_older = false;
+        self.loading_newer = false;
+        self.newer_available = false;
+        self.stick_to_bottom = false;
+        self.unread_target = None;
+        self.unread_bar = None;
+        self.read_till = read_till;
+        self.pending_focus = Some(msg_id);
+        self.highlight = None;
+        self.scroll_anim = None;
+        self.history_bar.drag = None;
+        let _ = self.commands.send(Command::OpenChatAt { peer, msg_id });
+        window.focus(&self.input.focus_handle(cx));
+        cx.notify();
+    }
+
+    /// The header's back arrow (or Esc): the previous chat slides back in from the
+    /// left, where it was, and this one leaves to the right.
+    fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(previous) = self.back_stack.pop() else {
+            return;
+        };
+        self.save_draft(cx);
+        let closing = self.take_current_pane(cx);
+        let peer = previous.peer;
+        self.restore_pane(previous);
+        if let Some(pane) = closing {
+            self.slide = Some(Slide {
+                pane,
+                forward: false,
+                start: Instant::now(),
+            });
+        }
+        let draft = self.draft_of(peer).unwrap_or_default();
+        self.set_input_text(draft, cx);
+        let _ = self.commands.send(Command::OpenChat(peer));
+        window.focus(&self.input.focus_handle(cx));
+        cx.notify();
+    }
+
+    /// The open chat at its newest messages again (from a window around an older one).
+    fn jump_to_latest(&mut self) {
+        if let Some(peer) = self.selected {
+            self.stick_to_bottom = true;
+            self.newer_available = false;
+            let _ = self.commands.send(Command::OpenChat(peer));
+        }
+    }
+
+    /// The highlight of a jumped-to message (`ElementHighlighter`): fades in, then
+    /// slowly out.
+    fn highlight_opacity(&self) -> Option<(i32, f32)> {
+        let (id, start) = self.highlight?;
+        let t = start.elapsed();
+        let opacity = if t < HIGHLIGHT_IN {
+            t.as_secs_f32() / HIGHLIGHT_IN.as_secs_f32()
+        } else if t < HIGHLIGHT_IN + HIGHLIGHT_OUT {
+            1. - (t - HIGHLIGHT_IN).as_secs_f32() / HIGHLIGHT_OUT.as_secs_f32()
+        } else {
+            return None;
+        };
+        Some((id, opacity))
     }
 
     /// Where the chat list widths are kept; loads them.
@@ -1272,10 +1503,22 @@ impl MainView {
                 peer,
                 messages,
                 complete,
+                newer,
+                focus,
             } => {
                 if self.selected == Some(peer) {
                     self.history_complete = complete;
                     self.loading_older = false;
+                    self.loading_newer = false;
+                    self.newer_available = newer;
+                    if newer {
+                        self.stick_to_bottom = false;
+                    }
+                    if let Some(id) = focus {
+                        self.pending_focus = Some(id);
+                        self.unread_target = None;
+                        self.stick_to_bottom = false;
+                    }
                     self.set_messages(messages);
                     // A short chat may not fill the view, so no scroll would ever ask for more.
                     if self.messages.len() < 20 {
@@ -1313,6 +1556,15 @@ impl MainView {
     /// the "Unread messages" bar, as in tdesktop.
     fn set_messages(&mut self, new: Vec<MessageItem>) {
         let mut reveal = None;
+        // A jumped-to message: shown in the middle, highlighted.
+        if let Some(id) = self.pending_focus
+            && let Some(ix) = new.iter().position(|m| m.id == id)
+        {
+            self.pending_focus = None;
+            self.highlight = Some((id, Instant::now()));
+            self.center_on = Some(ix);
+            reveal = Some(ix);
+        }
         if let Some(read_till) = self.unread_target
             && !new.is_empty()
         {
@@ -1556,6 +1808,9 @@ impl MainView {
     fn escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
         if self.main_menu_open {
             self.main_menu_open = false;
+        } else if !self.back_stack.is_empty() {
+            self.go_back(window, cx);
+            return;
         } else if self.selected.is_some() {
             self.save_draft(cx);
             self.set_input_text(String::new(), cx);
@@ -1585,11 +1840,18 @@ impl MainView {
         self.messages_state.reset(0);
         self.history_complete = false;
         self.loading_older = false;
+        self.loading_newer = false;
+        self.newer_available = false;
+        self.pending_focus = None;
+        self.highlight = None;
         self.stick_to_bottom = true;
         let _ = self.commands.send(Command::OpenChat(peer));
     }
 
     fn open(&mut self, peer: PeerKey, window: &mut Window, cx: &mut Context<Self>) {
+        // From the chat list: the back stack is cleared (`Way::ClearStack`).
+        self.back_stack.clear();
+        self.slide = None;
         if self.selected == Some(peer) {
             return;
         }
@@ -2119,27 +2381,65 @@ impl MainView {
 
     /// Whether messages `a` and `b` (in this order) belong to one group: same author,
     /// close in time, same day, no service message or unread bar between.
-    fn attached(&self, a: &MessageItem, b: &MessageItem) -> bool {
+    fn attached(pane: PaneRef, a: &MessageItem, b: &MessageItem) -> bool {
         a.service.is_none()
             && b.service.is_none()
             && a.out == b.out
             && a.author == b.author
             && (b.date - a.date).abs() < ATTACH_SECONDS
             && present::day_of(a.date) == present::day_of(b.date)
-            && self.unread_bar != Some(b.id)
+            && pane.unread_bar != Some(b.id)
+    }
+
+    /// The open chat's message `i`.
+    fn render_message(&self, i: usize, window: &Window, view: &WeakEntity<Self>) -> AnyElement {
+        let pane = PaneRef {
+            peer: self.selected,
+            messages: &self.messages,
+            unread_bar: self.unread_bar,
+            highlight: self.highlight_opacity(),
+            live: true,
+        };
+        self.render_message_in(pane, i, window, view)
+    }
+
+    /// Message `i` of the chat drawn beside the open one during a slide.
+    fn render_slide_message(
+        &self,
+        i: usize,
+        window: &Window,
+        view: &WeakEntity<Self>,
+    ) -> AnyElement {
+        let Some(slide) = &self.slide else {
+            return div().into_any_element();
+        };
+        let pane = PaneRef {
+            peer: Some(slide.pane.peer),
+            messages: &slide.pane.messages,
+            unread_bar: slide.pane.unread_bar,
+            highlight: None,
+            live: false,
+        };
+        self.render_message_in(pane, i, window, view)
     }
 
     /// A message row: a date divider when the day changes, the "Unread messages" bar,
     /// then the message — a bubble or a service line.
-    fn render_message(&self, i: usize, window: &Window) -> AnyElement {
-        let Some(item) = self.messages.get(i) else {
+    fn render_message_in(
+        &self,
+        pane: PaneRef,
+        i: usize,
+        window: &Window,
+        view: &WeakEntity<Self>,
+    ) -> AnyElement {
+        let Some(item) = pane.messages.get(i) else {
             return div().into_any_element();
         };
         let p = self.palette();
         let chat_width = self.chat_width(window);
         let column = service_column(chat_width);
         let day = present::day_of(item.date);
-        let new_day = i == 0 || present::day_of(self.messages[i - 1].date) != day;
+        let new_day = i == 0 || present::day_of(pane.messages[i - 1].date) != day;
         let today = chrono::Local::now().date_naive();
         let divider = new_day.then_some(day).flatten().map(|day| {
             let text = present::day_divider(day, today);
@@ -2153,7 +2453,7 @@ impl MainView {
                 .child(service_pill(p, text, w))
         });
         // The bar spans the chat; its text is centered in the service column.
-        let unread_bar = (self.unread_bar == Some(item.id)).then(|| {
+        let unread_bar = (pane.unread_bar == Some(item.id)).then(|| {
             div()
                 .w_full()
                 .mt(px(UNREAD_BAR_MARGIN))
@@ -2189,7 +2489,7 @@ impl MainView {
                     .child(service_pill(p, text.clone(), w))
                     .into_any_element()
             }
-            None => self.render_bubble(i, item, chat_width, window),
+            None => self.render_bubble(pane, i, item, chat_width, window, view),
         };
         div()
             .w_full()
@@ -2210,32 +2510,46 @@ impl MainView {
     /// measures wrapped text at one width and paints it at another.
     fn render_bubble(
         &self,
+        pane: PaneRef,
         i: usize,
         item: &MessageItem,
         chat_width: f32,
         window: &Window,
+        view: &WeakEntity<Self>,
     ) -> AnyElement {
         let p = self.palette();
-        let chat = self
-            .selected
+        let chat = pane
+            .peer
             .and_then(|peer| self.dialogs.iter().find(|d| d.peer == peer));
         let is_group = chat.is_some_and(|d| d.is_group());
+        let is_saved = chat.is_some_and(|d| d.is_saved);
         let wide = chat_width >= CHAT_WIDE_WIDTH;
         let right_side = item.out && !wide;
-        let with_userpic = if wide { true } else { is_group && !item.out };
+        // `hasFromPhoto`: groups, and forwards from others in Saved Messages.
+        let with_userpic = wide || ((is_group || is_saved) && !item.out);
 
-        let prev_attached = i > 0 && self.attached(&self.messages[i - 1], item);
-        let next_attached = self
+        let prev_attached = i > 0 && Self::attached(pane, &pane.messages[i - 1], item);
+        let next_attached = pane
             .messages
             .get(i + 1)
-            .is_some_and(|n| self.attached(item, n));
+            .is_some_and(|n| Self::attached(pane, item, n));
 
         let (bg, fg, date_fg) = if item.out {
             (p.msg_out_bg, p.history_text_out_fg, p.msg_out_date_fg)
         } else {
             (p.msg_in_bg, p.history_text_in_fg, p.msg_in_date_fg)
         };
-        let reserved = MSG_SIDE + MSG_MARGIN_FAR + if with_userpic { MSG_PHOTO_SKIP } else { 0. };
+        // The round button beside the bubble takes `msgPhotoSkip` more
+        // (`countGeometry`: `contentWidth -= size + (msgPhotoSkip - size)`).
+        let original = item.original;
+        let reserved = MSG_SIDE
+            + MSG_MARGIN_FAR
+            + if with_userpic { MSG_PHOTO_SKIP } else { 0. }
+            + if original.is_some() && with_userpic {
+                MSG_PHOTO_SKIP
+            } else {
+                0.
+            };
         let (pad_x, pad_y) = (lg(MSG_PADDING_X), lg(MSG_PADDING_Y));
         let max_text =
             (lg(MSG_MAX_WIDTH).min(chat_width - lg(reserved)) - 2. * pad_x).max(lg(120.));
@@ -2279,11 +2593,22 @@ impl MainView {
         let name_w = sender.map_or(0., |(name, _)| {
             text_width(window, name, FONT_SIZE, FontWeight::SEMIBOLD)
         });
+        // "Forwarded from [userpic] Name" (`HistoryMessageForwarded::text`).
+        const FORWARDED_FROM: &str = "Forwarded from ";
+        let forwarded = item.forwarded.as_ref();
+        let forwarded_w = forwarded.map_or(0., |f| {
+            text_width(window, FORWARDED_FROM, FONT_SIZE, FontWeight::SEMIBOLD)
+                + f.author
+                    .as_ref()
+                    .map_or(0., |_| lg(FWD_USERPIC) + lg(FWD_USERPIC_SKIP))
+                + text_width(window, &f.name, FONT_SIZE, FontWeight::SEMIBOLD)
+        });
         let media_w =
             media_line.map_or(0., |m| text_width(window, m, FONT_SIZE, FontWeight::NORMAL));
         // +1 px: sub-pixel rounding must not push the last word to a new line.
-        let inner = ((text_w.max(name_w).max(media_w) + 1.).min(max_text + 1.) * scale::get())
-            .ceil()
+        let inner = ((text_w.max(name_w).max(media_w).max(forwarded_w) + 1.).min(max_text + 1.)
+            * scale::get())
+        .ceil()
             / scale::get();
 
         let small = px(MSG_RADIUS_SMALL);
@@ -2374,6 +2699,35 @@ impl MainView {
                     .text_color(c(name_color(p, *color)))
                     .child(one_line(name.clone()))
             }))
+            .children(forwarded.map(|f| {
+                let fwd_fg = if item.out {
+                    p.msg_out_service_fg
+                } else {
+                    p.msg_in_service_fg
+                };
+                div()
+                    .w(gpui::px(inner))
+                    .h(text_font.line_height())
+                    .flex()
+                    .items_center()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(c(fwd_fg))
+                    .child(div().flex_none().child(FORWARDED_FROM))
+                    .children(f.author.as_ref().map(|a| {
+                        div()
+                            .flex_none()
+                            .mr(px(FWD_USERPIC_SKIP))
+                            .child(self.userpic(
+                                FWD_USERPIC,
+                                a.key,
+                                a.photo,
+                                &a.initials,
+                                a.color,
+                                false,
+                            ))
+                    }))
+                    .child(div().flex_1().min_w(px(0.)).child(one_line(f.name.clone())))
+            }))
             .children(media_line.map(|m| {
                 div()
                     .w(gpui::px(inner))
@@ -2414,7 +2768,69 @@ impl MainView {
                 )
                 .child(div().w_full().h(px(MSG_SHADOW)).bg(c(shadow)))
         });
-        let bubble = div().relative().flex_none().child(bubble).children(tail);
+        // The bubble's height, for the button beside it.
+        let bubble_h = 2. * pad_y
+            + text_h
+            + text_font.height
+                * (sender.is_some() as u8 + forwarded.is_some() as u8 + media_line.is_some() as u8)
+                    as f32;
+        // "Go to original" (`drawRightAction`): a round button beside the bubble, at
+        // its bottom (`historyFastShareBottom` up, centered on short bubbles).
+        let go_to = original.map(|(peer, msg_id)| {
+            let size = lg(FAST_SHARE_SIZE);
+            let skip = ((bubble_h - size) / 2.).clamp(0., lg(FAST_SHARE_BOTTOM));
+            let side = gpui::px(-(size + lg(FAST_SHARE_LEFT)));
+            let view = view.clone();
+            let live = pane.live;
+            div()
+                .id(SharedString::from(format!("go-to-original-{}", item.id)))
+                .absolute()
+                .bottom(gpui::px(skip))
+                .when(right_side, |d| d.left(side))
+                .when(!right_side, |d| d.right(side))
+                .size(gpui::px(size))
+                .rounded_full()
+                .bg(c(p.msg_service_bg))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .child(icon(Icon::GoToOriginal, p.msg_service_fg, window))
+                .on_click(move |_, window, cx| {
+                    if live {
+                        let _ = view.update(cx, |this, cx| {
+                            this.go_to_original(peer, msg_id, window, cx);
+                        });
+                    }
+                })
+        });
+        let bubble = div()
+            .relative()
+            .flex_none()
+            .child(bubble)
+            .children(tail)
+            .children(go_to);
+        // The jumped-to message's highlight (`paintHighlight`): the row, from
+        // `min(marginTop, marginBottom)` above the bubble to as much below it.
+        let top_margin = if prev_attached {
+            MSG_MARGIN_TOP_ATTACHED
+        } else {
+            MSG_MARGIN_TOP
+        };
+        let highlight = pane
+            .highlight
+            .filter(|(id, _)| *id == item.id)
+            .map(|(_, opacity)| {
+                let fill = lg(top_margin).min(lg(MSG_MARGIN_BOTTOM));
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(gpui::px(lg(top_margin) - fill))
+                    .bottom_0()
+                    .bg(c(p.msg_select_overlay))
+                    .opacity(opacity)
+            });
 
         let avatar_slot = with_userpic.then(|| {
             let author = &item.author;
@@ -2435,15 +2851,13 @@ impl MainView {
                 })
         });
         div()
+            .relative()
             .w_full()
             .flex()
             .items_end()
-            .pt(px(if prev_attached {
-                MSG_MARGIN_TOP_ATTACHED
-            } else {
-                MSG_MARGIN_TOP
-            }))
+            .pt(px(top_margin))
             .pb(px(MSG_MARGIN_BOTTOM))
+            .children(highlight)
             .px(px(MSG_SIDE))
             .when(right_side, |d| d.justify_end())
             .children(avatar_slot)
@@ -2685,6 +3099,141 @@ impl MainView {
         )
     }
 
+    /// The open chat's column during a slide (`Window::SlideAnimation`, without fade):
+    /// the arriving chat comes from the right edge over the other one, which moves
+    /// `slideShift` to the left and darkens (`slideFadeOutBg`), a shadow at the
+    /// arriving chat's edge; going back plays it in reverse.
+    fn with_slide(
+        &mut self,
+        live: gpui::Div,
+        border: Rgba,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let Some(slide) = &self.slide else {
+            return live;
+        };
+        let t = (slide.start.elapsed().as_secs_f32() / SLIDE_DURATION.as_secs_f32()).min(1.);
+        let forward = slide.forward;
+        // Back animates from 1 to 0 with the same curve.
+        let progress = if forward {
+            ease_out_circ(t)
+        } else {
+            1. - ease_out_circ(t)
+        };
+        let peer = slide.pane.peer;
+        let still_back = if forward {
+            self.back_stack.len() > 1
+        } else {
+            true
+        };
+        let p = self.palette();
+        let Some(other_chat) = self.dialogs.iter().find(|d| d.peer == peer).cloned() else {
+            return live;
+        };
+        let header = self.render_header(&other_chat, border, still_back, window, cx);
+        let view = cx.entity();
+        let weak = view.downgrade();
+        let state = slide.pane.state.clone();
+        let messages = list(state, move |i, window, cx| {
+            view.read(cx).render_slide_message(i, window, &weak)
+        })
+        .size_full()
+        .pb(px(8.));
+        let day = self.day_background(TOP_BAR_HEIGHT, window, cx);
+        let feed = self
+            .with_chat_background(div(), day)
+            .relative()
+            .overflow_hidden()
+            .flex_1()
+            .min_h(px(0.))
+            .child(messages);
+        // The other chat's field, as it was (no caret, no typing).
+        let composer = div()
+            .flex_none()
+            .min_h(px(46.))
+            .flex()
+            .items_center()
+            .pl(px(16.))
+            .bg(c(p.history_compose_area_bg))
+            .border_t_1()
+            .border_color(border)
+            .text_color(c(p.history_compose_area_fg))
+            .child(
+                div().text_color(c(p.placeholder_fg)).child(
+                    self.draft_of(peer)
+                        .unwrap_or_else(|| "Write a message…".into()),
+                ),
+            );
+        let still = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(c(p.window_bg))
+            .child(header)
+            .child(feed)
+            .child(composer);
+        let live = live.size_full();
+        let (under, over) = if forward {
+            (still.into_any_element(), live.into_any_element())
+        } else {
+            (live.into_any_element(), still.into_any_element())
+        };
+        let width = self.chat_width(window);
+        let coord_over = width * (1. - progress);
+        let coord_under = -lg(SLIDE_SHIFT) * progress;
+        window.request_animation_frame();
+        div()
+            .relative()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .overflow_hidden()
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(gpui::px(coord_under))
+                    .w(gpui::px(width))
+                    .h_full()
+                    .child(under),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(gpui::px(coord_over))
+                    .h_full()
+                    .bg(c(p.slide_fade_out_bg))
+                    .opacity(progress),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(gpui::px(coord_over))
+                    .w(gpui::px(width))
+                    .h_full()
+                    .child(over),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(gpui::px(
+                        coord_over - crate::icons::icon_width(Icon::SlideShadow, window),
+                    ))
+                    .h_full()
+                    .opacity(progress)
+                    .child(crate::icons::stretched(
+                        Icon::SlideShadow,
+                        p.slide_fade_out_shadow_fg,
+                        window,
+                    )),
+            )
+    }
+
     /// The round "scroll down" button of the chat (`historyToDown`), or the chat list's
     /// "scroll to top" one (`dialogsToUp`: the same with the arrow flipped, 1 px lower).
     fn render_jump_button(
@@ -2816,7 +3365,14 @@ impl MainView {
         present::day_of(item.date).map(|day| present::day_divider(day, today))
     }
 
-    fn render_header(&self, chat: &DialogItem, border: Rgba) -> impl IntoElement + use<> {
+    fn render_header(
+        &self,
+        chat: &DialogItem,
+        border: Rgba,
+        back: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let p = self.palette();
         let status = match chat.lastseen {
             Some(lastseen) => present::lastseen_text(lastseen, chrono::Local::now()),
@@ -2831,25 +3387,48 @@ impl MainView {
         } else {
             p.window_sub_text_fg
         };
+        // The back arrow (`TopBarWidget::_back`) when there is a chat to go back to.
+        let back_button = back.then(|| {
+            div()
+                .id("chat-back")
+                .flex_none()
+                .w(px(BACK_WIDTH))
+                .h_full()
+                .flex()
+                .items_center()
+                .pl(px(BACK_ICON_LEFT))
+                .cursor_pointer()
+                .child(icon(Icon::Back, p.box_title_close_fg, window))
+                .on_click(cx.listener(|this, _, window, cx| this.go_back(window, cx)))
+        });
         div()
             .h(px(TOP_BAR_HEIGHT))
             .flex_none()
             .flex()
-            .flex_col()
-            .justify_center()
-            .px(px(16.))
             .bg(c(p.window_bg))
             .border_b_1()
             .border_color(border)
+            .children(back_button)
             .child(
                 div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(c(p.window_bold_fg))
-                    .child(one_line(chat.name.clone())),
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .pl(px(if back { 0. } else { 16. }))
+                    .pr(px(16.))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(c(p.window_bold_fg))
+                            .child(one_line(chat.name.clone())),
+                    )
+                    .when(!status.is_empty(), |d| {
+                        d.child(div().text_color(c(status_fg)).child(one_line(status)))
+                    }),
             )
-            .when(!status.is_empty(), |d| {
-                d.child(div().text_color(c(status_fg)).child(one_line(status)))
-            })
     }
 }
 
@@ -2872,6 +3451,33 @@ impl Render for MainView {
             );
         }
         self.tick_scroll_anim(window, cx);
+        if self
+            .slide
+            .as_ref()
+            .is_some_and(|s| s.start.elapsed() >= SLIDE_DURATION)
+        {
+            self.slide = None;
+        }
+        if self.highlight.is_some() {
+            if self.highlight_opacity().is_some() {
+                window.request_animation_frame();
+            } else {
+                self.highlight = None;
+            }
+        }
+        // A jumped-to message goes to the middle once it is laid out
+        // (`itemTopForHighlight`).
+        if let Some(ix) = self.center_on
+            && let Some(item) = self.messages_state.bounds_for_item(ix)
+        {
+            self.center_on = None;
+            let viewport = self.messages_state.viewport_bounds();
+            let target = viewport.top() + (viewport.size.height - item.size.height) / 2.;
+            let delta = item.top() - target;
+            if delta.abs() > gpui::px(1.) {
+                self.messages_state.scroll_by(delta);
+            }
+        }
         // A dragged scrollbar keeps its thumb under the mouse as the list grows.
         for area in [Area::History, Area::Dialogs] {
             let (_, max, _) = self.scroll_metrics(area);
@@ -3100,10 +3706,13 @@ impl Render for MainView {
                         ),
                 ),
             Some(chat) => {
-                let header = self.render_header(chat, border);
+                let chat = chat.clone();
+                let header =
+                    self.render_header(&chat, border, !self.back_stack.is_empty(), window, cx);
                 let view = cx.entity();
+                let weak = view.downgrade();
                 let messages = list(self.messages_state.clone(), move |i, window, cx| {
-                    view.read(cx).render_message(i, window)
+                    view.read(cx).render_message(i, window, &weak)
                 })
                 .size_full()
                 .pb(px(8.));
@@ -3116,7 +3725,12 @@ impl Render for MainView {
                     self.render_jump_button("history-to-down", Icon::DownArrow, 0., window, cx)
                         .bottom(gpui::px(slide - lg(TO_DOWN_HEIGHT)))
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.start_scroll_anim(Area::History, f32::MAX);
+                            // From a window around an older message: the newest ones.
+                            if this.newer_available {
+                                this.jump_to_latest();
+                            } else {
+                                this.start_scroll_anim(Area::History, f32::MAX);
+                            }
                             cx.notify();
                         }))
                 });
@@ -3192,7 +3806,7 @@ impl Render for MainView {
                             }))
                             .child(icon(Icon::Send, p.history_send_icon_fg, window)),
                     );
-                div()
+                let live = div()
                     .flex_1()
                     .min_w(px(0.))
                     .h_full()
@@ -3200,7 +3814,8 @@ impl Render for MainView {
                     .flex_col()
                     .child(header)
                     .child(feed)
-                    .child(composer)
+                    .child(composer);
+                self.with_slide(live, border, window, cx)
             }
         };
 
