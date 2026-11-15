@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use gpui::{Img, RenderImage, Window, img, prelude::*, px};
+use gpui::{Div, RenderImage, Window, div, img, prelude::*, px};
 use tdr_theme::Color;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -161,18 +161,25 @@ fn tinted(icon: Icon, color: Color, scale_factor: f32) -> Arc<Tinted> {
     tinted
 }
 
-/// The icon tinted with `color`, at tdesktop's size for the current scale. The
-/// transparent border hangs outside that box (negative margins), so layout sees the
-/// bare icon.
-pub fn icon(icon: Icon, color: Color, window: &Window) -> Img {
+/// The icon tinted with `color`, at tdesktop's size for the current scale: a box
+/// exactly the icon's size, the image's transparent border hanging outside it.
+pub fn icon(icon: Icon, color: Color, window: &Window) -> Div {
     let scale = window.scale_factor();
     let t = tinted(icon, color, scale);
     let pad = PAD as f32 / scale;
-    img(t.image.clone())
-        .w(px(t.width / scale + 2. * pad))
-        .h(px(t.height / scale + 2. * pad))
-        .m(px(-pad))
+    div()
         .flex_none()
+        .relative()
+        .w(px(t.width / scale))
+        .h(px(t.height / scale))
+        .child(
+            img(t.image.clone())
+                .absolute()
+                .left(px(-pad))
+                .top(px(-pad))
+                .w(px(t.width / scale + 2. * pad))
+                .h(px(t.height / scale + 2. * pad)),
+        )
 }
 
 /// The bubble tail (`bubble_tail`, 6 x 10 style px) as an outline in style pixels,

@@ -963,7 +963,8 @@ pub fn start_demo() -> (
                 draft: None,
                 // The last few messages of each chat are unread.
                 read_inbox_max_id: 1005,
-                lastseen: None,
+                // Alice is online, for the userpic dot.
+                lastseen: (i == 0).then_some(describe::Lastseen::Online { until: i32::MAX }),
                 status: match kind {
                     ChatKind::Group => "906 members".into(),
                     ChatKind::Channel => "8 subscribers".into(),

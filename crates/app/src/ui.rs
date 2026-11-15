@@ -466,9 +466,16 @@ fn service_column(chat_width: f32) -> f32 {
 }
 
 /// Scrollbar drag in progress: where it started.
+/// Unlike tdesktop, where the thumb moves by the mouse's movement (so once more
+/// history loads and the thumb shrinks away, it can't be dragged further), the thumb
+/// stays under the mouse: the grabbed point follows it, also when the list grows.
 struct ScrollDrag {
-    start_mouse_y: Pixels,
-    start_offset: Pixels,
+    /// Where in the thumb it was grabbed.
+    grab: f32,
+    /// The mouse's last position (window coordinates).
+    mouse_y: Pixels,
+    /// The scrollable height the position was last applied for.
+    applied_max: f32,
 }
 
 /// One overlay scrollbar (tdesktop's `ScrollArea`): shown while scrolling and on hover.
@@ -765,11 +772,8 @@ impl MainView {
                 cx.background_executor()
                     .timer(Duration::from_secs(15))
                     .await;
-                let alive = this.update(cx, |view, cx| {
-                    if view.selected.is_some() {
-                        cx.notify();
-                    }
-                });
+                // Also takes online dots off when their time is up.
+                let alive = this.update(cx, |_, cx| cx.notify());
                 if alive.is_err() {
                     break;
                 }
@@ -1901,6 +1905,52 @@ impl MainView {
                         item.is_saved,
                     )),
             );
+        // The online dot on the userpic's corner (`PaintCornerBadgeFrame`): a
+        // `dialogsOnlineBadgeSize` circle at `dialogsOnlineBadgeSkip` from the corner,
+        // its `dialogsOnlineBadgeStroke` outline cut out of the userpic (the row's
+        // background shows). Not under a narrow row's counter.
+        let counter_on_userpic = narrow && item.unread > 0 && !has_draft;
+        let online = item
+            .lastseen
+            .is_some_and(|l| present::is_online(l, chrono::Local::now()));
+        let row = if online && !counter_on_userpic {
+            let photo = scale::device(DIALOG_PHOTO);
+            let size = scale::device(10.);
+            let stroke = scale::device(2.);
+            let (x, y) = (photo - size, photo - scale::device(2.) - size);
+            let ring_bg = if active {
+                p.dialogs_bg_active
+            } else if floating {
+                p.dialogs_bg_over
+            } else {
+                p.dialogs_bg
+            };
+            let dot_fg = if active {
+                p.dialogs_online_badge_fg_active
+            } else {
+                p.dialogs_online_badge_fg
+            };
+            let left = scale::device(DIALOG_PADDING_X) + x - stroke / 2.;
+            let top = scale::device(DIALOG_PADDING_Y) + y - stroke / 2.;
+            row.group("dialog-row").child(
+                div()
+                    .absolute()
+                    .left(dpx(left))
+                    .top(dpx(top))
+                    .size(dpx(size + stroke))
+                    .rounded_full()
+                    .bg(c(ring_bg))
+                    .when(!active && !floating, |d| {
+                        d.group_hover("dialog-row", |s| s.bg(c(p.dialogs_bg_over)))
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(div().size(dpx(size - stroke)).rounded_full().bg(c(dot_fg))),
+            )
+        } else {
+            row
+        };
         // The unread top of the badge, aligned to the text line's baseline
         // (`PaintWideCounter` / `PaintNarrowCounter`).
         let badge_top = |text_top: f32| {
@@ -2284,8 +2334,9 @@ impl MainView {
                 };
                 div()
                     .absolute()
-                    .left(gpui::px(info_w + lg(SEND_STATE_X)))
-                    .top(gpui::px(date_font.height + lg(SEND_STATE_Y)))
+                    // historyReceivedIcon / historySentIcon are offset by (2, 4).
+                    .left(gpui::px(info_w + lg(SEND_STATE_X) + lg(2.)))
+                    .top(gpui::px(date_font.height + lg(SEND_STATE_Y) + lg(4.)))
                     .child(icon(kind, p.history_out_icon_fg, window))
             }));
         // Captions stand in for media: in the date color when they are the whole text.
@@ -2582,15 +2633,21 @@ impl MainView {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
-                        let (_, _, offset) = this.scroll_metrics(area);
+                        let (_, bar, bar_top) = this.bar_geometry(area);
+                        let local = f32::from(e.position.y) - this.area_top(area);
+                        // On the thumb: hold it there; on the track: by its middle.
+                        let grab = if (bar_top..=bar_top + bar).contains(&local) {
+                            local - bar_top
+                        } else {
+                            bar / 2.
+                        };
                         this.bar_mut(area).drag = Some(ScrollDrag {
-                            start_mouse_y: e.position.y,
-                            start_offset: gpui::px(offset),
+                            grab,
+                            mouse_y: e.position.y,
+                            applied_max: -1.,
                         });
                         this.bar_mut(area).hide_at = None;
-                        if area == Area::History {
-                            this.messages_state.scrollbar_drag_started();
-                        }
+                        this.apply_scrollbar_drag(area);
                         cx.stop_propagation();
                         cx.notify();
                     }),
@@ -2646,7 +2703,7 @@ impl MainView {
             (p.history_to_down_bg, p.history_to_down_fg)
         };
         let layer =
-            |top: f32, element: gpui::Img| div().absolute().top(px(top)).left_0().child(element);
+            |top: f32, element: gpui::Div| div().absolute().top(px(top)).left_0().child(element);
         div()
             .id(id)
             .absolute()
@@ -2675,23 +2732,61 @@ impl MainView {
             ))
     }
 
+    /// The list's top in window coordinates.
+    fn area_top(&self, area: Area) -> f32 {
+        match area {
+            Area::History => f32::from(self.messages_state.viewport_bounds().origin.y),
+            Area::Dialogs => {
+                let base = self.dialogs_scroll.0.borrow().base_handle.clone();
+                f32::from(base.bounds().origin.y)
+            }
+        }
+    }
+
+    /// The scrollbar's track height, thumb height and thumb top (in the list).
+    fn bar_geometry(&self, area: Area) -> (f32, f32, f32) {
+        let (viewport, max, offset) = self.scroll_metrics(area);
+        let delta = lg(SCROLL_DELTA);
+        let track = viewport - 2. * delta;
+        let bar = (track * viewport / (viewport + max)).max(lg(SCROLL_MIN_BAR));
+        let top = delta + (track - bar) * if max > 0. { offset / max } else { 0. };
+        (track, bar, top)
+    }
+
     fn drag_scrollbar(&mut self, area: Area, mouse_y: Pixels, cx: &mut Context<Self>) {
-        let Some(drag) = &self.bar(area).drag else {
+        let Some(drag) = &mut self.bar_mut(area).drag else {
             return;
         };
-        let (start_mouse_y, start_offset) = (drag.start_mouse_y, drag.start_offset);
-        let (viewport, max, _) = self.scroll_metrics(area);
-        let track = viewport - 2. * lg(SCROLL_DELTA);
-        let bar = (track * viewport / (viewport + max)).max(lg(SCROLL_MIN_BAR));
+        drag.mouse_y = mouse_y;
+        self.apply_scrollbar_drag(area);
+        cx.notify();
+    }
+
+    /// Puts the grabbed point of the thumb under the mouse. Near the top of the chat
+    /// older messages load (also while the mouse stands still: the next frames apply
+    /// the position again as the list grows).
+    fn apply_scrollbar_drag(&mut self, area: Area) {
+        let Some((grab, mouse_y)) = self.bar(area).drag.as_ref().map(|d| (d.grab, d.mouse_y))
+        else {
+            return;
+        };
+        let (_, max, _) = self.scroll_metrics(area);
+        let (track, bar, _) = self.bar_geometry(area);
+        let local = f32::from(mouse_y) - self.area_top(area);
         let movable = (track - bar).max(1.);
-        let delta = f32::from(mouse_y - start_mouse_y) * max / movable;
-        let target = (f32::from(start_offset) + delta).clamp(0., max);
+        let share = ((local - grab - lg(SCROLL_DELTA)) / movable).clamp(0., 1.);
+        let target = share * max;
         self.set_scroll(area, target);
+        if let Some(drag) = &mut self.bar_mut(area).drag {
+            drag.applied_max = max;
+        }
         if area == Area::History {
             self.stick_to_bottom = target >= max - 1.;
+            if self.messages_state.logical_scroll_top().item_ix <= LOAD_OLDER_THRESHOLD {
+                self.load_older();
+            }
         }
         self.bar_mut(area).last_scroll = Some(Instant::now());
-        cx.notify();
     }
 
     fn end_drag(&mut self, area: Area, cx: &mut Context<Self>) {
@@ -2701,9 +2796,6 @@ impl MainView {
                 bar.hide_at = Some(Instant::now() + bar.hide_in);
                 let delay = bar.hide_in;
                 Self::wake_after(delay, cx);
-            }
-            if area == Area::History {
-                self.messages_state.scrollbar_drag_ended();
             }
             cx.notify();
         }
@@ -2780,6 +2872,18 @@ impl Render for MainView {
             );
         }
         self.tick_scroll_anim(window, cx);
+        // A dragged scrollbar keeps its thumb under the mouse as the list grows.
+        for area in [Area::History, Area::Dialogs] {
+            let (_, max, _) = self.scroll_metrics(area);
+            if self
+                .bar(area)
+                .drag
+                .as_ref()
+                .is_some_and(|d| (d.applied_max - max).abs() > 0.5)
+            {
+                self.apply_scrollbar_drag(area);
+            }
+        }
         let bars_busy = self.history_bar.tick() | self.dialogs_bar.tick();
         // The floating date: shown while scrolling, hidden a second later, fading.
         let date_on = self

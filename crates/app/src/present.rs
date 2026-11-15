@@ -270,6 +270,11 @@ pub fn is_call(service: &Service) -> bool {
 }
 
 /// `Data::OnlineText`.
+/// `Data::IsUserOnline`: online until a moment still ahead.
+pub fn is_online(status: Lastseen, now: DateTime<Local>) -> bool {
+    matches!(status, Lastseen::Online { until } if local(until).is_some_and(|until| until > now))
+}
+
 pub fn lastseen_text(status: Lastseen, now: DateTime<Local>) -> String {
     let was = match status {
         Lastseen::Online { until } if local(until).is_some_and(|until| until > now) => {
