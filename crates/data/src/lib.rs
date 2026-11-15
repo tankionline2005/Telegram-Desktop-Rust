@@ -116,6 +116,10 @@ pub struct Sync {
     dialogs_complete: bool,
     /// Chats loaded from the top of the server's list in this session.
     dialogs_loaded: usize,
+    /// Chats opened this session that the server's chat list does not have
+    /// (tdesktop lists every chat whose history it loaded): kept through the list's
+    /// clean-ups until the next start.
+    session_dialogs: Vec<PeerKey>,
     /// Pinned entries of the main list that are not chats we keep (the archive folder,
     /// communities), with their place among the pinned: a reorder must keep them.
     pinned_extra: Vec<(usize, enums::InputDialogPeer)>,
@@ -166,8 +170,83 @@ impl Sync {
             dialogs_cursor: None,
             dialogs_complete: false,
             dialogs_loaded: 0,
+            session_dialogs: Vec::new(),
             pinned_extra: Vec::new(),
         })
+    }
+
+    /// `Histories::requestDialogEntry`: a chat opened outside the chat list gets its
+    /// dialog (`messages.getPeerDialogs`), so it is listed by its last message like
+    /// any other for this session. Returns whether one came.
+    pub async fn request_dialog_entry(&mut self, peer: PeerKey) -> Result<bool> {
+        if self.store.read_marks(peer)?.is_some() {
+            return Ok(false);
+        }
+        let Some(input) = self.input_peer(peer) else {
+            return Ok(false);
+        };
+        let enums::messages::PeerDialogs::PeerDialogs(answer) = self
+            .client
+            .invoke(&functions::messages::GetPeerDialogs {
+                peers: vec![enums::InputDialogPeer::InputDialogPeer(Box::new(
+                    types::InputDialogPeer { peer: input },
+                ))],
+            })
+            .await?;
+        let message_rows: Vec<MessageRow> = answer
+            .messages
+            .iter()
+            .filter_map(convert::message_row)
+            .collect();
+        let peer_rows: Vec<_> = answer
+            .users
+            .iter()
+            .filter_map(convert::user_row)
+            .chain(answer.chats.iter().filter_map(convert::chat_row))
+            .collect();
+        let rows: Vec<DialogRow> = answer
+            .dialogs
+            .iter()
+            .filter_map(|d| match d {
+                enums::Dialog::Dialog(d) => Some(d),
+                _ => None,
+            })
+            .map(|d| {
+                let key = convert::peer_key(&d.peer);
+                DialogRow {
+                    peer: key,
+                    top_message: d.top_message,
+                    top_date: message_rows
+                        .iter()
+                        .find(|m| m.peer == key && m.id == d.top_message)
+                        .map_or(0, |m| m.date),
+                    pinned: d.pinned,
+                    folder_id: d.folder_id.unwrap_or(0),
+                    unread_count: d.unread_count,
+                    pts: d.pts,
+                    read_inbox_max_id: d.read_inbox_max_id,
+                    read_outbox_max_id: d.read_outbox_max_id,
+                    mute_until: convert::mute_until(&d.notify_settings),
+                }
+            })
+            .collect();
+        if rows.is_empty() {
+            return Ok(false);
+        }
+        self.store.write(|w| {
+            for p in &peer_rows {
+                w.put_peer(p)?;
+            }
+            for m in &message_rows {
+                w.put_message(m)?;
+            }
+            for d in &rows {
+                w.put_dialog(d)?;
+            }
+            Ok(())
+        })?;
+        self.session_dialogs.extend(rows.iter().map(|r| r.peer));
+        Ok(true)
     }
 
     /// The whole chat list has been loaded from the server in this session.
@@ -443,7 +522,11 @@ impl Sync {
         let after = if complete { None } else { oldest };
         let before = (!first).then_some(offset_date);
         let prune = complete || oldest.is_some();
-        let keep: Vec<PeerKey> = rows.iter().map(|r| r.peer).collect();
+        let keep: Vec<PeerKey> = rows
+            .iter()
+            .map(|r| r.peer)
+            .chain(self.session_dialogs.iter().copied())
+            .collect();
         let dirty = self.engine.take_dirty_channels();
         let removed = self.store.write(|w| {
             for p in &peer_rows {

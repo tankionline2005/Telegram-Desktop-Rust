@@ -1024,6 +1024,19 @@ async fn run(
                         if let Some(item) = chat_info(sync.store(), peer) {
                             let _ = tx.send(Update::ChatInfo(Box::new(item)));
                         }
+                        // Not in the chat list: it joins it by its last message, as
+                        // tdesktop lists every chat it loaded; the list shows far
+                        // enough down to have it.
+                        match sync.request_dialog_entry(peer).await {
+                            Ok(true) => {
+                                let all = sync.store().dialogs(0, usize::MAX >> 1)?;
+                                if let Some(pos) = all.iter().position(|d| d.dialog.peer == peer) {
+                                    shown_dialogs = shown_dialogs.max(pos + 1);
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(e) => error!("dialog entry: {e}"),
+                        }
                         if let Err(e) = sync.refresh_user(peer).await {
                             error!("user: {e}");
                         }

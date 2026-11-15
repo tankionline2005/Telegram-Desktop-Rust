@@ -13,7 +13,7 @@ use qrcode::QrCode;
 use qrcode::render::unicode;
 use tdr_api::{Client, Config, Error, SessionData};
 use tdr_data::tdr_storage::{
-    DialogView, FileCache, FileCacheConfig, MessageRow, PeerKind, Storage,
+    DialogView, FileCache, FileCacheConfig, MessageRow, PeerKey, PeerKind, Storage,
 };
 use tdr_data::{Applied, Sync};
 use tdr_tl::{enums, functions, types};
@@ -113,6 +113,8 @@ async fn main() -> Result<()> {
         ["watch", secs] => watch(Some(secs.parse().context("seconds must be a number")?)).await,
         ["avatar"] => avatar().await,
         ["probe", "dialogs", needle] => probe_dialogs(needle).await,
+        ["probe", "saved", offset] => probe_saved(offset.parse().context("message id")?).await,
+        ["probe", "peer-dialog", id] => probe_peer_dialog(id.parse().context("user id")?).await,
         ["logout"] => logout().await,
         ["selftest", "reconnect"] => selftest_reconnect().await,
         ["selftest", "unknown-key"] => selftest_unknown_key().await,
@@ -613,6 +615,87 @@ async fn probe_dialogs(needle: &str) -> Result<()> {
         (offset_date, offset_id, offset_peer) = (date, top, input);
     }
     println!("total chats {total}");
+    Ok(())
+}
+
+/// What `messages.getHistory` of Saved Messages answers below `offset` (no texts,
+/// no writes): the answer type, its count and the ids.
+async fn probe_saved(offset: i32) -> Result<()> {
+    let client = logged_in()?;
+    for (offset_id, add_offset, limit) in [
+        (offset, 0, 100),
+        (offset + 1, 0, 5),
+        (offset - 1, 0, 20),
+        (offset - 100, 0, 20),
+        (10000, 0, 20),
+        (1000, 0, 20),
+        (offset, -10, 20),
+    ] {
+        let r = client
+            .invoke(&functions::messages::GetHistory {
+                peer: enums::InputPeer::InputPeerSelf,
+                offset_id,
+                offset_date: 0,
+                add_offset,
+                limit,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            })
+            .await?;
+        let (kind, messages, count) = match r {
+            enums::messages::Messages::Messages(m) => ("messages", m.messages, None),
+            enums::messages::Messages::Slice(m) => ("slice", m.messages, Some(m.count)),
+            enums::messages::Messages::ChannelMessages(m) => ("channel", m.messages, Some(m.count)),
+            enums::messages::Messages::NotModified(_) => ("not modified", vec![], None),
+        };
+        let ids: Vec<(i32, &str)> = messages
+            .iter()
+            .map(|m| match m {
+                enums::Message::Message(m) => (m.id, "msg"),
+                enums::Message::Service(m) => (m.id, "service"),
+                enums::Message::Empty(m) => (m.id, "empty"),
+            })
+            .collect();
+        println!(
+            "offset {offset_id} limit {limit}: {kind}, count {count:?}, {} messages, first {:?} last {:?}",
+            ids.len(),
+            ids.first(),
+            ids.last()
+        );
+    }
+    Ok(())
+}
+
+/// Whether `messages.getPeerDialogs` has a dialog for user `id` (its access hash from
+/// the cache; no names printed, nothing written).
+async fn probe_peer_dialog(id: i64) -> Result<()> {
+    let store = open_cache()?;
+    let hash = store
+        .access_hash(PeerKey::user(id))?
+        .context("no access hash cached")?;
+    let client = logged_in()?;
+    let enums::messages::PeerDialogs::PeerDialogs(r) = client
+        .invoke(&functions::messages::GetPeerDialogs {
+            peers: vec![enums::InputDialogPeer::InputDialogPeer(Box::new(
+                types::InputDialogPeer {
+                    peer: enums::InputPeer::User(types::InputPeerUser {
+                        user_id: id,
+                        access_hash: hash,
+                    }),
+                },
+            ))],
+        })
+        .await?;
+    for d in &r.dialogs {
+        if let enums::Dialog::Dialog(d) = d {
+            println!(
+                "dialog: top_message {}, folder {:?}, pinned {}, unread {}",
+                d.top_message, d.folder_id, d.pinned, d.unread_count
+            );
+        }
+    }
+    println!("{} dialogs, {} messages", r.dialogs.len(), r.messages.len());
     Ok(())
 }
 

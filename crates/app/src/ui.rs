@@ -736,6 +736,8 @@ pub struct MainView {
     menu_hovered: bool,
     /// Header data of opened chats that are not in the loaded chat list.
     extra_chats: HashMap<PeerKey, DialogItem>,
+    /// Show this chat's row once the chat list has it (it joins it when opened).
+    reveal_pending: Option<PeerKey>,
     /// Chats to go back to (`showBackFromStack`), the last on top.
     back_stack: Vec<SavedPane>,
     slide: Option<Slide>,
@@ -884,6 +886,7 @@ impl MainView {
             more_dialogs_requested: 0,
             menu_hovered: false,
             extra_chats: HashMap::new(),
+            reveal_pending: None,
             back_stack: Vec::new(),
             slide: None,
             newer_available: false,
@@ -973,10 +976,12 @@ impl MainView {
 
     /// `InnerWidget::scrollToEntry`: the chat list scrolls just enough to show the
     /// open chat's row.
-    fn reveal_in_list(&self, peer: PeerKey) {
+    fn reveal_in_list(&mut self, peer: PeerKey) {
         let Some(ix) = self.dialogs.iter().position(|d| d.peer == peer) else {
+            self.reveal_pending = Some(peer);
             return;
         };
+        self.reveal_pending = None;
         let (_, _, offset) = self.scroll_metrics(Area::Dialogs);
         let first_visible = (offset / lg(DIALOG_ROW_HEIGHT)).floor() as usize;
         let strategy = if ix < first_visible {
@@ -1523,6 +1528,11 @@ impl MainView {
                     tracing::info!(elapsed = ?crate::STARTED.elapsed(), chats = list.len(), "ui: chat list received");
                 }
                 self.dialogs = list;
+                if let Some(peer) = self.reveal_pending
+                    && self.selected == Some(peer)
+                {
+                    self.reveal_in_list(peer);
+                }
                 if let Some(i) = self.open_on_start.take()
                     && let Some(peer) = self.dialogs.get(i).map(|d| d.peer)
                 {
