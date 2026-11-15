@@ -13,8 +13,8 @@ use gpui::{
     ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
     GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Size, Style, TextAlign, TextRun,
-    UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, point, prelude::*, px,
-    relative, rgba, size,
+    UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, linear_color_stop,
+    linear_gradient, point, prelude::*, px, relative, rgba, size,
 };
 use tdr_theme::Palette;
 use unicode_segmentation::*;
@@ -63,8 +63,11 @@ fn caret_blink_time() -> Option<std::time::Duration> {
 pub struct Submit(pub String);
 
 const CONTEXT: &str = "TextInput";
-/// chat_helpers.style: historyComposeFieldMaxHeight (224 px, ~13 lines).
-const MAX_LINES: f32 = 13.;
+/// chat_helpers.style: historyComposeFieldMaxHeight. Not a whole number of lines:
+/// scrolled down, the top line shows in part, under the fade.
+const MAX_HEIGHT: f32 = 224.;
+/// historyComposeFieldFadeHeight: the fades over a scrolled field's edges.
+const FADE_HEIGHT: f32 = 6.;
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -829,7 +832,7 @@ impl Element for TextElement {
                 };
                 Size {
                     width,
-                    height: total.clamp(line_height(), line_height() * MAX_LINES),
+                    height: total.clamp(line_height(), crate::scale::px(MAX_HEIGHT)),
                 }
             });
         (id, ())
@@ -990,6 +993,41 @@ impl Element for TextElement {
                 && let Some(cursor) = prepaint.cursor.take()
             {
                 window.paint_quad(cursor);
+            }
+            // `InitMessageFieldFade`: the background fading to transparent at 90 %
+            // over the top while the field is scrolled down, and over the bottom
+            // while there is more text below.
+            let total = match (prepaint.tops.last(), prepaint.lines.last()) {
+                (Some(&t), Some(l)) => t + l.size(line_height()).height.max(line_height()),
+                _ => line_height(),
+            };
+            let scroll_max = (total - bounds.size.height).max(px(0.));
+            let descent = px(crate::scale::font(13.).descent);
+            let bg = self.input.read(cx).palette.history_compose_area_bg.rgba();
+            let (solid, clear) = (rgba(bg), rgba(bg & 0xffff_ff00));
+            let fade = crate::scale::px(FADE_HEIGHT);
+            if scroll_y > px(0.) {
+                window.paint_quad(fill(
+                    Bounds::new(bounds.origin, size(bounds.size.width, fade)),
+                    linear_gradient(
+                        180.,
+                        linear_color_stop(solid, 0.),
+                        linear_color_stop(clear, 0.9),
+                    ),
+                ));
+            }
+            if scroll_y + descent < scroll_max {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(bounds.left(), bounds.bottom() - fade),
+                        size(bounds.size.width, fade),
+                    ),
+                    linear_gradient(
+                        0.,
+                        linear_color_stop(solid, 0.),
+                        linear_color_stop(clear, 0.9),
+                    ),
+                ));
             }
         });
         let lines = std::mem::take(&mut prepaint.lines);

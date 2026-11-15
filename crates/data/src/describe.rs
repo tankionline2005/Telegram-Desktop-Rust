@@ -4,7 +4,7 @@
 //! be stored twice. The UI turns these into strings (tdesktop's `lng_in_dlg_*`,
 //! `lng_action_*`).
 
-use tdr_storage::{MessageRow, PeerRow};
+use tdr_storage::{MessageRow, PeerKey, PeerRow};
 use tdr_tl::{Deserializable, enums};
 
 /// A message's media, as the chat list names it (`HistoryItem::notificationText`).
@@ -85,6 +85,31 @@ pub struct MessageInfo {
     pub grouped_id: Option<i64>,
     /// A channel post (views, signature).
     pub post: bool,
+    pub forward: Option<Forward>,
+}
+
+/// Where a forwarded message came from (`HistoryMessageForwarded`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Forward {
+    /// The original sender (`fwd_from.from_id`).
+    pub from: Option<PeerKey>,
+    /// A forward of a forward (`forwardOfForward`: `saved_from_id` or
+    /// `saved_from_name`): who it was saved from, and whether it was outgoing there.
+    pub forward_of_forward: bool,
+    pub saved_from: Option<PeerKey>,
+    pub saved_out: bool,
+}
+
+impl Forward {
+    /// `Message::hasOutLayout` in Saved Messages: a forward is drawn as outgoing only
+    /// when it came from `self_id` (or was saved from them, or was outgoing there).
+    pub fn outgoing_in_saved(&self, self_id: PeerKey) -> bool {
+        if self.forward_of_forward {
+            self.saved_from == Some(self_id) || self.saved_out
+        } else {
+            self.from == Some(self_id)
+        }
+    }
 }
 
 fn parse<T: Deserializable>(raw: &Option<(i32, Vec<u8>)>) -> Option<T> {
@@ -107,6 +132,15 @@ pub fn message_info(row: &MessageRow) -> MessageInfo {
             edited: m.edit_date.is_some() && !m.edit_hide,
             grouped_id: m.grouped_id,
             post: m.post,
+            forward: m.fwd_from.as_ref().map(|f| {
+                let enums::MessageFwdHeader::MessageFwdHeader(f) = f;
+                Forward {
+                    from: f.from_id.as_ref().map(crate::convert::peer_key),
+                    forward_of_forward: f.saved_from_id.is_some() || f.saved_from_name.is_some(),
+                    saved_from: f.saved_from_id.as_ref().map(crate::convert::peer_key),
+                    saved_out: f.saved_out,
+                }
+            }),
         },
         Some(enums::Message::Service(m)) => MessageInfo {
             service: Some(service(&m.action)),
@@ -352,6 +386,25 @@ fn chat_photo(p: &enums::ChatPhoto) -> Option<(i64, i32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn saved_messages_layout_like_tdesktop() {
+        let me = PeerKey::user(1);
+        let other = PeerKey::user(2);
+        let fwd = |from, fof, saved_from, saved_out| Forward {
+            from,
+            forward_of_forward: fof,
+            saved_from,
+            saved_out,
+        };
+        // Forwarded from someone else: incoming; from yourself: outgoing.
+        assert!(!fwd(Some(other), false, None, false).outgoing_in_saved(me));
+        assert!(fwd(Some(me), false, None, false).outgoing_in_saved(me));
+        // A forward of a forward: by who it was saved from, or its outgoing flag.
+        assert!(fwd(Some(other), true, Some(me), false).outgoing_in_saved(me));
+        assert!(fwd(Some(other), true, Some(other), true).outgoing_in_saved(me));
+        assert!(!fwd(Some(me), true, Some(other), false).outgoing_in_saved(me));
+    }
+
     use super::*;
     use tdr_storage::PeerKey;
     use tdr_tl::{Serializable, types};

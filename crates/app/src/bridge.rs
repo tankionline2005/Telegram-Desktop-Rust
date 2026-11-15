@@ -414,9 +414,18 @@ fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec
                 .flatten();
             // Calls are bubbles with their caption, not service lines.
             let call = info.service.as_ref().is_some_and(present::is_call);
+            // `Message::hasOutLayout`: in Saved Messages everything is drawn as
+            // outgoing except forwards from others.
+            let out = if is_saved {
+                info.forward
+                    .as_ref()
+                    .is_none_or(|f| f.outgoing_in_saved(PeerKey::user(ctx.self_id)))
+            } else {
+                m.out
+            };
             MessageItem {
                 id: m.id,
-                out: m.out,
+                out,
                 date: m.date,
                 text: if call {
                     service.clone().unwrap_or_default()
@@ -426,7 +435,12 @@ fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec
                 media,
                 service: service.filter(|_| !call),
                 edited: info.edited,
-                read: (m.out && !is_saved && !is_channel).then_some(m.id <= read_outbox),
+                // Saved Messages are never unread: their outgoing ones show ✓✓.
+                read: if is_saved {
+                    out.then_some(true)
+                } else {
+                    (m.out && !is_channel).then_some(m.id <= read_outbox)
+                },
                 time: present::message_time(m.date),
                 sender,
                 author,
