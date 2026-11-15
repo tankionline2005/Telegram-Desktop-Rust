@@ -74,6 +74,8 @@ pub struct Applied {
     pub marks_changed: bool,
     /// Chats were pinned, unpinned or reordered.
     pub pinned_changed: bool,
+    /// Users went online or offline.
+    pub statuses_changed: bool,
     /// Local drafts changed by the server (another device): the input field of an
     /// open chat should show the new text (`None`: cleared).
     pub draft_changes: Vec<drafts::Change>,
@@ -89,6 +91,7 @@ impl Applied {
         self.reloaded |= other.reloaded;
         self.marks_changed |= other.marks_changed;
         self.pinned_changed |= other.pinned_changed;
+        self.statuses_changed |= other.statuses_changed;
         self.draft_changes.extend(other.draft_changes);
         self.cloud_drafts.extend(other.cloud_drafts);
     }
@@ -665,6 +668,34 @@ impl Sync {
 
     /// Members of a group or subscribers of a channel (`*.getFullChannel`; basic groups
     /// carry the number in their object).
+    /// Fresh user info (status, photo) for an opened private chat, as tdesktop asks for
+    /// it when a profile is shown.
+    pub async fn refresh_user(&mut self, peer: PeerKey) -> Result<bool> {
+        if peer.kind != PeerKind::User {
+            return Ok(false);
+        }
+        let Some(enums::InputPeer::User(u)) = self.input_peer(peer) else {
+            return Ok(false);
+        };
+        let users = self
+            .client
+            .invoke(&functions::users::GetUsers {
+                id: vec![enums::InputUser::InputUser(types::InputUser {
+                    user_id: u.user_id,
+                    access_hash: u.access_hash,
+                })],
+            })
+            .await?;
+        let rows: Vec<_> = users.iter().filter_map(convert::user_row).collect();
+        self.store.write(|w| {
+            for r in &rows {
+                w.put_peer(r)?;
+            }
+            Ok(())
+        })?;
+        Ok(!rows.is_empty())
+    }
+
     pub async fn member_count(&mut self, peer: PeerKey) -> Result<Option<i32>> {
         if peer.kind != PeerKind::Channel {
             return Ok(None);
@@ -1086,6 +1117,11 @@ fn apply_update(
             }
             applied.marks_changed = true;
         }
+        U::UserStatus(x) => {
+            if set_user_status(w, x.user_id, &x.status)? {
+                applied.statuses_changed = true;
+            }
+        }
         U::DialogPinned(x) if x.folder_id.unwrap_or(0) == 0 => {
             if let enums::DialogPeer::DialogPeer(d) = &x.peer {
                 w.set_pinned(convert::peer_key(&d.peer), x.pinned)?;
@@ -1110,6 +1146,34 @@ fn apply_update(
         _ => {}
     }
     Ok(())
+}
+
+/// `updateUserStatus`: the cached user gets the new status (tdesktop's
+/// `UserData::setLastseen`). Returns whether a cached user changed.
+fn set_user_status(
+    w: &tdr_storage::Writer<'_>,
+    user_id: i64,
+    status: &enums::UserStatus,
+) -> tdr_storage::Result<bool> {
+    let Some(row) = w.peer(PeerKey::user(user_id))? else {
+        return Ok(false);
+    };
+    let Some(mut user) = describe::user(&row) else {
+        return Ok(false);
+    };
+    let enums::User::User(u) = &mut user else {
+        return Ok(false);
+    };
+    u.status = Some(status.clone());
+    match convert::user_row(&user) {
+        Some(mut updated) => {
+            // Keep what the stored row knew (a status update carries no more).
+            updated.is_min = row.is_min;
+            w.put_peer(&updated)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// See [`Sync::history`].

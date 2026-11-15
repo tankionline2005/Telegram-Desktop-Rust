@@ -112,6 +112,7 @@ async fn main() -> Result<()> {
         ["watch"] => watch(None).await,
         ["watch", secs] => watch(Some(secs.parse().context("seconds must be a number")?)).await,
         ["avatar"] => avatar().await,
+        ["probe", "dialogs", needle] => probe_dialogs(needle).await,
         ["logout"] => logout().await,
         ["selftest", "reconnect"] => selftest_reconnect().await,
         ["selftest", "unknown-key"] => selftest_unknown_key().await,
@@ -490,6 +491,129 @@ fn describe(applied: &Applied) -> String {
             ""
         }
     )
+}
+
+/// Pages through the server's main chat list like `Sync` does and reports the
+/// paging (no names, no session or cache writes): where a chat whose user name
+/// contains `needle` comes, and where the paging stops.
+async fn probe_dialogs(needle: &str) -> Result<()> {
+    let client = logged_in()?;
+    let needle = needle.to_lowercase();
+    let (mut offset_date, mut offset_id, mut offset_peer) = (0, 0, enums::InputPeer::Empty);
+    let mut total = 0;
+    for page in 0..50 {
+        let r = client
+            .invoke(&functions::messages::GetDialogs {
+                exclude_pinned: false,
+                folder_id: None,
+                offset_date,
+                offset_id,
+                offset_peer: offset_peer.clone(),
+                limit: 100,
+                hash: 0,
+            })
+            .await?;
+        let (dialogs, messages, users, chats, slice, count) = match r {
+            enums::messages::Dialogs::Dialogs(d) => {
+                (d.dialogs, d.messages, d.users, d.chats, false, 0)
+            }
+            enums::messages::Dialogs::Slice(d) => {
+                (d.dialogs, d.messages, d.users, d.chats, true, d.count)
+            }
+            enums::messages::Dialogs::NotModified(_) => {
+                println!("page {page}: not modified");
+                break;
+            }
+        };
+        let user = |id: i64| {
+            users.iter().find_map(|u| match u {
+                enums::User::User(u) if u.id == id => Some(u),
+                _ => None,
+            })
+        };
+        let mut last = None;
+        let mut kinds = [0; 3];
+        for (i, d) in dialogs.iter().enumerate() {
+            let d = match d {
+                enums::Dialog::Dialog(d) => d,
+                enums::Dialog::Folder(_) => {
+                    kinds[1] += 1;
+                    continue;
+                }
+                enums::Dialog::Community(_) => {
+                    kinds[2] += 1;
+                    continue;
+                }
+            };
+            kinds[0] += 1;
+            let date = messages.iter().find_map(|m| {
+                let (id, date, peer) = match m {
+                    enums::Message::Message(m) => (m.id, m.date, &m.peer_id),
+                    enums::Message::Service(m) => (m.id, m.date, &m.peer_id),
+                    enums::Message::Empty(_) => return None,
+                };
+                (id == d.top_message && peer == &d.peer).then_some(date)
+            });
+            if let enums::Peer::User(p) = &d.peer
+                && let Some(u) = user(p.user_id)
+            {
+                let name = format!(
+                    "{} {}",
+                    u.first_name.clone().unwrap_or_default(),
+                    u.last_name.clone().unwrap_or_default()
+                )
+                .to_lowercase();
+                if name.contains(&needle) {
+                    println!(
+                        "  match: page {page}, index {i}, date {date:?}, pinned {}",
+                        d.pinned
+                    );
+                }
+            }
+            last = Some((d.peer.clone(), d.top_message, date));
+        }
+        total += kinds[0];
+        let Some((peer, top, date)) = last else {
+            println!("page {page}: no chats");
+            break;
+        };
+        let input = match &peer {
+            enums::Peer::User(p) => user(p.user_id).and_then(|u| u.access_hash).map(|h| {
+                enums::InputPeer::User(types::InputPeerUser {
+                    user_id: p.user_id,
+                    access_hash: h,
+                })
+            }),
+            enums::Peer::Chat(p) => Some(enums::InputPeer::Chat(types::InputPeerChat {
+                chat_id: p.chat_id,
+            })),
+            enums::Peer::Channel(p) => chats.iter().find_map(|c| match c {
+                enums::Chat::Channel(c) if c.id == p.channel_id => c.access_hash.map(|h| {
+                    enums::InputPeer::Channel(types::InputPeerChannel {
+                        channel_id: p.channel_id,
+                        access_hash: h,
+                    })
+                }),
+                _ => None,
+            }),
+        };
+        println!(
+            "page {page}: dialogs {} folders {} communities {} slice {slice} count {count}, last date {date:?}, last has input {}",
+            kinds[0],
+            kinds[1],
+            kinds[2],
+            input.is_some()
+        );
+        let (Some(input), Some(date)) = (input, date) else {
+            break;
+        };
+        if dialogs.len() < 100 || !slice {
+            break;
+        }
+        (offset_date, offset_id, offset_peer) = (date, top, input);
+    }
+    println!("total chats {total}");
+    Ok(())
 }
 
 async fn dialogs(limit: i32) -> Result<()> {

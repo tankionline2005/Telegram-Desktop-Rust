@@ -6,30 +6,136 @@
 use chrono::{DateTime, Datelike, Local, TimeZone};
 use tdr_data::describe::{Lastseen, Media, Service};
 
+/// The server's clock minus this computer's, in seconds.
+static SERVER_TIME_OFFSET: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// tdesktop shows server timestamps on this computer's clock (`base::unixtime::parse`
+/// subtracts the server-local difference), so a message sent now shows the time the
+/// taskbar does.
+pub fn set_server_time_offset(offset: i32) {
+    SERVER_TIME_OFFSET.store(offset, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A server timestamp as local time on this computer's clock.
 fn local(date: i32) -> Option<DateTime<Local>> {
-    Local.timestamp_opt(i64::from(date), 0).single()
+    let offset = SERVER_TIME_OFFSET.load(std::sync::atomic::Ordering::Relaxed);
+    Local
+        .timestamp_opt(i64::from(date) - i64::from(offset), 0)
+        .single()
+}
+
+/// The system's short date and time formats as `chrono` patterns: tdesktop formats
+/// with `QLocale()`, which on Windows follows the regional settings
+/// (`LOCALE_SSHORTDATE`, `LOCALE_SSHORTTIME`).
+struct SystemFormats {
+    date: String,
+    time: String,
+}
+
+static FORMATS: std::sync::LazyLock<SystemFormats> = std::sync::LazyLock::new(|| SystemFormats {
+    date: system_format(true).map_or_else(|| "%d.%m.%y".into(), |f| windows_to_chrono(&f)),
+    time: system_format(false).map_or_else(|| "%H:%M".into(), |f| windows_to_chrono(&f)),
+});
+
+#[cfg(windows)]
+fn system_format(date: bool) -> Option<String> {
+    use windows::Win32::Globalization::{GetLocaleInfoEx, LOCALE_SSHORTDATE, LOCALE_SSHORTTIME};
+    let kind = if date {
+        LOCALE_SSHORTDATE
+    } else {
+        LOCALE_SSHORTTIME
+    };
+    let mut buffer = [0u16; 128];
+    // SAFETY: a null locale name is the user default; the buffer is ours.
+    let n = unsafe { GetLocaleInfoEx(windows::core::PCWSTR::null(), kind, Some(&mut buffer)) };
+    (n > 1).then(|| String::from_utf16_lossy(&buffer[..n as usize - 1]))
+}
+
+#[cfg(not(windows))]
+fn system_format(_date: bool) -> Option<String> {
+    None
+}
+
+/// A Windows date/time picture ("M/d/yyyy", "HH:mm", "dd.MM.yy", 'quoted' text) as a
+/// `chrono` format.
+fn windows_to_chrono(picture: &str) -> String {
+    let chars: Vec<char> = picture.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\'' {
+            i += 1;
+            while i < chars.len() && chars[i] != '\'' {
+                if chars[i] == '%' {
+                    out.push('%');
+                }
+                out.push(chars[i]);
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        let run = chars[i..].iter().take_while(|&&c| c == ch).count();
+        let token = match (ch, run) {
+            ('d', 1) => "%-d",
+            ('d', 2) => "%d",
+            ('d', 3) => "%a",
+            ('d', _) => "%A",
+            ('M', 1) => "%-m",
+            ('M', 2) => "%m",
+            ('M', 3) => "%b",
+            ('M', _) => "%B",
+            ('y', 1) => "%-y",
+            ('y', 2) => "%y",
+            ('y', _) => "%Y",
+            ('g', _) => "",
+            ('h', 1) => "%-I",
+            ('h', _) => "%I",
+            ('H', 1) => "%-H",
+            ('H', _) => "%H",
+            ('m', 1) => "%-M",
+            ('m', _) => "%M",
+            ('s', 1) => "%-S",
+            ('s', _) => "%S",
+            ('t', _) => "%p",
+            ('%', _) => {
+                out.push_str(&"%%".repeat(run));
+                i += run;
+                continue;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n(ch, run));
+                i += run;
+                continue;
+            }
+        };
+        out.push_str(token);
+        i += run;
+    }
+    out
 }
 
 /// `Ui::FormatDialogsDate`: the time for anything from today or the last 20 hours, the
-/// weekday within a week, the date otherwise.
+/// weekday within a week, the date otherwise (short formats of the system locale).
 pub fn dialogs_date(date: i32, now: DateTime<Local>) -> String {
     let Some(t) = local(date) else {
         return String::new();
     };
     let recent = (now - t).num_seconds().abs() < 20 * 3600;
     if t.date_naive() == now.date_naive() || recent {
-        t.format("%H:%M").to_string()
+        t.format(&FORMATS.time).to_string()
     } else if (now.date_naive() - t.date_naive()).num_days().abs() < 7 {
         t.format("%a").to_string()
     } else {
-        t.format("%d.%m.%y").to_string()
+        t.format(&FORMATS.date).to_string()
     }
 }
 
 /// Message time in a bubble.
 pub fn message_time(date: i32) -> String {
     local(date)
-        .map(|t| t.format("%H:%M").to_string())
+        .map(|t| t.format(&FORMATS.time).to_string())
         .unwrap_or_default()
 }
 
@@ -166,7 +272,9 @@ pub fn is_call(service: &Service) -> bool {
 /// `Data::OnlineText`.
 pub fn lastseen_text(status: Lastseen, now: DateTime<Local>) -> String {
     let was = match status {
-        Lastseen::Online { until } if i64::from(until) > now.timestamp() => return "online".into(),
+        Lastseen::Online { until } if local(until).is_some_and(|until| until > now) => {
+            return "online".into();
+        }
         Lastseen::Online { until } => until,
         Lastseen::Offline { was } => was,
         Lastseen::Recently => return "last seen recently".into(),
@@ -187,11 +295,11 @@ pub fn lastseen_text(status: Lastseen, now: DateTime<Local>) -> String {
         let h = ago / 3600;
         format!("last seen {h} hour{} ago", if h == 1 { "" } else { "s" })
     } else if t.date_naive() == now.date_naive() {
-        format!("last seen today at {}", t.format("%H:%M"))
+        format!("last seen today at {}", t.format(&FORMATS.time))
     } else if now.date_naive().pred_opt() == Some(t.date_naive()) {
-        format!("last seen yesterday at {}", t.format("%H:%M"))
+        format!("last seen yesterday at {}", t.format(&FORMATS.time))
     } else {
-        format!("last seen {}", t.format("%d.%m.%y"))
+        format!("last seen {}", t.format(&FORMATS.date))
     }
 }
 
@@ -223,7 +331,7 @@ mod tests {
         // Yesterday 23:27 is within 20 hours: a time, not "Sat".
         assert_eq!(
             dialogs_date(at(2026, 11, 14, 23, 27).timestamp() as i32, now),
-            "23:27"
+            at(2026, 11, 14, 23, 27).format(&FORMATS.time).to_string()
         );
         // 21 hours ago, yesterday: the weekday.
         assert_eq!(
@@ -232,8 +340,20 @@ mod tests {
         );
         assert_eq!(
             dialogs_date(at(2026, 11, 1, 5, 0).timestamp() as i32, now),
-            "01.11.26"
+            at(2026, 11, 1, 5, 0).format(&FORMATS.date).to_string()
         );
+    }
+
+    #[test]
+    fn windows_formats_convert() {
+        let t = at(2023, 12, 6, 7, 5);
+        let f = |p: &str| t.format(&windows_to_chrono(p)).to_string();
+        assert_eq!(f("M/d/yyyy"), "12/6/2023");
+        assert_eq!(f("dd.MM.yy"), "06.12.23");
+        assert_eq!(f("yyyy-MM-dd"), "2023-12-06");
+        assert_eq!(f("HH:mm"), "07:05");
+        assert_eq!(f("h:mm tt"), "7:05 AM");
+        assert_eq!(f("d 'de' MMMM"), "6 de December");
     }
 
     #[test]

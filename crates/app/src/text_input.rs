@@ -44,6 +44,21 @@ actions!(
     ]
 );
 
+/// Half of the caret's blink period: Windows' `GetCaretBlinkTime` (Qt's
+/// `cursorFlashTime` is twice it); `None` when blinking is off.
+fn caret_blink_time() -> Option<std::time::Duration> {
+    #[cfg(windows)]
+    {
+        // SAFETY: no arguments, returns the user's setting.
+        let ms = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCaretBlinkTime() };
+        (ms != 0 && ms != u32::MAX).then(|| std::time::Duration::from_millis(ms.into()))
+    }
+    #[cfg(not(windows))]
+    {
+        Some(std::time::Duration::from_millis(500))
+    }
+}
+
 /// Emitted on Enter with the text; the field is cleared.
 pub struct Submit(pub String);
 
@@ -97,6 +112,10 @@ pub struct TextInput {
     /// Scrolled-out height when the text is taller than the maximum.
     scroll_y: Pixels,
     is_selecting: bool,
+    /// The caret blinks from this moment (reset by typing, moving and focusing, as
+    /// Qt's text controls do), and what it was reset for.
+    blink_since: std::time::Instant,
+    blink_state: (SharedString, Range<usize>, bool),
     palette: &'static Palette,
 }
 
@@ -114,6 +133,25 @@ impl TextInput {
         palette: &'static Palette,
         cx: &mut Context<Self>,
     ) -> Self {
+        if let Some(half) = caret_blink_time() {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(half / 4).await;
+                    let alive = this.update(cx, |input, cx| {
+                        // Repaint around each toggle only.
+                        let phase =
+                            input.blink_since.elapsed().as_millis() % half.as_millis().max(1);
+                        if phase < (half / 4).as_millis() + 5 && input.blink_state.2 {
+                            cx.notify();
+                        }
+                    });
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         Self {
             focus_handle: cx.focus_handle(),
             content: "".into(),
@@ -124,7 +162,19 @@ impl TextInput {
             layout: Layout::default(),
             scroll_y: px(0.),
             is_selecting: false,
+            blink_since: std::time::Instant::now(),
+            blink_state: (SharedString::default(), 0..0, false),
             palette,
+        }
+    }
+
+    /// Whether the caret is drawn now: on for the first half of every blink period.
+    fn caret_on(&self) -> bool {
+        match caret_blink_time() {
+            Some(half) => {
+                (self.blink_since.elapsed().as_millis() / half.as_millis().max(1)).is_multiple_of(2)
+            }
+            None => true,
         }
     }
 
@@ -794,7 +844,17 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        // Typing, moving the caret or focusing shows it at once and restarts blinking.
+        let focused = self.input.read(cx).focus_handle.is_focused(window);
+        self.input.update(cx, |input, _| {
+            let state = (input.content.clone(), input.selected_range.clone(), focused);
+            if state != input.blink_state {
+                input.blink_state = state;
+                input.blink_since = std::time::Instant::now();
+            }
+        });
         let input = self.input.read(cx);
+        let caret_on = input.caret_on();
         let content = input.content.clone();
         let palette = input.palette;
         let style = window.text_style();
@@ -854,11 +914,12 @@ impl Element for TextElement {
         scroll_y = scroll_y.min((total - visible).max(px(0.))).max(px(0.));
         let origin = point(bounds.left(), bounds.top() - scroll_y);
 
-        let cursor = selected.is_empty().then(|| {
+        // Qt's default caret: one device pixel wide.
+        let cursor = (selected.is_empty() && caret_on).then(|| {
             fill(
                 Bounds::new(
                     point(origin.x + cursor_pos.x, origin.y + cursor_pos.y),
-                    size(px(1.5), lh),
+                    size(px(1. / window.scale_factor()), lh),
                 ),
                 rgba(palette.active_line_fg.rgba()),
             )

@@ -112,6 +112,9 @@ pub struct DialogItem {
     pub read_inbox_max_id: i32,
     /// Under the name in the chat header: "online", "906 members", "bot", ...
     pub status: String,
+    /// A private chat's last-seen state: the header formats it when drawn, so "5
+    /// minutes ago" stays true.
+    pub lastseen: Option<describe::Lastseen>,
 }
 
 impl DialogItem {
@@ -351,6 +354,11 @@ fn dialog_item(store: &Storage, d: &DialogView, ctx: &Context) -> DialogItem {
         pinned: d.dialog.pinned,
         read_inbox_max_id: d.dialog.read_inbox_max_id,
         status,
+        lastseen: info.lastseen.filter(|_| {
+            kind == ChatKind::User
+                && !is_saved
+                && peer != PeerKey::user(tdr_data::SERVICE_NOTIFICATIONS_ID)
+        }),
     }
 }
 
@@ -519,7 +527,15 @@ fn send_dialogs(
 ) -> anyhow::Result<()> {
     let list = store.dialogs(0, shown)?;
     let ctx = Context::load(store);
-    let items = list.iter().map(|d| dialog_item(store, d, &ctx)).collect();
+    let items = list
+        .iter()
+        .filter(|d| {
+            !d.peer
+                .as_ref()
+                .is_some_and(|p| describe::peer_info(p).migrated)
+        })
+        .map(|d| dialog_item(store, d, &ctx))
+        .collect();
     let _ = tx.send(Update::Dialogs(items));
     Ok(())
 }
@@ -546,6 +562,7 @@ fn changed(a: &Applied) -> bool {
         || a.reloaded
         || a.marks_changed
         || a.pinned_changed
+        || a.statuses_changed
         || !a.draft_changes.is_empty()
 }
 
@@ -609,6 +626,12 @@ async fn run(
         anyhow::bail!("Not logged in. Run `tdr login` once, then start the app again.");
     }
     let client = Client::new(config, session);
+    let sync_clock = |client: &Client| {
+        present::set_server_time_offset(
+            client.server_time() - chrono::Utc::now().timestamp() as i32,
+        );
+    };
+    sync_clock(&client);
     let save = |client: &Client| {
         if let Err(e) = client.save_session(&paths.session) {
             error!("session save: {e}");
@@ -620,6 +643,7 @@ async fn run(
     let mut sync = Sync::new(client.clone(), store)?;
     let started = std::time::Instant::now();
     let applied = sync.start().await?;
+    sync_clock(&client);
     info!(elapsed = ?started.elapsed(), "synced");
     save(&client);
     send_dialogs(sync.store(), shown, &tx)?;
@@ -670,6 +694,10 @@ async fn run(
                         match sync.history(peer, count).await {
                             Ok(_) => send_history(sync.store(), peer, count, &tx)?,
                             Err(e) => error!("history: {e}"),
+                        }
+                        // A private chat's status, fresh from the server.
+                        if let Err(e) = sync.refresh_user(peer).await {
+                            error!("user: {e}");
                         }
                         send_dialogs(sync.store(), shown, &tx)?;
                         // Supergroups and channels: the member count is in the full info.
@@ -762,6 +790,7 @@ async fn run(
             }
             event = sync.wait_event(Duration::from_secs(5)) => {
                 let applied = sync.process(event).await?;
+                sync_clock(&client);
                 if changed(&applied) {
                     send_dialogs(sync.store(), shown, &tx)?;
                     send_draft_changes(&applied, &tx);
@@ -934,6 +963,7 @@ pub fn start_demo() -> (
                 draft: None,
                 // The last few messages of each chat are unread.
                 read_inbox_max_id: 1005,
+                lastseen: None,
                 status: match kind {
                     ChatKind::Group => "906 members".into(),
                     ChatKind::Channel => "8 subscribers".into(),
@@ -968,6 +998,7 @@ pub fn start_demo() -> (
             draft: None,
             read_inbox_max_id: 1005,
             status: "last seen a long time ago".into(),
+            lastseen: None,
         });
     }
     let _ = up_tx.send(Update::Dialogs(dialogs.clone()));

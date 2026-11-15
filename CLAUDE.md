@@ -64,6 +64,13 @@
 - Drags (scrollbars, the column edge) follow the mouse through window-level listeners
   and a full-window capture layer (`render_drag_capture`), not the element's own
   `on_mouse_move`, which stops when the mouse leaves the element.
+- Sizes in `ui` go through `scale::px` (tdesktop's `ConvertScale`: every style size
+  becomes whole device pixels on its own) and fonts through `scale::font` (Qt's
+  rounded ascent + descent as the line height). Use `gpui::px` only for values
+  already in logical pixels. Times on screen are shifted by the server clock offset
+  (`present::set_server_time_offset`), dates use the system's short formats.
+- `uniform_list` lays out each item as its own root, where a `top` offset is
+  ignored: animate an item inside a fixed-size wrapper.
 - Live checks against Telegram use the user's session in `data/` (git-ignored):
   `tdr me`, `tdr selftest reconnect|unknown-key|dc N`. Run cargo with
   `--manifest-path` if the shell cannot `cd` into the bracketed folder.

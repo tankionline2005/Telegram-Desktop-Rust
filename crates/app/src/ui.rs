@@ -293,10 +293,12 @@ fn paint_bookmark(bounds: gpui::Bounds<Pixels>, size: f32, fg: Color, window: &m
     let (right, bottom) = (left + width, top + height);
     let middle = ((left + right) / 2.).floor();
     let half = ((top + bottom) / 2.).floor();
+    // Qt draws this pen so that each line covers whole pixels (a 3 px side is 3 solid
+    // pixels in tdesktop): the outline sits half a pixel off the integer grid.
     let at = |x: f32, y: f32| {
         point(
-            bounds.left() + gpui::px(x / scale),
-            bounds.top() + gpui::px(y / scale),
+            bounds.left() + gpui::px((x + 0.5) / scale),
+            bounds.top() + gpui::px((y + 0.5) / scale),
         )
     };
     let stroke = |join: LineJoin| {
@@ -324,6 +326,35 @@ fn paint_bookmark(bounds: gpui::Bounds<Pixels>, size: f32, fg: Color, window: &m
         if let Ok(path) = path.build() {
             window.paint_path(path, c(fg));
         }
+    }
+}
+
+/// `bubble_tail` in style pixels.
+const TAIL_SIZE: (f32, f32) = (6., 10.);
+
+/// The bubble tail filled in `bounds` (mirrored for the right side).
+fn paint_tail(bounds: gpui::Bounds<Pixels>, right_side: bool, fill: Rgba, window: &mut Window) {
+    let outline = crate::icons::bubble_tail_outline();
+    let sx = f32::from(bounds.size.width) / TAIL_SIZE.0;
+    let sy = f32::from(bounds.size.height) / TAIL_SIZE.1;
+    let at = |&(x, y): &(f32, f32)| {
+        let x = if right_side { TAIL_SIZE.0 - x } else { x };
+        point(
+            bounds.left() + gpui::px(x * sx),
+            bounds.top() + gpui::px(y * sy),
+        )
+    };
+    let mut path = PathBuilder::fill();
+    let mut points = outline.iter();
+    if let Some(first) = points.next() {
+        path.move_to(at(first));
+        for p in points {
+            path.line_to(at(p));
+        }
+        path.close();
+    }
+    if let Ok(path) = path.build() {
+        window.paint_path(path, fill);
     }
 }
 
@@ -380,9 +411,31 @@ struct PinDrag {
     peer: PeerKey,
     /// The mouse position the row's slot corresponds to (moves with each swap).
     start_y: f32,
-    /// The row's offset from its slot.
+    /// The row's offset from its slot, following the mouse.
     yadd: f32,
+    /// At the start the row slides from its slot to the mouse (`yadd` animated
+    /// from `anim_from` since `anim_start`); swaps meanwhile keep it sliding.
+    anim_from: f32,
+    anim_start: Option<Instant>,
     start_order: Vec<PeerKey>,
+}
+
+impl PinDrag {
+    /// The offset drawn now.
+    fn shown_yadd(&self) -> f32 {
+        match self.anim_start {
+            Some(start) if start.elapsed() < PINNED_SHIFT_DURATION => {
+                let t = start.elapsed().as_secs_f32() / PINNED_SHIFT_DURATION.as_secs_f32();
+                self.anim_from + (self.yadd - self.anim_from) * sine_in_out(t)
+            }
+            _ => self.yadd,
+        }
+    }
+
+    fn animating(&self) -> bool {
+        self.anim_start
+            .is_some_and(|s| s.elapsed() < PINNED_SHIFT_DURATION)
+    }
 }
 
 /// An animated scroll (`_scrollToAnimation`).
@@ -420,18 +473,153 @@ struct ScrollDrag {
 
 /// One overlay scrollbar (tdesktop's `ScrollArea`): shown while scrolling and on hover.
 #[derive(Default)]
+/// A value moving linearly to its target (`Ui::Animations::Simple` with the default
+/// linear transition).
+#[derive(Clone, Copy)]
+struct Fade {
+    from: f32,
+    to: f32,
+    start: Option<Instant>,
+    duration: Duration,
+}
+
+impl Fade {
+    fn new(value: f32, duration: Duration) -> Self {
+        Self {
+            from: value,
+            to: value,
+            start: None,
+            duration,
+        }
+    }
+
+    fn value(&self) -> f32 {
+        match self.start {
+            Some(start) if start.elapsed() < self.duration => {
+                let t = start.elapsed().as_secs_f32() / self.duration.as_secs_f32();
+                self.from + (self.to - self.from) * t
+            }
+            _ => self.to,
+        }
+    }
+
+    fn animating(&self) -> bool {
+        self.start.is_some_and(|s| s.elapsed() < self.duration)
+    }
+
+    fn set(&mut self, to: f32) {
+        if self.to != to {
+            self.from = self.value();
+            self.to = to;
+            self.start = Some(Instant::now());
+        }
+    }
+}
+
+/// `ScrollArea::duration`: the scrollbar fades and its hover highlights.
+const SCROLL_FADE: Duration = Duration::from_millis(150);
+/// `historyScrollDateHideTimeout`, `historyDateFadeDuration`.
+const SCROLL_DATE_HIDE_AFTER: Duration = Duration::from_millis(1000);
+const SCROLL_DATE_FADE: Duration = Duration::from_millis(200);
+/// `historyToDownDuration`: the round buttons slide in and out.
+const TO_DOWN_DURATION: Duration = Duration::from_millis(150);
+
+/// One overlay scrollbar, as lib_ui's `ScrollBar`: hidden until the mouse enters its
+/// area or the area scrolls, then hidden again a second later (at once when the mouse
+/// leaves the area), never while the mouse is over the bar; every change fades.
 struct Scrollbar {
+    /// Shown (1) or hidden (0); `_a_opacity`.
+    opacity: Fade,
+    /// When the hide timer fires (`_hideTimer`), and its interval (`_hideIn`).
+    hide_at: Option<Instant>,
+    hide_in: Duration,
+    /// The mouse is over the bar's strip (`_over`), over the thumb (`_overbar`).
+    over: bool,
+    over_bar: bool,
+    over_fade: Fade,
+    bar_fade: Fade,
+    /// The list last scrolled (the floating date goes with it).
     last_scroll: Option<Instant>,
-    hovered: bool,
     drag: Option<ScrollDrag>,
 }
 
+impl Default for Scrollbar {
+    fn default() -> Self {
+        Self {
+            opacity: Fade::new(0., SCROLL_FADE),
+            hide_at: None,
+            hide_in: SCROLL_HIDE_AFTER,
+            over: false,
+            over_bar: false,
+            over_fade: Fade::new(0., SCROLL_FADE),
+            bar_fade: Fade::new(0., SCROLL_FADE),
+            last_scroll: None,
+            drag: None,
+        }
+    }
+}
+
 impl Scrollbar {
-    fn visible(&self) -> bool {
-        self.last_scroll
-            .is_some_and(|t| t.elapsed() < SCROLL_HIDE_AFTER)
-            || self.hovered
-            || self.drag.is_some()
+    fn hiding(&self) -> bool {
+        self.opacity.to == 0.
+    }
+
+    /// `ScrollBar::hideTimeout`: show now (unless `dt` is zero) and hide after `dt`.
+    fn hide_timeout(&mut self, dt: Duration) {
+        if self.hiding() && !dt.is_zero() {
+            self.opacity.set(1.);
+        }
+        self.hide_in = dt;
+        if self.drag.is_none() {
+            self.hide_at = Some(Instant::now() + dt);
+        }
+    }
+
+    /// Fires the hide timer; true while something still animates or waits.
+    fn tick(&mut self) -> bool {
+        if let Some(at) = self.hide_at
+            && Instant::now() >= at
+        {
+            self.hide_at = None;
+            if !self.over && self.drag.is_none() {
+                self.opacity.set(0.);
+            }
+        }
+        let moving = self.drag.is_some();
+        self.over_fade
+            .set(if self.over || moving { 1. } else { 0. });
+        self.bar_fade
+            .set(if self.over_bar || moving { 1. } else { 0. });
+        self.opacity.animating() || self.over_fade.animating() || self.bar_fade.animating()
+    }
+
+    /// `setOver`: the mouse entered or left the bar's strip.
+    fn set_over(&mut self, over: bool) {
+        if self.over == over {
+            return;
+        }
+        self.over = over;
+        if over {
+            self.hide_at = None;
+            if self.hiding() {
+                self.opacity.set(1.);
+            }
+        } else {
+            self.over_bar = false;
+            if !self.hiding() && self.drag.is_none() {
+                self.hide_at = Some(Instant::now() + self.hide_in);
+            }
+        }
+    }
+}
+
+/// `anim::color`: a mix of two colors, then faded by `opacity`.
+fn mix(a: Rgba, b: Rgba, t: f32, opacity: f32) -> Rgba {
+    Rgba {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: (a.a + (b.a - a.a) * t) * opacity,
     }
 }
 
@@ -514,6 +702,11 @@ pub struct MainView {
     title_hovered: Option<&'static str>,
     /// The "scroll down" / "scroll to top" button under the mouse.
     jump_hovered: Option<&'static str>,
+    /// How far the round buttons have slid in (`CornerButton::animation`).
+    to_down_shown: Fade,
+    to_up_shown: Fade,
+    /// The floating date's opacity (`_scrollDateOpacity`).
+    scroll_date: Fade,
     input: Entity<TextInput>,
     status: String,
     fatal: Option<String>,
@@ -560,6 +753,24 @@ impl MainView {
         cx.spawn(async move |this, cx| {
             while let Some(update) = updates.recv().await {
                 if this.update(cx, |view, cx| view.apply(update, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        // "last seen 5 minutes ago" moves on with the clock.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(15))
+                    .await;
+                let alive = this.update(cx, |view, cx| {
+                    if view.selected.is_some() {
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
                     break;
                 }
             }
@@ -631,6 +842,9 @@ impl MainView {
             main_menu_open: false,
             title_hovered: None,
             jump_hovered: None,
+            to_down_shown: Fade::new(0., TO_DOWN_DURATION),
+            to_up_shown: Fade::new(0., TO_DOWN_DURATION),
+            scroll_date: Fade::new(0., SCROLL_DATE_FADE),
             input,
             status: String::new(),
             fatal: None,
@@ -738,10 +952,13 @@ impl MainView {
         if order.len() < 2 || !order.contains(&peer) {
             return;
         }
+        // `startReorderPinned`: yadd animates from 0 to the mouse.
         self.pin_drag = Some(PinDrag {
             peer,
             start_y,
             yadd: 0.,
+            anim_from: 0.,
+            anim_start: Some(Instant::now()),
             start_order: order,
         });
         self.update_pin_drag(f32::from(y), cx);
@@ -775,9 +992,11 @@ impl MainView {
         else {
             return;
         };
-        let height = DIALOG_ROW_HEIGHT;
+        let height = lg(DIALOG_ROW_HEIGHT);
         let threshold = (height / 2.).max(height - height / 2.);
         let now = Instant::now();
+        let shown_was = drag.shown_yadd();
+        let start_was = drag.start_y;
         while index > 0 && drag.start_y - y >= threshold {
             self.dialogs.swap(index, index - 1);
             let displaced = self.dialogs[index].peer;
@@ -795,6 +1014,11 @@ impl MainView {
             drag.start_y += height;
         }
         drag.yadd = y - drag.start_y;
+        // `yadd = anim::value(yaddWas - shiftHeight, ...)`: a running slide goes on
+        // from where it was drawn.
+        if drag.animating() {
+            drag.anim_from = shown_was - (drag.start_y - start_was);
+        }
         self.pin_drag = Some(drag);
         cx.notify();
     }
@@ -806,7 +1030,7 @@ impl MainView {
             return;
         };
         self.row_shifts
-            .insert(drag.peer, (drag.yadd, Instant::now()));
+            .insert(drag.peer, (drag.shown_yadd(), Instant::now()));
         self.suppress_open = true;
         let order = self.pinned_order();
         if order != drag.start_order {
@@ -1210,13 +1434,34 @@ impl MainView {
         }
     }
 
-    /// A list scrolled: show its scrollbar (and the floating date) for a moment.
+    /// A list scrolled: show its scrollbar (and the floating date) for a moment
+    /// (`ScrollArea::scrolled` -> `hideTimeout(st.hiding)`).
     fn scrolled(&mut self, area: Area, cx: &mut Context<Self>) {
-        self.bar_mut(area).last_scroll = Some(Instant::now());
+        let bar = self.bar_mut(area);
+        bar.last_scroll = Some(Instant::now());
+        bar.hide_timeout(SCROLL_HIDE_AFTER);
         cx.notify();
+        Self::wake_after(SCROLL_HIDE_AFTER, cx);
+    }
+
+    /// The mouse entered or left a list (`ScrollArea::enterEventHook/leaveEventHook`):
+    /// its scrollbar shows for a second, or hides at once.
+    fn area_hovered(&mut self, area: Area, hovered: bool, cx: &mut Context<Self>) {
+        let bar = self.bar_mut(area);
+        if hovered {
+            bar.hide_timeout(SCROLL_HIDE_AFTER);
+            Self::wake_after(SCROLL_HIDE_AFTER, cx);
+        } else if bar.drag.is_none() {
+            bar.hide_timeout(Duration::ZERO);
+        }
+        cx.notify();
+    }
+
+    /// A render after `delay` (timers are checked while rendering).
+    fn wake_after(delay: Duration, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(SCROLL_HIDE_AFTER + Duration::from_millis(20))
+                .timer(delay + Duration::from_millis(20))
                 .await;
             let _ = this.update(cx, |_, cx| cx.notify());
         })
@@ -2096,12 +2341,8 @@ impl MainView {
         // The tail (`bubble_tail`) hangs outside the square corner; the shadow line
         // continues under it (`PaintBubbleGeneric`).
         let tail = (!next_attached).then(|| {
-            let kind = if right_side {
-                Icon::BubbleTailRight
-            } else {
-                Icon::BubbleTail
-            };
-            let tail_w = icon_width(kind, window);
+            let (tail_w, tail_h) = (lg(TAIL_SIZE.0), lg(TAIL_SIZE.1));
+            let fill = c(bg);
             div()
                 .absolute()
                 .bottom(-px(MSG_SHADOW))
@@ -2110,7 +2351,16 @@ impl MainView {
                 .w(gpui::px(tail_w))
                 .flex()
                 .flex_col()
-                .child(icon(kind, bg, window))
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            paint_tail(bounds, right_side, fill, window);
+                        },
+                    )
+                    .w(gpui::px(tail_w))
+                    .h(gpui::px(tail_h)),
+                )
                 .child(div().w_full().h(px(MSG_SHADOW)).bg(c(shadow)))
         });
         let bubble = div().relative().flex_none().child(bubble).children(tail);
@@ -2282,20 +2532,35 @@ impl MainView {
             return None;
         }
         let bar_state = self.bar(area);
-        let visible = bar_state.visible();
-        let over = bar_state.hovered || bar_state.drag.is_some();
-        let (track_bg, bar_bg, bar_bg_over) = match area {
+        let opacity = bar_state.opacity.value();
+        let (bg, bg_over, bar_bg, bar_bg_over) = match area {
             Area::History => (
+                p.history_scroll_bg,
                 p.history_scroll_bg_over,
                 p.history_scroll_bar_bg,
                 p.history_scroll_bar_bg_over,
             ),
-            Area::Dialogs => (p.scroll_bg_over, p.scroll_bar_bg, p.scroll_bar_bg_over),
+            Area::Dialogs => (
+                p.scroll_bg,
+                p.scroll_bg_over,
+                p.scroll_bar_bg,
+                p.scroll_bar_bg_over,
+            ),
         };
+        let track_color = mix(c(bg), c(bg_over), bar_state.over_fade.value(), opacity);
+        let bar_color = mix(
+            c(bar_bg),
+            c(bar_bg_over),
+            bar_state.bar_fade.value(),
+            opacity,
+        );
+        // Each style size converted on its own, as tdesktop does: at 125 % the chat
+        // list's bar is 12 - 2 * 4 = 4 px wide, not (10 - 6) * 1.25 = 5.
         let (width, round) = area.bar_style();
-        let track = viewport - 2. * SCROLL_DELTA;
-        let bar = (track * viewport / (viewport + max)).max(SCROLL_MIN_BAR);
-        let bar_top = SCROLL_DELTA + (track - bar) * (offset / max);
+        let delta = lg(SCROLL_DELTA);
+        let track = viewport - 2. * delta;
+        let bar = (track * viewport / (viewport + max)).max(lg(SCROLL_MIN_BAR));
+        let bar_top = delta + (track - bar) * (offset / max);
         let id = match area {
             Area::History => "history-scroll",
             Area::Dialogs => "dialogs-scroll",
@@ -2309,7 +2574,9 @@ impl MainView {
                 .w(px(width))
                 .h_full()
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                    this.bar_mut(area).hovered = *hovered;
+                    this.bar_mut(area).set_over(*hovered);
+                    let delay = this.bar(area).hide_in;
+                    Self::wake_after(delay, cx);
                     cx.notify();
                 }))
                 .on_mouse_down(
@@ -2318,8 +2585,9 @@ impl MainView {
                         let (_, _, offset) = this.scroll_metrics(area);
                         this.bar_mut(area).drag = Some(ScrollDrag {
                             start_mouse_y: e.position.y,
-                            start_offset: px(offset),
+                            start_offset: gpui::px(offset),
                         });
+                        this.bar_mut(area).hide_at = None;
                         if area == Area::History {
                             this.messages_state.scrollbar_drag_started();
                         }
@@ -2327,26 +2595,34 @@ impl MainView {
                         cx.notify();
                     }),
                 )
-                .when(visible, |d| {
+                .when(opacity > 0., |d| {
                     d.child(
                         div()
                             .absolute()
-                            .top(px(SCROLL_DELTA))
-                            .left(px(SCROLL_DELTA))
-                            .w(px(width - 2. * SCROLL_DELTA))
-                            .h(px(track))
+                            .top(gpui::px(delta))
+                            .left(gpui::px(delta))
+                            .w(gpui::px(lg(width) - 2. * delta))
+                            .h(gpui::px(track))
                             .rounded(px(round))
-                            .when(over, |d| d.bg(c(track_bg))),
+                            .bg(track_color),
                     )
                     .child(
                         div()
+                            .id(match area {
+                                Area::History => "history-scroll-bar",
+                                Area::Dialogs => "dialogs-scroll-bar",
+                            })
                             .absolute()
-                            .top(px(bar_top))
-                            .left(px(SCROLL_DELTA))
-                            .w(px(width - 2. * SCROLL_DELTA))
-                            .h(px(bar))
+                            .top(gpui::px(bar_top))
+                            .left(gpui::px(delta))
+                            .w(gpui::px(lg(width) - 2. * delta))
+                            .h(gpui::px(bar))
                             .rounded(px(round))
-                            .bg(c(if over { bar_bg_over } else { bar_bg })),
+                            .bg(bar_color)
+                            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                this.bar_mut(area).over_bar = *hovered;
+                                cx.notify();
+                            })),
                     )
                 }),
         )
@@ -2405,8 +2681,8 @@ impl MainView {
         };
         let (start_mouse_y, start_offset) = (drag.start_mouse_y, drag.start_offset);
         let (viewport, max, _) = self.scroll_metrics(area);
-        let track = viewport - 2. * SCROLL_DELTA;
-        let bar = (track * viewport / (viewport + max)).max(SCROLL_MIN_BAR);
+        let track = viewport - 2. * lg(SCROLL_DELTA);
+        let bar = (track * viewport / (viewport + max)).max(lg(SCROLL_MIN_BAR));
         let movable = (track - bar).max(1.);
         let delta = f32::from(mouse_y - start_mouse_y) * max / movable;
         let target = (f32::from(start_offset) + delta).clamp(0., max);
@@ -2420,6 +2696,12 @@ impl MainView {
 
     fn end_drag(&mut self, area: Area, cx: &mut Context<Self>) {
         if self.bar_mut(area).drag.take().is_some() {
+            let bar = self.bar_mut(area);
+            if !bar.over {
+                bar.hide_at = Some(Instant::now() + bar.hide_in);
+                let delay = bar.hide_in;
+                Self::wake_after(delay, cx);
+            }
             if area == Area::History {
                 self.messages_state.scrollbar_drag_ended();
             }
@@ -2430,7 +2712,7 @@ impl MainView {
     /// While scrolling, the date of the topmost visible message floats at the top
     /// (tdesktop's `_scrollDateShown`).
     fn floating_date(&self) -> Option<String> {
-        if !self.history_bar.visible() || self.history_bar.hovered {
+        if self.scroll_date.value() <= 0. {
             return None;
         }
         let top = self.messages_state.logical_scroll_top();
@@ -2444,11 +2726,14 @@ impl MainView {
 
     fn render_header(&self, chat: &DialogItem, border: Rgba) -> impl IntoElement + use<> {
         let p = self.palette();
-        let status = self
-            .members
-            .get(&chat.peer)
-            .cloned()
-            .unwrap_or_else(|| chat.status.clone());
+        let status = match chat.lastseen {
+            Some(lastseen) => present::lastseen_text(lastseen, chrono::Local::now()),
+            None => self
+                .members
+                .get(&chat.peer)
+                .cloned()
+                .unwrap_or_else(|| chat.status.clone()),
+        };
         let status_fg = if status == "online" {
             p.window_active_text_fg
         } else {
@@ -2495,6 +2780,21 @@ impl Render for MainView {
             );
         }
         self.tick_scroll_anim(window, cx);
+        let bars_busy = self.history_bar.tick() | self.dialogs_bar.tick();
+        // The floating date: shown while scrolling, hidden a second later, fading.
+        let date_on = self
+            .history_bar
+            .last_scroll
+            .is_some_and(|t| t.elapsed() < SCROLL_DATE_HIDE_AFTER);
+        self.scroll_date.set(if date_on { 1. } else { 0. });
+        if bars_busy
+            || self.pin_drag.as_ref().is_some_and(PinDrag::animating)
+            || self.scroll_date.animating()
+            || self.to_down_shown.animating()
+            || self.to_up_shown.animating()
+        {
+            window.request_animation_frame();
+        }
         self.row_shifts
             .retain(|_, (_, start)| start.elapsed() < PINNED_SHIFT_DURATION);
         if !self.row_shifts.is_empty() {
@@ -2550,7 +2850,14 @@ impl Render for MainView {
             cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
                 range
                     .filter_map(|i| this.dialogs.get(i).cloned())
-                    .map(|item| this.render_dialog(&item, false, window, cx))
+                    // Each item is laid out on its own, where a root's `top` offset
+                    // is ignored: the row slides inside a fixed slot.
+                    .map(|item| {
+                        div()
+                            .w_full()
+                            .h(px(DIALOG_ROW_HEIGHT))
+                            .child(this.render_dialog(&item, false, window, cx))
+                    })
                     .collect::<Vec<_>>()
             }),
         )
@@ -2573,7 +2880,7 @@ impl Render for MainView {
         let floating_row = self.pin_drag.as_ref().and_then(|drag| {
             let index = self.dialogs.iter().position(|d| d.peer == drag.peer)?;
             let item = self.dialogs[index].clone();
-            let top = index as f32 * DIALOG_ROW_HEIGHT + drag.yadd - dialogs_offset;
+            let top = index as f32 * lg(DIALOG_ROW_HEIGHT) + drag.shown_yadd() - dialogs_offset;
             Some(
                 div()
                     .absolute()
@@ -2586,9 +2893,18 @@ impl Render for MainView {
         let show_to_up = !narrow
             && dialogs_offset > TO_DOWN_SHOWN_AFTER / 2.
             && dialogs_offset < dialogs_max - 0.5;
-        let to_up = show_to_up.then(|| {
+        if narrow {
+            // `startScrollUpButtonAnimation`: no animation in the small column.
+            self.to_up_shown = Fade::new(0., TO_DOWN_DURATION);
+        } else {
+            self.to_up_shown.set(if show_to_up { 1. } else { 0. });
+        }
+        let up_shown = self.to_up_shown.value();
+        let to_up = (up_shown > 0.).then(|| {
+            // `updateScrollUpPosition`: top = height - (button + margin) * shown.
+            let slide = (lg(TO_DOWN_HEIGHT) + lg(TO_UP_BOTTOM)) * up_shown;
             self.render_jump_button("dialogs-to-up", Icon::UpArrow, 1., window, cx)
-                .bottom(px(TO_UP_BOTTOM))
+                .bottom(gpui::px(slide - lg(TO_DOWN_HEIGHT)))
                 .on_click(cx.listener(|this, _, _, cx| {
                     // `scrollToDefaultChecked`: not again while it runs.
                     if this.scroll_anim.is_none() {
@@ -2604,6 +2920,9 @@ impl Render for MainView {
             .flex_1()
             .min_h(px(0.))
             .overflow_hidden()
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.area_hovered(Area::Dialogs, *hovered, cx);
+            }))
             .on_scroll_wheel(cx.listener(|this, _, _, cx| {
                 this.stop_scroll_anim(Area::Dialogs);
                 this.scrolled(Area::Dialogs, cx);
@@ -2686,18 +3005,23 @@ impl Render for MainView {
                 .pb(px(8.));
                 let (_, max, offset) = self.scroll_metrics(Area::History);
                 let show_to_down = max - offset > TO_DOWN_SHOWN_AFTER;
-                let to_down = show_to_down.then(|| {
+                self.to_down_shown.set(if show_to_down { 1. } else { 0. });
+                let down_shown = self.to_down_shown.value();
+                let to_down = (down_shown > 0.).then(|| {
+                    let slide = (lg(TO_DOWN_HEIGHT) + lg(TO_DOWN_BOTTOM)) * down_shown;
                     self.render_jump_button("history-to-down", Icon::DownArrow, 0., window, cx)
-                        .bottom(px(TO_DOWN_BOTTOM))
+                        .bottom(gpui::px(slide - lg(TO_DOWN_HEIGHT)))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.start_scroll_anim(Area::History, f32::MAX);
                             cx.notify();
                         }))
                 });
                 let column = service_column(self.chat_width(window));
+                let date_opacity = self.scroll_date.value();
                 let floating_date = self.floating_date().map(|text| {
                     let w = text_width(window, &text, FONT_SIZE, FontWeight::SEMIBOLD).ceil() + 1.;
                     div()
+                        .opacity(date_opacity)
                         .absolute()
                         .top(px(SERVICE_MARGIN_TOP))
                         .left_0()
@@ -2711,8 +3035,12 @@ impl Render for MainView {
                     .with_chat_background(div(), day)
                     .id("history")
                     .relative()
+                    .overflow_hidden()
                     .flex_1()
                     .min_h(px(0.))
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        this.area_hovered(Area::History, *hovered, cx);
+                    }))
                     .child(messages)
                     .children(floating_date)
                     .children(scrollbar)

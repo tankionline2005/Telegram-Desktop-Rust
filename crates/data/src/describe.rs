@@ -94,6 +94,11 @@ fn parse<T: Deserializable>(raw: &Option<(i32, Vec<u8>)>) -> Option<T> {
         .flatten()
 }
 
+/// The cached user object of a peer row.
+pub fn user(row: &PeerRow) -> Option<enums::User> {
+    parse(&row.raw)
+}
+
 pub fn message_info(row: &MessageRow) -> MessageInfo {
     match parse::<enums::Message>(&row.raw) {
         Some(enums::Message::Message(m)) => MessageInfo {
@@ -270,6 +275,9 @@ pub struct PeerInfo {
     pub photo: Option<(i64, i32)>,
     pub verified: bool,
     pub first_name: Option<String>,
+    /// A basic group upgraded to a supergroup (`migrated_to`): tdesktop leaves it out
+    /// of the chat list (`History::shouldBeInChatList`), the supergroup goes on.
+    pub migrated: bool,
 }
 
 fn color(c: &Option<enums::PeerColor>) -> Option<u8> {
@@ -303,6 +311,7 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
                 },
                 verified: u.verified,
                 first_name: u.first_name.clone(),
+                migrated: false,
             },
             _ => PeerInfo::default(),
         },
@@ -311,6 +320,7 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
                 kind: PeerKind::Group,
                 members: Some(c.participants_count),
                 photo: chat_photo(&c.photo),
+                migrated: c.migrated_to.is_some(),
                 ..Default::default()
             },
             Some(enums::Chat::Channel(c)) => PeerInfo {

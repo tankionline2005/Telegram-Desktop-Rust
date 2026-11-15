@@ -31,9 +31,6 @@ pub enum Icon {
     /// The same in an outgoing bubble.
     HistorySent,
     HistoryReceived,
-    /// The bubble tail on the left (`historyBubbleTailInLeft`) and its mirror.
-    BubbleTail,
-    BubbleTailRight,
 }
 
 macro_rules! icon_bytes {
@@ -63,7 +60,6 @@ impl Icon {
             Icon::DialogsReceived => icon_bytes!("dialogs__dialogs_received"),
             Icon::HistorySent => icon_bytes!("history_sent"),
             Icon::HistoryReceived => icon_bytes!("history_received"),
-            Icon::BubbleTail | Icon::BubbleTailRight => icon_bytes!("bubble_tail"),
         }
     }
 }
@@ -138,10 +134,8 @@ fn tinted(icon: Icon, color: Color, scale_factor: f32) -> Arc<Tinted> {
             image::imageops::FilterType::Triangle,
         );
     }
-    match icon {
-        Icon::UpArrow => image::imageops::flip_vertical_in_place(&mut mask),
-        Icon::BubbleTailRight => image::imageops::flip_horizontal_in_place(&mut mask),
-        _ => {}
+    if icon == Icon::UpArrow {
+        image::imageops::flip_vertical_in_place(&mut mask);
     }
     let rgba = color.rgba();
     let (r, g, b, a) = (
@@ -179,4 +173,34 @@ pub fn icon(icon: Icon, color: Color, window: &Window) -> Img {
         .h(px(t.height / scale + 2. * pad))
         .m(px(-pad))
         .flex_none()
+}
+
+/// The bubble tail (`bubble_tail`, 6 x 10 style px) as an outline in style pixels,
+/// traced from the @3x mask: drawn as a path it is antialiased like the bubble it
+/// joins at any (fractional) scroll position, where an image would snap to pixels
+/// and sometimes stand a pixel off.
+pub fn bubble_tail_outline() -> &'static [(f32, f32)] {
+    static OUTLINE: LazyLock<Vec<(f32, f32)>> = LazyLock::new(|| {
+        let mask = decode(include_bytes!(
+            "../../../assets/tdesktop-icons/bubble_tail@3x.png"
+        ));
+        let (w, h) = (mask.width() as f32, mask.height() as f32);
+        let scale = 3.;
+        // The shape fills each row from its left edge to the right side: the row's
+        // coverage gives where that edge is.
+        let left = |y: u32| {
+            let covered: f32 = (0..mask.width())
+                .map(|x| mask.get_pixel(x, y)[2] as f32 / 255.)
+                .sum();
+            (w - covered) / scale
+        };
+        let mut points = vec![(w / scale, 0.), (w / scale, h / scale)];
+        points.push((left(mask.height() - 1), h / scale));
+        for y in (0..mask.height()).rev() {
+            points.push((left(y), (y as f32 + 0.5) / scale));
+        }
+        points.push((left(0), 0.));
+        points
+    });
+    &OUTLINE
 }

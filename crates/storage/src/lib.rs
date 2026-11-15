@@ -795,6 +795,17 @@ impl Writer<'_> {
     }
 
     /// Forgets the chat list (before reloading it after `differenceTooLong`).
+    /// A cached peer, read inside the write transaction.
+    pub fn peer(&self, key: PeerKey) -> Result<Option<PeerRow>> {
+        self.tx
+            .prepare_cached(
+                "SELECT kind, id, access_hash, is_min, is_megagroup, name, username, raw_layer, raw
+                 FROM peers WHERE kind = ?1 AND id = ?2",
+            )?
+            .query_row(params![key.kind as i64, key.id], read_peer)
+            .optional()
+    }
+
     pub fn clear_dialogs(&self) -> Result<()> {
         self.tx.execute("DELETE FROM dialogs", [])?;
         Ok(())
