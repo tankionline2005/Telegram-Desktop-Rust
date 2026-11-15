@@ -117,6 +117,7 @@ async fn main() -> Result<()> {
         ["probe", "peer-dialog", id] => probe_peer_dialog(id.parse().context("user id")?).await,
         ["probe", "keep", id] => probe_keep(id.parse().context("user id")?, true).await,
         ["probe", "relist", id] => probe_keep(id.parse().context("user id")?, false).await,
+        ["probe", "entities"] => probe_entities(),
         ["logout"] => logout().await,
         ["selftest", "reconnect"] => selftest_reconnect().await,
         ["selftest", "unknown-key"] => selftest_unknown_key().await,
@@ -665,6 +666,56 @@ async fn probe_saved(offset: i32) -> Result<()> {
             ids.first(),
             ids.last()
         );
+    }
+    Ok(())
+}
+
+/// The formatting entities of the latest cached Saved Messages: ids, kinds, UTF-16
+/// offsets and lengths only (no texts, no links).
+fn probe_entities() -> Result<()> {
+    use tdr_data::describe::EntityKind as K;
+    let store = open_cache()?;
+    let me = store.meta_i64("self_id")?.context("no self id")?;
+    let h = store.history(PeerKey::user(me), 30)?;
+    for m in &h.messages {
+        let info = tdr_data::describe::message_info(m);
+        if info.entities.is_empty() {
+            continue;
+        }
+        let units = m.text.encode_utf16().count();
+        let kinds: Vec<String> = info
+            .entities
+            .iter()
+            .map(|e| {
+                let kind = match &e.kind {
+                    K::TextUrl(_) => "TextUrl".to_string(),
+                    K::Pre { language } => format!("Pre(lang {} chars)", language.chars().count()),
+                    K::MentionName(_) => "MentionName".to_string(),
+                    K::FormattedDate { flags, .. } => format!("Date(flags {})", flags.any()),
+                    k => format!("{k:?}"),
+                };
+                format!("{kind}@{}+{}", e.offset, e.length)
+            })
+            .collect();
+        println!("msg {} ({units} units): {}", m.id, kinds.join(" "));
+        if let Some((_, raw)) = &m.raw
+            && let Ok(tdr_tl::enums::Message::Message(full)) =
+                <tdr_tl::enums::Message as tdr_tl::Deserializable>::from_bytes(
+                    &tdr_tl::Bytes::copy_from_slice(raw),
+                )
+        {
+            let all: Vec<String> = full
+                .entities
+                .iter()
+                .flatten()
+                .map(|e| format!("{e:?}").split('(').next().unwrap_or("").to_string())
+                .collect();
+            println!(
+                "  raw kinds: {} media: {}",
+                all.join(" "),
+                full.media.is_some()
+            );
+        }
     }
     Ok(())
 }

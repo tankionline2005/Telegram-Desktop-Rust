@@ -340,6 +340,10 @@ impl TextInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        // Nothing selected here: the chat's selected text gets the key.
+        if self.selected_range.is_empty() {
+            cx.propagate();
+        }
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.valid(self.selected_range.clone())].to_string(),

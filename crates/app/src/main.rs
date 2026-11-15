@@ -8,11 +8,17 @@
 
 mod bridge;
 mod icons;
+#[cfg(windows)]
+mod instance;
+mod lottie;
 mod one_line;
 mod placement;
 mod present;
+mod rich_text;
 mod scale;
+mod spoiler;
 mod text_input;
+mod toast;
 #[cfg(windows)]
 mod tray;
 mod ui;
@@ -172,6 +178,12 @@ fn main() {
         a.strip_prefix("--open=")
             .and_then(|n| n.parse::<usize>().ok())
     });
+    // One copy per data folder: a second start shows the running one's window
+    // (demo runs are tests and stay apart).
+    #[cfg(windows)]
+    if !demo && !instance::claim(&data_dir(), tray::Tray::show_window) {
+        return;
+    }
     let (commands, updates) = if demo {
         bridge::start_demo()
     } else {
@@ -198,6 +210,12 @@ fn main() {
                 ),
                 Cow::Borrowed(
                     include_bytes!("../../../assets/fonts/OpenSans-SemiBold.ttf").as_slice(),
+                ),
+                Cow::Borrowed(
+                    include_bytes!("../../../assets/fonts/OpenSans-Italic.ttf").as_slice(),
+                ),
+                Cow::Borrowed(
+                    include_bytes!("../../../assets/fonts/OpenSans-SemiBoldItalic.ttf").as_slice(),
                 ),
             ])
             .expect("bundled fonts are valid");

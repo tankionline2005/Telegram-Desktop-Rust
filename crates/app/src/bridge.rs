@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use crate::present;
+use crate::rich_text::{Kind as TextKind, TextEntity};
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -34,11 +35,17 @@ pub enum Command {
     CloseChat,
     /// The user scrolled to the top of the open chat: load older messages.
     LoadOlder(PeerKey),
-    /// Open a chat at a message (the "go to original" button): its history around
-    /// it, the message focused.
+    /// Open a chat on top of the open one (the "go to original" button, a mention,
+    /// a t.me link): at a message (its history around it, the message focused) or
+    /// at its latest messages. Back returns.
     OpenChatAt {
         peer: PeerKey,
-        msg_id: i32,
+        msg_id: Option<i32>,
+    },
+    /// A `@username` or `t.me/username[/post]` link: resolve it, then the UI opens it.
+    OpenUsername {
+        username: String,
+        post: Option<i32>,
     },
     /// A chat shown around an older message was scrolled to its bottom: load newer.
     LoadNewer(PeerKey),
@@ -102,6 +109,13 @@ pub enum Update {
     ChatInfo(Box<DialogItem>),
     /// Connection state for the header ("Connecting…"), empty when online.
     Status(String),
+    /// A username resolved: open this chat (at this message).
+    Resolved {
+        peer: PeerKey,
+        msg_id: Option<i32>,
+    },
+    /// Show a toast with this text.
+    Toast(String),
     Fatal(String),
 }
 
@@ -173,6 +187,8 @@ pub struct MessageItem {
     pub forwarded: Option<ForwardLine>,
     /// The "go to original" button's target (`saved_from_peer`, `saved_from_msg_id`).
     pub original: Option<(PeerKey, i32)>,
+    /// Formatting and links of `text`, as byte ranges of it.
+    pub entities: Vec<TextEntity>,
 }
 
 /// The "Forwarded from" line (`HistoryMessageForwarded::text`).
@@ -274,6 +290,80 @@ fn message_content(
 
 /// Text of a message row: older cache rows stored placeholders for media and service
 /// messages.
+/// The text a message shows and its entities as byte ranges. A formatted date with
+/// a format replaces its text (`BlockParser`'s replaced entities).
+fn message_text(text: &str, entities: &[describe::Entity]) -> (String, Vec<TextEntity>) {
+    use describe::EntityKind as E;
+    let now = Local::now().timestamp() as i32;
+    let mut ranged: Vec<(std::ops::Range<usize>, &E)> = entities
+        .iter()
+        .filter_map(|e| Some((e.byte_range(text)?, &e.kind)))
+        .collect();
+    ranged.sort_by_key(|(r, _)| r.start);
+    // Replacements: (original range, new text), not overlapping.
+    let mut replaced: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for (r, kind) in &ranged {
+        if let E::FormattedDate { date, flags } = kind
+            && flags.any()
+            && replaced.last().is_none_or(|(last, _)| last.end <= r.start)
+        {
+            replaced.push((r.clone(), present::formatted_date(*date, *flags, now)));
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (r, shown) in &replaced {
+        out.push_str(&text[at..r.start]);
+        out.push_str(shown);
+        at = r.end;
+    }
+    out.push_str(&text[at..]);
+    // An offset in `text` as an offset in `out`: inside a replaced range it moves to
+    // that range's start (or end).
+    let map = |i: usize| -> usize {
+        let mut shift: isize = 0;
+        for (r, shown) in &replaced {
+            if i >= r.end {
+                shift += shown.len() as isize - r.len() as isize;
+            } else if i > r.start {
+                return (r.start as isize + shift) as usize;
+            }
+        }
+        (i as isize + shift) as usize
+    };
+    let converted = ranged
+        .iter()
+        .map(|(r, kind)| {
+            let kind = match kind {
+                E::Bold => TextKind::Bold,
+                E::Italic => TextKind::Italic,
+                E::Underline => TextKind::Underline,
+                E::Strike => TextKind::Strike,
+                E::Spoiler => TextKind::Spoiler,
+                E::Code => TextKind::Code,
+                E::Pre { language } => TextKind::Pre(language.clone()),
+                E::Blockquote { .. } => TextKind::Blockquote,
+                E::Url => TextKind::Url(text[r.clone()].to_string()),
+                E::TextUrl(url) => TextKind::Url(url.clone()),
+                E::Email => TextKind::Email,
+                E::Mention => TextKind::Mention,
+                E::MentionName(id) => TextKind::MentionName(*id),
+                E::Hashtag => TextKind::Hashtag,
+                E::Cashtag => TextKind::Cashtag,
+                E::BotCommand => TextKind::BotCommand,
+                E::Phone => TextKind::Phone,
+                E::BankCard => TextKind::BankCard,
+                E::FormattedDate { date, .. } => TextKind::Date(*date),
+            };
+            TextEntity {
+                range: map(r.start)..map(r.end).max(map(r.start)),
+                kind,
+            }
+        })
+        .collect();
+    (out, converted)
+}
+
 fn row_text(m: &MessageRow) -> String {
     match m.text.as_str() {
         "[media]" | "[service message]" => String::new(),
@@ -507,15 +597,17 @@ fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec
                 });
             // Calls are bubbles with their caption, not service lines.
             let call = info.service.as_ref().is_some_and(present::is_call);
+            let (text, entities) = if call {
+                (service.clone().unwrap_or_default(), Vec::new())
+            } else {
+                message_text(&row_text(m), &info.entities)
+            };
             MessageItem {
                 id: m.id,
                 out,
                 date: m.date,
-                text: if call {
-                    service.clone().unwrap_or_default()
-                } else {
-                    row_text(m)
-                },
+                text,
+                entities,
                 media,
                 service: service.filter(|_| !call),
                 edited: info.edited,
@@ -1157,9 +1249,21 @@ async fn run(
                             let _ = tx.send(Update::ChatInfo(Box::new(item)));
                         }
                         // In the cached history: shown from the newest down to it.
-                        if let Some(n) = sync.store().count_from(peer, msg_id)? {
+                        let cached_from = match msg_id {
+                            Some(id) => sync.store().count_from(peer, id)?,
+                            None => None,
+                        };
+                        if let Some(n) = cached_from {
                             shown = Shown::Latest(open_count(sync.store(), peer).max(n + 30));
+                        } else if msg_id.is_none() {
+                            // The latest messages: the cached ones now, then fresh.
+                            shown = Shown::Latest(open_count(sync.store(), peer));
+                            send_history(sync.store(), peer, &shown, None, &tx)?;
+                            if let Err(e) = sync.history(peer, open_count(sync.store(), peer)).await {
+                                error!("history: {e}");
+                            }
                         } else {
+                            let msg_id = msg_id.unwrap_or(0);
                             match sync.history_around(peer, msg_id, WINDOW_PAGE * 2).await {
                                 Ok(Some(rows)) => {
                                     shown = Shown::Window {
@@ -1178,7 +1282,7 @@ async fn run(
                                 }
                             }
                         }
-                        send_history(sync.store(), peer, &shown, Some(msg_id), &tx)?;
+                        send_history(sync.store(), peer, &shown, msg_id, &tx)?;
                         // Its peer came with the history if it was unknown.
                         if let Some(item) = chat_info(sync.store(), peer) {
                             let _ = tx.send(Update::ChatInfo(Box::new(item)));
@@ -1204,6 +1308,20 @@ async fn run(
                             }
                             Ok(None) => {}
                             Err(e) => error!("full info: {e}"),
+                        }
+                    }
+                    Command::OpenUsername { username, post } => {
+                        match sync.resolve_username(&username).await {
+                            Ok(Some(peer)) => {
+                                let _ = tx.send(Update::Resolved { peer, msg_id: post });
+                            }
+                            Ok(None) => {
+                                // tdesktop says it in a box (`lng_username_not_found`).
+                                let _ = tx.send(Update::Toast(format!(
+                                    "Username @{username} not found."
+                                )));
+                            }
+                            Err(e) => error!("resolve: {e}"),
                         }
                     }
                     Command::Send { peer, text } => {
@@ -1260,6 +1378,65 @@ async fn run(
     }
     save(&client);
     Ok(())
+}
+
+/// Demo messages with formatting: (outgoing, text, entities).
+fn demo_formatted(date: i32) -> Vec<(bool, String, Vec<TextEntity>)> {
+    use TextKind as K;
+    let build = |parts: &[(&str, &[K])]| {
+        let mut text = String::new();
+        let mut entities = Vec::new();
+        for (part, kinds) in parts {
+            let start = text.len();
+            text.push_str(part);
+            for kind in kinds.iter() {
+                entities.push(TextEntity {
+                    range: start..text.len(),
+                    kind: kind.clone(),
+                });
+            }
+        }
+        (text, entities)
+    };
+    let link = K::Url("https://telegram.org".into());
+    let (a, ae) = build(&[
+        ("Underlined line", &[K::Underline]),
+        ("\n", &[]),
+        ("Bold italic struck", &[K::Bold, K::Italic, K::Strike]),
+        (" then bold", &[K::Bold]),
+        ("\n", &[]),
+        ("x", &[K::Spoiler]),
+        (" text with ", &[]),
+        ("an underlined part", &[K::Underline]),
+        ("\nplain line\n", &[]),
+        ("A quoted line", &[K::Blockquote]),
+        ("\n", &[]),
+        ("Bold line", &[K::Bold]),
+        ("\ncode ", &[]),
+        ("abc", &[K::Spoiler]),
+        ("\n", &[]),
+        ("hidden link", std::slice::from_ref(&link)),
+        ("\n", &[]),
+        ("a whole hidden line", &[K::Spoiler]),
+        ("\n", &[]),
+        ("a marked date", &[K::Date(date)]),
+    ]);
+    let (b, be) = build(&[
+        ("Inline ", &[]),
+        ("code", &[K::Code]),
+        (", a mention ", &[]),
+        ("@durov", &[K::Mention]),
+        (", a link ", &[]),
+        ("https://telegram.org", std::slice::from_ref(&link)),
+        (" and a block:\n", &[]),
+        (
+            "fn main() {\n    println!(\"Hello\");\n}",
+            &[K::Pre("rust".into())],
+        ),
+        ("\nAnd one without a language:\n", &[]),
+        ("line one\nline two", &[K::Pre(String::new())]),
+    ]);
+    vec![(false, a, ae), (true, b, be)]
 }
 
 fn demo_author(out: bool) -> Author {
@@ -1508,9 +1685,30 @@ pub fn start_demo() -> (
                     author: demo_author(out),
                     forwarded: None,
                     original: None,
+                    entities: Vec::new(),
                 }
             })
             .collect();
+        // Formatting: a message like the user's test one, then code and links.
+        for (k, (out, text, entities)) in demo_formatted(today(10, 0)).into_iter().enumerate() {
+            let date = today(10, 0) + k as i32 * 60;
+            history.push(MessageItem {
+                id: 1000 + count + k as i32,
+                out,
+                text,
+                media: None,
+                service: None,
+                edited: false,
+                read: out.then_some(true),
+                time: present::message_time(date),
+                date,
+                sender: None,
+                author: demo_author(out),
+                forwarded: None,
+                original: None,
+                entities,
+            });
+        }
         // Older demo messages appear 20 at a time when the user scrolls up.
         let mut older_left = 60;
         let mut next_id = 2000;
@@ -1529,7 +1727,11 @@ pub fn start_demo() -> (
                 | Command::LoadNewer(_)
                 | Command::Back
                 | Command::ReopenChat(_) => continue,
-                Command::OpenChatAt { peer, msg_id } => focus = Some((peer, msg_id)),
+                Command::OpenChatAt { peer, msg_id } => focus = msg_id.map(|m| (peer, m)),
+                Command::OpenUsername { username, .. } => {
+                    let _ = up_tx.send(Update::Toast(format!("Username @{username} not found.")));
+                    continue;
+                }
                 Command::OpenChat(_)
                 | Command::CloseChat
                 | Command::SaveDraft { .. }
@@ -1556,6 +1758,7 @@ pub fn start_demo() -> (
                                 author: demo_author(k % 3 == 0),
                                 forwarded: None,
                                 original: None,
+                                entities: Vec::new(),
                             }
                         })
                         .collect();
@@ -1580,6 +1783,7 @@ pub fn start_demo() -> (
                         author: demo_author(true),
                         forwarded: None,
                         original: None,
+                        entities: Vec::new(),
                     });
                 }
             }

@@ -178,6 +178,35 @@ impl Sync {
     /// listed by its last message. Unlike tdesktop, which forgets it on restart, it
     /// is kept in the cache: the chat exists, the list just leaves it out. Returns
     /// whether one came.
+    /// `contacts.resolveUsername` (`SessionNavigation::resolveUsername`): the peer
+    /// with this username, stored in the cache; `None` when nobody has it.
+    pub async fn resolve_username(&mut self, username: &str) -> Result<Option<PeerKey>> {
+        let request = functions::contacts::ResolveUsername {
+            username: username.to_string(),
+            referer: None,
+        };
+        let enums::contacts::ResolvedPeer::ResolvedPeer(answer) =
+            match self.client.invoke(&request).await {
+                Ok(answer) => answer,
+                // USERNAME_NOT_OCCUPIED, USERNAME_INVALID.
+                Err(ApiError::Rpc(e)) if e.code == 400 => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+        let rows: Vec<_> = answer
+            .users
+            .iter()
+            .filter_map(convert::user_row)
+            .chain(answer.chats.iter().filter_map(convert::chat_row))
+            .collect();
+        self.store.write(|w| {
+            for p in &rows {
+                w.put_peer(p)?;
+            }
+            Ok(())
+        })?;
+        Ok(Some(convert::peer_key(&answer.peer)))
+    }
+
     pub async fn request_dialog_entry(&mut self, peer: PeerKey) -> Result<bool> {
         if self.listed.contains(&peer) {
             return Ok(false);

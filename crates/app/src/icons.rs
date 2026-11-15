@@ -38,6 +38,10 @@ pub enum Icon {
     /// The same in an outgoing bubble.
     HistorySent,
     HistoryReceived,
+    /// In the top right corner of a block quote (`chat/mini_quote`).
+    MiniQuote,
+    /// In the top right corner of a code block (`chat/mini_copy`).
+    MiniCopy,
 }
 
 macro_rules! icon_bytes {
@@ -70,6 +74,8 @@ impl Icon {
             Icon::GoToOriginal => icon_bytes!("filled_go_to_message"),
             Icon::Back => icon_bytes!("info__info_back"),
             Icon::SlideShadow => icon_bytes!("slide_shadow"),
+            Icon::MiniQuote => icon_bytes!("chat__mini_quote"),
+            Icon::MiniCopy => icon_bytes!("chat__mini_copy"),
         }
     }
 }
@@ -169,6 +175,22 @@ fn tinted(icon: Icon, color: Color, scale_factor: f32) -> Arc<Tinted> {
     });
     CACHE.lock().unwrap().insert(key, tinted.clone());
     tinted
+}
+
+/// The tinted icon for painting by hand: the image, the icon's logical width and
+/// height, and the transparent border around it (logical pixels).
+pub fn tinted_image(
+    icon: Icon,
+    color: Color,
+    scale_factor: f32,
+) -> Option<(Arc<RenderImage>, f32, f32, f32)> {
+    let t = tinted(icon, color, scale_factor);
+    Some((
+        t.image.clone(),
+        t.width / scale_factor,
+        t.height / scale_factor,
+        PAD as f32 / scale_factor,
+    ))
 }
 
 /// The icon tinted with `color`, at tdesktop's size for the current scale: a box

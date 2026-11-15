@@ -29,11 +29,18 @@ use crate::present;
 use crate::scale::{self, dpx, lg, px};
 use crate::text_input::{Submit, TextInput};
 
+mod message_text;
+
 gpui::actions!(main_view, [Escape]);
 
 /// Window-wide keys (the text field's own keys are in `text_input::bind_keys`).
+/// Ctrl+C anywhere copies selected message text; in the text field it copies the
+/// field's selection, or bubbles up here when the field has none.
 pub fn bind_keys(cx: &mut gpui::App) {
-    cx.bind_keys([gpui::KeyBinding::new("escape", Escape, None)]);
+    cx.bind_keys([
+        gpui::KeyBinding::new("escape", Escape, None),
+        gpui::KeyBinding::new("secondary-c", crate::text_input::Copy, None),
+    ]);
 }
 
 // widgets.style: windowTitleHeight, windowTitleButtonWidth
@@ -152,60 +159,6 @@ fn text_width(window: &Window, text: &str, size: f32, weight: FontWeight) -> f32
             )
         })
         .fold(0., f32::max)
-}
-
-/// The widths of the lines `text` wraps into at `wrap` (GPUI's own wrapping, the one
-/// that paints it), paragraph by paragraph.
-fn wrapped_line_widths(
-    window: &Window,
-    text: &str,
-    size: f32,
-    weight: FontWeight,
-    wrap: f32,
-) -> Vec<f32> {
-    let mut f = font(FONT_FAMILY);
-    f.weight = weight;
-    let mut out = Vec::new();
-    for paragraph in text.split('\n') {
-        if paragraph.is_empty() {
-            out.push(0.);
-            continue;
-        }
-        let run = TextRun {
-            len: paragraph.len(),
-            font: f.clone(),
-            color: gpui::black(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let shaped = window.text_system().shape_text(
-            SharedString::from(paragraph.to_string()),
-            px(size),
-            &[run],
-            Some(gpui::px(wrap)),
-            None,
-        );
-        let Ok(lines) = shaped else {
-            out.push(text_width(window, paragraph, size, weight));
-            continue;
-        };
-        for line in lines {
-            let layout = &line.unwrapped_layout;
-            let mut start = 0.;
-            for b in line.wrap_boundaries() {
-                let x = layout
-                    .runs
-                    .get(b.run_ix)
-                    .and_then(|r| r.glyphs.get(b.glyph_ix))
-                    .map_or(start, |g| f32::from(g.position.x));
-                out.push(x - start);
-                start = x;
-            }
-            out.push(f32::from(layout.width) - start);
-        }
-    }
-    out
 }
 
 /// tdesktop's two-color userpic gradients, by color index
@@ -799,6 +752,8 @@ pub struct MainView {
     /// Font with the Windows caption-button glyphs.
     icon_font: SharedString,
     first_list_frame_logged: bool,
+    /// Message texts: layouts, selection, clicks, toasts.
+    text_ui: message_text::TextUi,
     /// Demo/screenshot helper: open the chat at this list index once the list arrives.
     pub open_on_start: Option<usize>,
 }
@@ -901,6 +856,7 @@ impl MainView {
             center_on: None,
             day_background: None,
             day_background_busy: false,
+            text_ui: Default::default(),
             unread_target: None,
             unread_bar: None,
             read_till: 0,
@@ -1057,15 +1013,17 @@ impl MainView {
     fn go_to_original(
         &mut self,
         peer: PeerKey,
-        msg_id: i32,
+        msg_id: Option<i32>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.selected == Some(peer) {
-            self.pending_focus = Some(msg_id);
-            self.stick_to_bottom = false;
-            let _ = self.commands.send(Command::OpenChatAt { peer, msg_id });
-            cx.notify();
+            if msg_id.is_some() {
+                self.pending_focus = msg_id;
+                self.stick_to_bottom = false;
+                let _ = self.commands.send(Command::OpenChatAt { peer, msg_id });
+                cx.notify();
+            }
             return;
         }
         self.save_draft(cx);
@@ -1093,7 +1051,9 @@ impl MainView {
         self.unread_target = None;
         self.unread_bar = None;
         self.read_till = read_till;
-        self.pending_focus = Some(msg_id);
+        self.pending_focus = msg_id;
+        // At its latest messages when no message is asked for.
+        self.stick_to_bottom = msg_id.is_none();
         self.highlight = None;
         self.scroll_anim = None;
         self.history_bar.drag = None;
@@ -1579,9 +1539,15 @@ impl MainView {
                         self.stick_to_bottom = false;
                     }
                     if let Some(id) = focus {
-                        self.pending_focus = Some(id);
-                        self.unread_target = None;
-                        self.stick_to_bottom = false;
+                        if messages.iter().any(|m| m.id == id) {
+                            self.pending_focus = Some(id);
+                            self.unread_target = None;
+                            self.stick_to_bottom = false;
+                        } else {
+                            // `countInitialScrollTop`: shown as usual, with a toast.
+                            self.pending_focus = None;
+                            self.show_toast("Message doesn't exist.", None);
+                        }
                     }
                     self.set_messages(messages);
                     // A short chat may not fill the view, so no scroll would ever ask for more.
@@ -1613,6 +1579,10 @@ impl MainView {
                 self.userpics.insert(peer, (photo_id, image));
             }
             Update::Status(s) => self.status = s,
+            Update::Toast(text) => self.show_toast(&text, None),
+            Update::Resolved { peer, msg_id } => {
+                self.text_ui.pending_open = Some((peer, msg_id));
+            }
             Update::Fatal(e) => self.fatal = Some(e),
         }
         cx.notify();
@@ -1873,7 +1843,8 @@ impl MainView {
     /// Esc: closes the main menu, or else the open chat (back to "Select a chat"), as
     /// in tdesktop.
     fn escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
-        if self.main_menu_open {
+        if self.clear_text_selection() {
+        } else if self.main_menu_open {
             self.main_menu_open = false;
         } else if !self.back_stack.is_empty() {
             self.go_back(window, cx);
@@ -2655,15 +2626,13 @@ impl MainView {
             };
         let skip_w = lg(MSG_DATE_SPACE) + info_w - lg(MSG_DATE_DELTA_X);
         let skip_h = date_font.height - lg(MSG_DATE_DELTA_Y);
-        let lines = wrapped_line_widths(window, &text, FONT_SIZE, FontWeight::NORMAL, max_text);
-        let last = lines.last().copied().unwrap_or(0.);
-        let skip_inline = last + skip_w <= max_text;
-        let text_w = lines
-            .iter()
-            .copied()
-            .fold(0., f32::max)
-            .max(if skip_inline { last + skip_w } else { skip_w });
-        let text_h = lines.len() as f32 * text_font.height + if skip_inline { 0. } else { skip_h };
+        // The text (`rich_text`): its natural width has the skip block at its end.
+        let text_key = (pane.peer.unwrap_or(PeerKey::user(0)), item.id);
+        let caption_only = item.text.is_empty();
+        let entities: &[crate::rich_text::TextEntity] =
+            if caption_only { &[] } else { &item.entities };
+        let measured = self.rich_measured(text_key, &text, entities, window);
+        let text_w = measured.natural_width(skip_w);
         let name_w = sender.map_or(0., |(name, _)| {
             text_width(window, name, FONT_SIZE, FontWeight::SEMIBOLD)
         });
@@ -2679,11 +2648,17 @@ impl MainView {
         });
         let media_w =
             media_line.map_or(0., |m| text_width(window, m, FONT_SIZE, FontWeight::NORMAL));
-        // +1 px: sub-pixel rounding must not push the last word to a new line.
-        let inner = ((text_w.max(name_w).max(media_w).max(forwarded_w) + 1.).min(max_text + 1.)
+        // Whole device pixels; the text is laid out at this width.
+        let inner = (text_w
+            .max(name_w)
+            .max(media_w)
+            .max(forwarded_w)
+            .min(max_text)
             * scale::get())
         .ceil()
             / scale::get();
+        let text_layout = self.rich_layout(text_key, &measured, inner, (skip_w, skip_h));
+        let text_h = text_layout.height;
 
         let small = px(MSG_RADIUS_SMALL);
         let large = px(MSG_RADIUS_LARGE);
@@ -2739,10 +2714,29 @@ impl MainView {
                     .child(icon(kind, p.history_out_icon_fg, window))
             }));
         // Captions stand in for media: in the date color when they are the whole text.
-        let text_color = if item.text.is_empty() && media.is_some() {
-            date_fg
-        } else {
-            fg
+        let text_colors = self.text_colors(item, item.text.is_empty() && media.is_some());
+        let (text_state, text_dragging) = self.text_state(text_key);
+        let text_view = {
+            let view = view.clone();
+            let layout = text_layout.clone();
+            let live = pane.live;
+            crate::rich_text::view(
+                SharedString::from(format!(
+                    "msg-text-{}-{}-{}",
+                    text_key.0.id, item.id, live as u8
+                )),
+                text_layout,
+                text_colors,
+                if live { text_state } else { Default::default() },
+                live && text_dragging,
+                move |event, window, cx| {
+                    if live {
+                        let _ = view.update(cx, |this, cx| {
+                            this.on_text_event(text_key, &layout, event, window, cx);
+                        });
+                    }
+                },
+            )
         };
         let bubble = div()
             .relative()
@@ -2809,13 +2803,7 @@ impl MainView {
                     .text_color(c(date_fg))
                     .child(one_line(m.clone()))
             }))
-            .child(
-                div()
-                    .w(gpui::px(inner))
-                    .h(gpui::px(text_h))
-                    .text_color(c(text_color))
-                    .child(text),
-            )
+            .child(text_view)
             .child(info);
         // The tail (`bubble_tail`) hangs outside the square corner; the shadow line
         // continues under it (`PaintBubbleGeneric`).
@@ -2873,7 +2861,7 @@ impl MainView {
                 .on_click(move |_, window, cx| {
                     if live {
                         let _ = view.update(cx, |this, cx| {
-                            this.go_to_original(peer, msg_id, window, cx);
+                            this.go_to_original(peer, Some(msg_id), window, cx);
                         });
                     }
                 })
@@ -3525,6 +3513,17 @@ impl Render for MainView {
             );
         }
         self.tick_scroll_anim(window, cx);
+        if let Some((peer, msg_id)) = self.text_ui.pending_open.take() {
+            self.go_to_original(peer, msg_id, window, cx);
+        }
+        if self
+            .text_ui
+            .toast
+            .as_ref()
+            .is_some_and(|t| t.level().is_none())
+        {
+            self.text_ui.toast = None;
+        }
         if self
             .slide
             .as_ref()
@@ -3902,6 +3901,9 @@ impl Render for MainView {
             .text_color(c(p.window_fg))
             // On the root: with nothing focused, GPUI dispatches keys to the root only.
             .on_action(cx.listener(Self::escape))
+            .on_action(cx.listener(|this, _: &crate::text_input::Copy, _, cx| {
+                this.copy_selected_text(cx);
+            }))
             .child(self.render_title_bar(window, cx))
             // Focus tracking stays below the title bar: a focusable element swallows mouse
             // downs (prevent_default), and GPUI then skips the native caption-button
@@ -3942,5 +3944,18 @@ impl Render for MainView {
                     }),
             )
             .children(self.render_drag_capture(cx))
+            .children(self.text_ui.toast.as_ref().and_then(|t| {
+                let size = window.viewport_size();
+                let title = lg(TITLE_HEIGHT);
+                crate::toast::render(
+                    t,
+                    p,
+                    0.,
+                    title,
+                    f32::from(size.width),
+                    f32::from(size.height) - title,
+                    window,
+                )
+            }))
     }
 }

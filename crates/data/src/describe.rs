@@ -86,6 +86,155 @@ pub struct MessageInfo {
     /// A channel post (views, signature).
     pub post: bool,
     pub forward: Option<Forward>,
+    /// Formatting and links of the text (`message.entities`).
+    pub entities: Vec<Entity>,
+}
+
+/// A formatting or link entity of a message text (`MessageEntity`). Offsets are in
+/// UTF-16 code units, as the API sends them; [`Entity::byte_range`] converts them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entity {
+    pub offset: i32,
+    pub length: i32,
+    pub kind: EntityKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntityKind {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    Spoiler,
+    /// Inline code: copied on click.
+    Code,
+    /// A code block with its language (empty: none).
+    Pre {
+        language: String,
+    },
+    Blockquote {
+        collapsed: bool,
+    },
+    /// The text is the link.
+    Url,
+    /// A link hidden behind other text.
+    TextUrl(String),
+    Email,
+    /// `@username`.
+    Mention,
+    /// A mention of a user without a username.
+    MentionName(i64),
+    Hashtag,
+    Cashtag,
+    BotCommand,
+    Phone,
+    BankCard,
+    /// A date (`messageEntityFormattedDate`): with no flags the text stays and is a
+    /// link; with flags the client shows the date in that format instead.
+    FormattedDate {
+        date: i32,
+        flags: DateFlags,
+    },
+}
+
+/// How a formatted date is shown (`FormattedDateFlag`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DateFlags {
+    pub relative: bool,
+    pub short_time: bool,
+    pub long_time: bool,
+    pub short_date: bool,
+    pub long_date: bool,
+    pub day_of_week: bool,
+}
+
+impl DateFlags {
+    pub fn any(self) -> bool {
+        self != Self::default()
+    }
+}
+
+impl Entity {
+    /// The entity's byte range in `text`, or `None` when it falls outside it.
+    pub fn byte_range(&self, text: &str) -> Option<std::ops::Range<usize>> {
+        let start = utf16_to_byte(text, self.offset.max(0) as usize)?;
+        let end = utf16_to_byte(text, (self.offset.max(0) + self.length.max(0)) as usize)?;
+        (start < end).then_some(start..end)
+    }
+}
+
+/// The byte offset of UTF-16 offset `units` (rounded up to a char boundary), `None`
+/// past the end.
+fn utf16_to_byte(text: &str, units: usize) -> Option<usize> {
+    let mut counted = 0;
+    for (i, ch) in text.char_indices() {
+        if counted >= units {
+            return Some(i);
+        }
+        counted += ch.len_utf16();
+    }
+    (counted >= units).then_some(text.len())
+}
+
+fn entities(list: &[enums::MessageEntity]) -> Vec<Entity> {
+    use enums::MessageEntity as E;
+    list.iter()
+        .filter_map(|e| {
+            let (offset, length, kind) = match e {
+                E::Bold(e) => (e.offset, e.length, EntityKind::Bold),
+                E::Italic(e) => (e.offset, e.length, EntityKind::Italic),
+                E::Underline(e) => (e.offset, e.length, EntityKind::Underline),
+                E::Strike(e) => (e.offset, e.length, EntityKind::Strike),
+                E::Spoiler(e) => (e.offset, e.length, EntityKind::Spoiler),
+                E::Code(e) => (e.offset, e.length, EntityKind::Code),
+                E::Pre(e) => (
+                    e.offset,
+                    e.length,
+                    EntityKind::Pre {
+                        language: e.language.clone(),
+                    },
+                ),
+                E::Blockquote(e) => (
+                    e.offset,
+                    e.length,
+                    EntityKind::Blockquote {
+                        collapsed: e.collapsed,
+                    },
+                ),
+                E::Url(e) => (e.offset, e.length, EntityKind::Url),
+                E::TextUrl(e) => (e.offset, e.length, EntityKind::TextUrl(e.url.clone())),
+                E::Email(e) => (e.offset, e.length, EntityKind::Email),
+                E::Mention(e) => (e.offset, e.length, EntityKind::Mention),
+                E::MentionName(e) => (e.offset, e.length, EntityKind::MentionName(e.user_id)),
+                E::Hashtag(e) => (e.offset, e.length, EntityKind::Hashtag),
+                E::Cashtag(e) => (e.offset, e.length, EntityKind::Cashtag),
+                E::BotCommand(e) => (e.offset, e.length, EntityKind::BotCommand),
+                E::Phone(e) => (e.offset, e.length, EntityKind::Phone),
+                E::BankCard(e) => (e.offset, e.length, EntityKind::BankCard),
+                E::FormattedDate(e) => (
+                    e.offset,
+                    e.length,
+                    EntityKind::FormattedDate {
+                        date: e.date,
+                        flags: DateFlags {
+                            relative: e.relative,
+                            short_time: e.short_time,
+                            long_time: e.long_time,
+                            short_date: e.short_date,
+                            long_date: e.long_date,
+                            day_of_week: e.day_of_week,
+                        },
+                    },
+                ),
+                _ => return None,
+            };
+            Some(Entity {
+                offset,
+                length,
+                kind,
+            })
+        })
+        .collect()
 }
 
 /// Where a forwarded message came from (`HistoryMessageForwarded`).
@@ -157,6 +306,7 @@ pub fn message_info(row: &MessageRow) -> MessageInfo {
                         .map(|(p, id)| (crate::convert::peer_key(p), id)),
                 }
             }),
+            entities: m.entities.as_deref().map(entities).unwrap_or_default(),
         },
         Some(enums::Message::Service(m)) => MessageInfo {
             service: Some(service(&m.action)),
@@ -425,6 +575,22 @@ mod tests {
     use super::*;
     use tdr_storage::PeerKey;
     use tdr_tl::{Serializable, types};
+
+    #[test]
+    fn entity_offsets_are_utf16() {
+        // "😀" is two UTF-16 units and four bytes; "ж" one unit and two bytes.
+        let text = "😀 жbold";
+        let e = |offset, length| Entity {
+            offset,
+            length,
+            kind: EntityKind::Bold,
+        };
+        assert_eq!(e(4, 4).byte_range(text), Some(7..11));
+        assert_eq!(e(0, 2).byte_range(text), Some(0..4));
+        assert_eq!(e(3, 1).byte_range(text), Some(5..7));
+        assert_eq!(e(4, 10).byte_range(text), None);
+        assert_eq!(e(2, 0).byte_range(text), None);
+    }
 
     fn row_with(message: enums::Message) -> MessageRow {
         MessageRow {

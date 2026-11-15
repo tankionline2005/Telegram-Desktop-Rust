@@ -29,6 +29,11 @@ lyon = "1.0"
 raw-window-handle = "0.6.2"
 # Already built for GPUI; renders tdesktop's SVGs (tray icon, wallpaper pattern).
 resvg = { version = "0.45.1", default-features = false }
+# Already in the lock: toast icons are gzipped Lottie JSON (`.tgs`).
+flate2 = "1.1"
+serde_json = "1"
+# Line break opportunities for message text (UAX #14, as Qt's).
+unicode-linebreak = "0.1"
 
 [target."cfg(windows)".dependencies]
 # Same version and a subset of the features GPUI enables: no extra build.

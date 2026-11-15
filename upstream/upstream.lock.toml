@@ -323,3 +323,50 @@ path = "assets/tdesktop-icons/slide_shadow@3x.png"
 upstream = "icons/slide_shadow@3x.png"
 submodule = "Telegram/lib_ui"
 sha256 = "131ae0d6542e4cf6ebc29835f92fb643e4954c7b52a13f07a94e36b51d81926a"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__mini_quote.png"
+upstream = "Telegram/Resources/icons/chat/mini_quote.png"
+sha256 = "7df2cbc3dfca83b435d4edc4171af1b04e102acb44cec385165d05624996f086"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__mini_quote@2x.png"
+upstream = "Telegram/Resources/icons/chat/mini_quote@2x.png"
+sha256 = "7d43af2cad8cd242895aa1e51a37bcd948c108dd47c7fac25804c4b821138e99"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__mini_quote@3x.png"
+upstream = "Telegram/Resources/icons/chat/mini_quote@3x.png"
+sha256 = "af3fd9d7a7a18fee7ba362d2bc29a89c142e092c254016bc8743258216284699"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__mini_copy.png"
+upstream = "Telegram/Resources/icons/chat/mini_copy.png"
+sha256 = "51f6044690958752ebceb44f226aaa557afdde4144f34e0f93344f6ca795e529"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__mini_copy@2x.png"
+upstream = "Telegram/Resources/icons/chat/mini_copy@2x.png"
+sha256 = "191fb3f24dfd7c6d4a9453ea68e843f1695264f0d6c0e4ce1daf159f0d66b427"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__mini_copy@3x.png"
+upstream = "Telegram/Resources/icons/chat/mini_copy@3x.png"
+sha256 = "8b189d5581172d5ceb973a69fb8198ffffa652cbecd55e6559b73e151e2e679a"
+
+[[vendored]]
+path = "assets/tdesktop-animations/toast__copy.tgs"
+upstream = "Telegram/Resources/animations/toast/copy.tgs"
+sha256 = "84079616525580051388a68d5c06e3efb50829fb2ed5effdbccc8b9d94a0deef"
+
+[[vendored]]
+path = "assets/fonts/OpenSans-Italic.ttf"
+upstream = "fonts/OpenSans-Italic.ttf"
+submodule = "Telegram/lib_ui"
+sha256 = "1207b0474e4a02f8c0e394c0a46bc6000b85467ea086999cdc1cd69e6c3df1e1"
+
+[[vendored]]
+path = "assets/fonts/OpenSans-SemiBoldItalic.ttf"
+upstream = "fonts/OpenSans-SemiBoldItalic.ttf"
+submodule = "Telegram/lib_ui"
+sha256 = "7b1f2bba5b751f412118a5baeeadaddd334d2af59d62b1da2542e3c314b4d24b"

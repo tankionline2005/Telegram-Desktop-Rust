@@ -4,7 +4,7 @@
 //! Localization comes later; until then these are the English strings.
 
 use chrono::{DateTime, Datelike, Local, TimeZone};
-use tdr_data::describe::{Lastseen, Media, Service};
+use tdr_data::describe::{DateFlags, Lastseen, Media, Service};
 
 /// The server's clock minus this computer's, in seconds.
 static SERVER_TIME_OFFSET: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -30,20 +30,40 @@ fn local(date: i32) -> Option<DateTime<Local>> {
 struct SystemFormats {
     date: String,
     time: String,
+    long_date: String,
+    long_time: String,
 }
 
-static FORMATS: std::sync::LazyLock<SystemFormats> = std::sync::LazyLock::new(|| SystemFormats {
-    date: system_format(true).map_or_else(|| "%d.%m.%y".into(), |f| windows_to_chrono(&f)),
-    time: system_format(false).map_or_else(|| "%H:%M".into(), |f| windows_to_chrono(&f)),
+#[derive(Clone, Copy)]
+enum FormatKind {
+    ShortDate,
+    ShortTime,
+    LongDate,
+    LongTime,
+}
+
+static FORMATS: std::sync::LazyLock<SystemFormats> = std::sync::LazyLock::new(|| {
+    let get = |kind, fallback: &str| {
+        system_format(kind).map_or_else(|| fallback.to_string(), |f| windows_to_chrono(&f))
+    };
+    SystemFormats {
+        date: get(FormatKind::ShortDate, "%d.%m.%y"),
+        time: get(FormatKind::ShortTime, "%H:%M"),
+        long_date: get(FormatKind::LongDate, "%A, %B %-d, %Y"),
+        long_time: get(FormatKind::LongTime, "%H:%M:%S"),
+    }
 });
 
 #[cfg(windows)]
-fn system_format(date: bool) -> Option<String> {
-    use windows::Win32::Globalization::{GetLocaleInfoEx, LOCALE_SSHORTDATE, LOCALE_SSHORTTIME};
-    let kind = if date {
-        LOCALE_SSHORTDATE
-    } else {
-        LOCALE_SSHORTTIME
+fn system_format(kind: FormatKind) -> Option<String> {
+    use windows::Win32::Globalization::{
+        GetLocaleInfoEx, LOCALE_SLONGDATE, LOCALE_SSHORTDATE, LOCALE_SSHORTTIME, LOCALE_STIMEFORMAT,
+    };
+    let kind = match kind {
+        FormatKind::ShortDate => LOCALE_SSHORTDATE,
+        FormatKind::ShortTime => LOCALE_SSHORTTIME,
+        FormatKind::LongDate => LOCALE_SLONGDATE,
+        FormatKind::LongTime => LOCALE_STIMEFORMAT,
     };
     let mut buffer = [0u16; 128];
     // SAFETY: a null locale name is the user default; the buffer is ours.
@@ -52,7 +72,7 @@ fn system_format(date: bool) -> Option<String> {
 }
 
 #[cfg(not(windows))]
-fn system_format(_date: bool) -> Option<String> {
+fn system_format(_kind: FormatKind) -> Option<String> {
     None
 }
 
@@ -136,6 +156,79 @@ pub fn dialogs_date(date: i32, now: DateTime<Local>) -> String {
 pub fn message_time(date: i32) -> String {
     local(date)
         .map(|t| t.format(&FORMATS.time).to_string())
+        .unwrap_or_default()
+}
+
+/// `FormatDateRelative`: "now", "5 minutes ago", "in 2 days".
+fn relative_date(date: i32, now: i32) -> String {
+    let delta = i64::from(date) - i64::from(now);
+    let abs = delta.abs();
+    let (count, unit) = if abs < 1 {
+        return "now".into();
+    } else if abs < 60 {
+        (abs, "second")
+    } else if abs < 3600 {
+        (abs / 60, "minute")
+    } else if abs < 86400 {
+        (abs / 3600, "hour")
+    } else if abs < 30 * 86400 {
+        (abs / 86400, "day")
+    } else if abs < 365 * 86400 {
+        (abs / (30 * 86400), "month")
+    } else {
+        (abs / (365 * 86400), "year")
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    if delta > 0 {
+        format!("in {count} {unit}{plural}")
+    } else {
+        format!("{count} {unit}{plural} ago")
+    }
+}
+
+/// `FormatDateWithFlags`: the date a `messageEntityFormattedDate` shows instead of
+/// its text.
+pub fn formatted_date(date: i32, flags: DateFlags, now: i32) -> String {
+    if flags.relative {
+        return relative_date(date, now);
+    }
+    let Some(t) = local(date) else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    if flags.day_of_week {
+        parts.push(
+            t.format(if flags.long_date { "%A" } else { "%a" })
+                .to_string(),
+        );
+    }
+    if flags.long_date {
+        parts.push(t.format("%B %-d, %Y").to_string());
+    } else if flags.short_date {
+        parts.push(t.format("%b %-d").to_string());
+    }
+    if flags.long_time {
+        parts.push(t.format(&FORMATS.long_time).to_string());
+    } else if flags.short_time {
+        parts.push(t.format(&FORMATS.time).to_string());
+    }
+    if parts.is_empty() {
+        format!("{} {}", t.format(&FORMATS.date), t.format(&FORMATS.time))
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// "Copy Date": the date and time in the system's long formats.
+pub fn long_date_time(date: i32) -> String {
+    local(date)
+        .map(|t| {
+            format!(
+                "{} {}",
+                t.format(&FORMATS.long_date),
+                t.format(&FORMATS.long_time)
+            )
+        })
         .unwrap_or_default()
 }
 
@@ -325,6 +418,14 @@ pub fn count_text(count: i32, one: &str, many: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_dates_like_tdesktop() {
+        assert_eq!(relative_date(100, 100), "now");
+        assert_eq!(relative_date(100, 101), "1 second ago");
+        assert_eq!(relative_date(100 + 7200, 100), "in 2 hours");
+        assert_eq!(relative_date(100, 100 + 3 * 86400), "3 days ago");
+    }
 
     fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
         Local.with_ymd_and_hms(y, mo, d, h, mi, 0).single().unwrap()

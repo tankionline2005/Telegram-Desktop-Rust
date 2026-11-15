@@ -69,6 +69,11 @@
   rounded ascent + descent as the line height). Use `gpui::px` only for values
   already in logical pixels. Times on screen are shifted by the server clock offset
   (`present::set_server_time_offset`), dates use the system's short formats.
+- Message text is our own element (`rich_text`: entities -> spans and quote
+  paragraphs, wrapping, painting, hit tests); `ui/message_text.rs` keeps the layout
+  cache, selection, link clicks and toasts. Spoiler particles (`spoiler`) and toast
+  icons (`lottie`, a tiny Lottie player) are generated once per scale/color.
+- One running copy per data folder (`instance`, a named pipe); `--demo` is exempt.
 - `uniform_list` lays out each item as its own root, where a `top` offset is
   ignored: animate an item inside a fixed-size wrapper.
 - Live checks against Telegram use the user's session in `data/` (git-ignored):
