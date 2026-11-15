@@ -684,6 +684,9 @@ enum Shown {
     Window {
         rows: Vec<MessageRow>,
         older_done: bool,
+        /// Nothing newer: the window reached the chat's last message (a chat with
+        /// no cached dialog to join, e.g. one the chat list does not have).
+        newer_done: bool,
     },
 }
 
@@ -708,11 +711,15 @@ fn send_history(
                 focus,
             }
         }
-        Shown::Window { rows, older_done } => Update::History {
+        Shown::Window {
+            rows,
+            older_done,
+            newer_done,
+        } => Update::History {
             peer,
             messages: message_items(store, peer, rows),
             complete: *older_done,
-            newer: true,
+            newer: !*newer_done,
             focus,
         },
     };
@@ -921,7 +928,9 @@ async fn run(
                             }
                             send_history(sync.store(), peer, &shown, None, &tx)?;
                         }
-                        Shown::Window { rows, older_done } => {
+                        Shown::Window {
+                            rows, older_done, ..
+                        } => {
                             if let Some(oldest) = rows.last().map(|m| m.id) {
                                 match sync.history_page(peer, oldest, 0, WINDOW_PAGE).await {
                                     Ok(page) => {
@@ -937,22 +946,31 @@ async fn run(
                     },
                     Command::LoadOlder(_) => {}
                     Command::LoadNewer(peer) if open == Some(peer) => {
-                        if let Shown::Window { rows, .. } = &mut shown
+                        if let Shown::Window {
+                            rows, newer_done, ..
+                        } = &mut shown
                             && let Some(newest) = rows.first().map(|m| m.id)
                         {
+                            let mut got_newer = false;
                             match sync.history_page(peer, newest, -WINDOW_PAGE, WINDOW_PAGE).await {
                                 Ok(page) => {
                                     let mut newer: Vec<MessageRow> =
                                         page.into_iter().filter(|m| m.id > newest).collect();
+                                    got_newer = !newer.is_empty();
                                     newer.append(rows);
                                     *rows = newer;
                                 }
                                 Err(e) => error!("history: {e}"),
                             }
-                            // The window met the newest message: it joins the cached
-                            // history and the chat is shown as usual from here.
+                            // The window met the newest message of the cached history:
+                            // it joins it and the chat is shown as usual from here. A
+                            // chat without a cached dialog (not in the chat list) stays
+                            // a window, complete once nothing newer comes.
                             let top = sync.store().history(peer, 1)?.messages.first().map(|m| m.id);
-                            let reached = rows.first().map(|m| m.id) >= top;
+                            let reached = top.is_some_and(|top| rows.first().is_some_and(|m| m.id >= top));
+                            if top.is_none() && !got_newer {
+                                *newer_done = true;
+                            }
                             if reached {
                                 let window = std::mem::take(rows);
                                 if let Err(e) = sync.join_window(peer, &window) {
@@ -985,7 +1003,11 @@ async fn run(
                         } else {
                             match sync.history_around(peer, msg_id, WINDOW_PAGE * 2).await {
                                 Ok(Some(rows)) => {
-                                    shown = Shown::Window { rows, older_done: false };
+                                    shown = Shown::Window {
+                                        rows,
+                                        older_done: false,
+                                        newer_done: false,
+                                    };
                                 }
                                 Ok(None) => {
                                     let n = sync.store().count_from(peer, msg_id)?.unwrap_or(0);
