@@ -8,6 +8,7 @@
 
 mod bridge;
 mod icons;
+mod one_line;
 mod placement;
 mod text_input;
 #[cfg(windows)]

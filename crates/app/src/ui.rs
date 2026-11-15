@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::bridge::{Author, Command, DialogItem, MessageItem, Update};
 use crate::icons::{Icon, icon};
+use crate::one_line::one_line;
 use crate::text_input::{LINE_HEIGHT, Submit, TextInput};
 
 gpui::actions!(main_view, [Escape]);
@@ -76,18 +77,6 @@ const LOAD_OLDER_THRESHOLD: usize = 3;
 
 fn c(color: Color) -> Rgba {
     rgba(color.rgba())
-}
-
-/// One line of text cut with "…". (GPUI 0.2.2 caches the size of `nowrap` text from its
-/// first, unconstrained measurement and then never truncates it; a one-line clamp of
-/// wrapping text is re-measured with the real width.)
-fn one_line(text: impl Into<SharedString>) -> gpui::Div {
-    div()
-        .w_full()
-        .overflow_hidden()
-        .line_clamp(1)
-        .text_ellipsis()
-        .child(text.into())
 }
 
 /// Width of the longest line of `text` when laid out without wrapping.

@@ -52,7 +52,9 @@
   prevent_default mouse downs and GPUI then skips the native caption buttons.
 - GPUI 0.2.2 measures wrapped text at a different width than it paints it: message
   bubbles get an explicit width from `text_width` (see `render_message`).
-- GPUI 0.2.2 never truncates `nowrap` text (stale measure cache); use `ui::one_line`.
+- GPUI 0.2.2 never truncates `nowrap` text (stale measure cache), and its
+  `text_ellipsis()` panics on multi-byte text (it shortens runs in place across measure
+  passes): never use either; use `one_line::one_line` for cut single lines.
 - Live checks against Telegram use the user's session in `data/` (git-ignored):
   `tdr me`, `tdr selftest reconnect|unknown-key|dc N`. Run cargo with
   `--manifest-path` if the shell cannot `cd` into the bracketed folder.
