@@ -35,6 +35,17 @@
   tests.
 - GPUI 0.2.2 applies `hover(...)` styles at paint time, after text is shaped, so a
   hover `text_color` never shows; track the hover with `on_hover` instead.
+- GPUI dispatches keys along the focused element's path, or to the view root only when
+  nothing is focused: the main view focuses itself on start; window-wide actions (Esc)
+  sit on the root element.
+- Panics are appended to `data/crash.log` (the release build has no console). It may
+  contain the user's text: read only the location lines.
+- Demo runs keep their window placement in `data/window-demo.txt`, the real app in
+  `data/window.txt`. Files that must survive a crash are written with
+  `tdr_api::write_atomic`.
+- Drafts: `tdr_data::drafts` is a pure state machine ported from tdesktop, with one
+  intended difference (an empty cloud draft never wipes the local one), see
+  `docs/ARCHITECTURE.md`.
 - Give the user the path of the built exe (`target/release/unofficial-telegram-desktop-rust.exe`)
   after each build: they test it directly instead of rebuilding.
 - Never put `track_focus` on an ancestor of the title bar: focusable elements

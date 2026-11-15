@@ -24,6 +24,18 @@ unicode-segmentation = "1.13.3"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 smallvec = "1"
+raw-window-handle = "0.6.2"
+
+[target."cfg(windows)".dependencies]
+# Same version and a subset of the features GPUI enables: no extra build.
+windows = { version = "0.61", features = [
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# Already built for GPUI; renders the tray icon from tdesktop's SVG.
+resvg = { version = "0.45.1", default-features = false }
 
 [lints]
 workspace = true

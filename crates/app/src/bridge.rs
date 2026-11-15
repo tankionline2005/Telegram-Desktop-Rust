@@ -15,11 +15,20 @@ use tracing::{error, info};
 #[derive(Debug, Clone)]
 pub enum Command {
     OpenChat(PeerKey),
+    /// The chat view was closed (Esc).
+    CloseChat,
     /// The user scrolled to the top of the open chat: load older messages.
     LoadOlder(PeerKey),
     Send {
         peer: PeerKey,
         text: String,
+    },
+    /// The input field of `peer` holds `text`. `cloud`: also save it to the server
+    /// soon (the chat was left, or typing paused for a while).
+    SaveDraft {
+        peer: PeerKey,
+        text: String,
+        cloud: bool,
     },
 }
 
@@ -31,6 +40,12 @@ pub enum Update {
         messages: Vec<MessageItem>,
         /// The first message of the chat is loaded: nothing older to ask for.
         complete: bool,
+    },
+    /// The draft of `peer` was changed from another device: the input field of that
+    /// chat shows `text` now (`None`: empty).
+    Draft {
+        peer: PeerKey,
+        text: Option<String>,
     },
     /// Connection state for the header ("Connecting…"), empty when online.
     Status(String),
@@ -53,6 +68,8 @@ pub struct DialogItem {
     pub is_saved: bool,
     /// A basic group or supergroup (sender names and avatars in the feed).
     pub is_group: bool,
+    /// The saved draft ("Draft: …" in the list).
+    pub draft: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,11 +141,15 @@ fn dialog_item(d: &DialogView, self_id: i64) -> DialogItem {
         color: color_index(d.dialog.peer.id),
         name,
         last,
+        // A newer draft shows its own time, as in tdesktop.
         time: d
             .top
             .as_ref()
-            .map(|m| time_label(m.date))
+            .map(|m| m.date)
+            .max(d.draft.as_ref().map(|(_, date)| *date))
+            .map(time_label)
             .unwrap_or_default(),
+        draft: d.draft.as_ref().map(|(text, _)| text.clone()),
         unread: d.dialog.unread_count,
         pinned: d.dialog.pinned,
         is_channel: d.dialog.peer.kind == PeerKind::Channel
@@ -267,8 +288,26 @@ fn send_history(
 }
 
 fn changed(a: &Applied) -> bool {
-    !a.new_messages.is_empty() || a.edited > 0 || a.deleted > 0 || a.reloaded
+    !a.new_messages.is_empty()
+        || a.edited > 0
+        || a.deleted > 0
+        || a.reloaded
+        || !a.draft_changes.is_empty()
 }
+
+/// Drafts changed from another device go to the input fields.
+fn send_draft_changes(applied: &Applied, tx: &mpsc::UnboundedSender<Update>) {
+    for (peer, text) in &applied.draft_changes {
+        let _ = tx.send(Update::Draft {
+            peer: *peer,
+            text: text.clone(),
+        });
+    }
+}
+
+/// tdesktop's `kSaveCloudDraftTimeout`: drafts go to the server this long after the
+/// chat is left (changes in the meantime are batched).
+const SAVE_CLOUD_DRAFT_DELAY: Duration = Duration::from_millis(1000);
 
 async fn run(
     config: Config,
@@ -295,7 +334,9 @@ async fn run(
     }
     let client = Client::new(config, session);
     let save = |client: &Client| {
-        let _ = std::fs::write(&paths.session, client.session_bytes());
+        if let Err(e) = client.save_session(&paths.session) {
+            error!("session save: {e}");
+        }
     };
 
     // 2. Catch up with the server.
@@ -306,8 +347,13 @@ async fn run(
     info!(elapsed = ?started.elapsed(), "synced");
     save(&client);
     send_dialogs(sync.store(), &tx)?;
+    send_draft_changes(&applied, &tx);
     let _ = tx.send(Update::Status(String::new()));
-    let _ = applied;
+    // When to save drafts to the cloud. Drafts left unsaved last time (the app quit
+    // first) go up right away.
+    let mut cloud_save_at = sync
+        .has_unsaved_drafts()
+        .then(|| tokio::time::Instant::now() + SAVE_CLOUD_DRAFT_DELAY);
 
     // 3. Commands and live updates.
     let mut open: Option<PeerKey> = None;
@@ -327,6 +373,15 @@ async fn run(
                             Err(e) => error!("history: {e}"),
                         }
                         send_dialogs(sync.store(), &tx)?;
+                    }
+                    Command::CloseChat => open = None,
+                    Command::SaveDraft { peer, text, cloud } => {
+                        if sync.set_draft(peer, &text)? {
+                            send_dialogs(sync.store(), &tx)?;
+                        }
+                        if cloud && sync.has_unsaved_drafts() && cloud_save_at.is_none() {
+                            cloud_save_at = Some(tokio::time::Instant::now() + SAVE_CLOUD_DRAFT_DELAY);
+                        }
                     }
                     Command::LoadOlder(peer) => {
                         if open == Some(peer) {
@@ -353,10 +408,22 @@ async fn run(
                     }
                 }
             }
+            _ = async {
+                match cloud_save_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                cloud_save_at = None;
+                if let Err(e) = sync.save_drafts_to_cloud().await {
+                    error!("drafts: {e}");
+                }
+            }
             event = sync.wait_event(Duration::from_secs(5)) => {
                 let applied = sync.process(event).await?;
                 if changed(&applied) {
                     send_dialogs(sync.store(), &tx)?;
+                    send_draft_changes(&applied, &tx);
                     if let Some(peer) = open {
                         let touched = applied.new_messages.iter().any(|m| m.peer == peer)
                             || applied.edited + applied.deleted > 0;
@@ -430,6 +497,7 @@ pub fn start_demo() -> (
             pinned: *pinned,
             is_channel: false,
             is_saved: *name == "Saved Messages",
+            draft: None,
             is_group: *name == "Rust Developers"
                 || *name == "Weekend Hiking"
                 || *name == "Design Team",
@@ -471,7 +539,7 @@ pub fn start_demo() -> (
         let mut next_id = 2000;
         while let Some(cmd) = cmd_rx.blocking_recv() {
             match cmd {
-                Command::OpenChat(_) => {}
+                Command::OpenChat(_) | Command::CloseChat | Command::SaveDraft { .. } => {}
                 Command::LoadOlder(_) if older_left > 0 => {
                     let first = history.first().map_or(1000, |m| m.id);
                     let page: Vec<MessageItem> = (1..=20)

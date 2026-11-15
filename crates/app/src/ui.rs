@@ -21,6 +21,13 @@ use crate::bridge::{Author, Command, DialogItem, MessageItem, Update};
 use crate::icons::{Icon, icon};
 use crate::text_input::{LINE_HEIGHT, Submit, TextInput};
 
+gpui::actions!(main_view, [Escape]);
+
+/// Window-wide keys (the text field's own keys are in `text_input::bind_keys`).
+pub fn bind_keys(cx: &mut gpui::App) {
+    cx.bind_keys([gpui::KeyBinding::new("escape", Escape, None)]);
+}
+
 // widgets.style: windowTitleHeight, windowTitleButtonWidth
 const TITLE_HEIGHT: f32 = 24.;
 const TITLE_BUTTON_WIDTH: f32 = 36.;
@@ -222,8 +229,16 @@ pub struct MainView {
     last_scroll: Option<Instant>,
     scroll_hovered: bool,
     scroll_drag: Option<ScrollDrag>,
-    /// Unsent text per chat (tdesktop keeps a local draft per history).
-    drafts: HashMap<PeerKey, String>,
+    /// Draft edits made here or pushed from the server since the chat list was last
+    /// loaded (`None`: cleared). They win over the list's own `DialogItem::draft`,
+    /// which may lag behind the data thread.
+    drafts: HashMap<PeerKey, Option<String>>,
+    /// The text the input field had at the last check (to notice typing).
+    input_text: String,
+    /// Bumped on every edit: pending draft-save timers check it.
+    draft_generation: u64,
+    /// The first unsaved edit (tdesktop's `_saveDraftStart`).
+    draft_dirty_since: Option<Instant>,
     main_menu_open: bool,
     /// The caption button under the mouse.
     title_hovered: Option<&'static str>,
@@ -248,9 +263,15 @@ impl MainView {
     ) -> Self {
         let palette = tdr_theme::palette(dark);
         let input = cx.new(|cx| TextInput::new("Write a message…", palette, cx));
+        cx.observe(&input, |this: &mut Self, _, cx| this.input_changed(cx))
+            .detach();
         cx.subscribe(&input, |this: &mut Self, _, Submit(text), cx| {
             if let Some(peer) = this.selected {
-                this.drafts.remove(&peer);
+                // Sending clears the draft (the data thread clears the stored one).
+                this.drafts.insert(peer, None);
+                this.input_text.clear();
+                this.draft_dirty_since = None;
+                this.draft_generation += 1;
                 this.stick_to_bottom = true;
                 let _ = this.commands.send(Command::Send {
                     peer,
@@ -307,6 +328,9 @@ impl MainView {
             scroll_hovered: false,
             scroll_drag: None,
             drafts: HashMap::new(),
+            input_text: String::new(),
+            draft_generation: 0,
+            draft_dirty_since: None,
             main_menu_open: false,
             title_hovered: None,
             input,
@@ -322,6 +346,16 @@ impl MainView {
 
     fn palette(&self) -> &'static Palette {
         tdr_theme::palette(self.dark)
+    }
+
+    /// The chat background (under messages and the empty-chat placeholder): the night
+    /// theme's solid color, or the default wallpaper's gradient in the day theme.
+    fn with_chat_background(&self, d: gpui::Div) -> gpui::Div {
+        if self.dark {
+            d.bg(c(tdr_theme::NIGHT_CHAT_BACKGROUND))
+        } else {
+            d.relative().child(crate::wallpaper::default_gradient())
+        }
     }
 
     fn apply(&mut self, update: Update, cx: &mut Context<Self>) {
@@ -351,6 +385,15 @@ impl MainView {
                     if self.messages.len() < 20 {
                         self.load_older();
                     }
+                }
+            }
+            Update::Draft { peer, text } => {
+                // tdesktop's `applyCloudDraft`: the open chat's field shows it at once.
+                self.drafts.insert(peer, text.clone());
+                if self.selected == Some(peer) {
+                    self.draft_generation += 1;
+                    self.draft_dirty_since = None;
+                    self.set_input_text(text.unwrap_or_default(), cx);
                 }
             }
             Update::Status(s) => self.status = s,
@@ -447,21 +490,113 @@ impl MainView {
         .detach();
     }
 
+    /// The draft of a chat as this view knows it.
+    fn draft_of(&self, peer: PeerKey) -> Option<String> {
+        match self.drafts.get(&peer) {
+            Some(text) => text.clone(),
+            None => self
+                .dialogs
+                .iter()
+                .find(|d| d.peer == peer)
+                .and_then(|d| d.draft.clone()),
+        }
+        .filter(|t| !t.trim().is_empty())
+    }
+
+    /// Keeps the unsent text of the open chat as its draft, locally and (shortly) in
+    /// the cloud: tdesktop saves both when a chat is left.
+    fn save_draft(&mut self, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).text();
+        if let Some(prev) = self.selected {
+            self.drafts
+                .insert(prev, (!text.trim().is_empty()).then(|| text.clone()));
+            self.draft_dirty_since = None;
+            self.draft_generation += 1;
+            let _ = self.commands.send(Command::SaveDraft {
+                peer: prev,
+                text,
+                cloud: true,
+            });
+        }
+    }
+
+    /// Replaces the field's text without treating it as typing.
+    fn set_input_text(&mut self, text: String, cx: &mut Context<Self>) {
+        self.input_text = text.clone();
+        self.input.update(cx, |input, cx| input.set_text(text, cx));
+    }
+
+    /// The field may have changed: tdesktop's draft timers. The local draft is saved a
+    /// second after typing stops (at the latest every 5 s while typing on), the cloud
+    /// one after 14 s without typing.
+    fn input_changed(&mut self, cx: &mut Context<Self>) {
+        const SAVE_DRAFT: Duration = Duration::from_millis(1000); // kSaveDraftTimeout
+        const SAVE_DRAFT_ANYWAY: Duration = Duration::from_secs(5); // kSaveDraftAnywayTimeout
+        const SAVE_CLOUD_DRAFT_IDLE: Duration = Duration::from_secs(14); // kSaveCloudDraftIdleTimeout
+        let text = self.input.read(cx).text();
+        if text == self.input_text {
+            return;
+        }
+        self.input_text = text.clone();
+        let Some(peer) = self.selected else { return };
+        self.drafts
+            .insert(peer, (!text.trim().is_empty()).then(|| text.clone()));
+        self.draft_generation += 1;
+        let generation = self.draft_generation;
+        let since = *self.draft_dirty_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= SAVE_DRAFT_ANYWAY {
+            self.draft_dirty_since = Some(Instant::now());
+            let _ = self.commands.send(Command::SaveDraft {
+                peer,
+                text: text.clone(),
+                cloud: false,
+            });
+        }
+        for (delay, cloud) in [(SAVE_DRAFT, false), (SAVE_CLOUD_DRAFT_IDLE, true)] {
+            let text = text.clone();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(delay).await;
+                let _ = this.update(cx, |this, _| {
+                    if this.draft_generation == generation && this.selected == Some(peer) {
+                        if !cloud {
+                            this.draft_dirty_since = None;
+                        }
+                        let _ = this.commands.send(Command::SaveDraft { peer, text, cloud });
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Esc: closes the main menu, or else the open chat (back to "Select a chat"), as
+    /// in tdesktop.
+    fn escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.main_menu_open {
+            self.main_menu_open = false;
+        } else if self.selected.is_some() {
+            self.save_draft(cx);
+            self.set_input_text(String::new(), cx);
+            self.selected = None;
+            self.messages.clear();
+            self.messages_state.reset(0);
+            self.scroll_drag = None;
+            let _ = self.commands.send(Command::CloseChat);
+            window.focus(&self.focus);
+        } else {
+            return;
+        }
+        cx.notify();
+    }
+
     fn open(&mut self, peer: PeerKey, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected == Some(peer) {
             return;
         }
         // Keep the unsent text of the chat we leave; restore the one of the chat we open.
-        let text = self.input.read(cx).text();
-        if let Some(prev) = self.selected {
-            if text.trim().is_empty() {
-                self.drafts.remove(&prev);
-            } else {
-                self.drafts.insert(prev, text);
-            }
-        }
-        let draft = self.drafts.get(&peer).cloned().unwrap_or_default();
-        self.input.update(cx, |input, cx| input.set_text(draft, cx));
+        self.save_draft(cx);
+        let draft = self.draft_of(peer).unwrap_or_default();
+        self.set_input_text(draft, cx);
 
         self.selected = Some(peer);
         self.messages.clear();
@@ -623,7 +758,7 @@ impl MainView {
             )
         };
         let peer = item.peer;
-        let draft = (!active).then(|| self.drafts.get(&peer)).flatten();
+        let draft = (!active).then(|| self.draft_of(peer)).flatten();
         let badge = (item.unread > 0).then(|| {
             let (badge_bg, badge_fg) = if active {
                 (p.dialogs_unread_bg_active, p.dialogs_unread_fg_active)
@@ -1129,13 +1264,13 @@ impl Render for MainView {
             .selected
             .and_then(|peer| self.dialogs.iter().find(|d| d.peer == peer))
         {
-            None => div()
+            None => self
+                .with_chat_background(div())
                 .flex_1()
                 .h_full()
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(c(p.window_bg_over))
                 .child(
                     div()
                         .px(px(12.))
@@ -1204,12 +1339,12 @@ impl Render for MainView {
                         )))
                 });
                 let scrollbar = self.render_scrollbar(cx);
-                let feed = div()
+                let feed = self
+                    .with_chat_background(div())
                     .id("history")
                     .relative()
                     .flex_1()
                     .min_h(px(0.))
-                    .bg(c(p.window_bg_over))
                     .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
                         if this.scroll_drag.is_some() {
                             this.drag_scrollbar(e.position.y, cx);
@@ -1300,6 +1435,8 @@ impl Render for MainView {
             .text_size(px(FONT_SIZE))
             .bg(c(p.window_bg))
             .text_color(c(p.window_fg))
+            // On the root: with nothing focused, GPUI dispatches keys to the root only.
+            .on_action(cx.listener(Self::escape))
             .child(self.render_title_bar(window, cx))
             // Focus tracking stays below the title bar: a focusable element swallows mouse
             // downs (prevent_default), and GPUI then skips the native caption-button

@@ -67,7 +67,7 @@ fn load_session() -> Result<Option<SessionData>> {
 
 fn save_session(client: &Client) -> Result<()> {
     std::fs::create_dir_all(data_dir())?;
-    std::fs::write(session_path(), client.session_bytes())?;
+    client.save_session(&session_path())?;
     Ok(())
 }
 

@@ -24,7 +24,7 @@ pub use rusqlite::Error;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Schema version (`PRAGMA user_version`); bump with a migration in [`migrate`].
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PeerKind {
@@ -114,6 +114,8 @@ pub struct DialogView {
     pub dialog: DialogRow,
     pub peer: Option<PeerRow>,
     pub top: Option<MessageRow>,
+    /// The local draft: text and date.
+    pub draft: Option<(String, i32)>,
 }
 
 /// See [`Storage::history`].
@@ -159,6 +161,18 @@ fn migrate(conn: &mut Connection) -> Result<()> {
              UPDATE dialogs SET cached_from = top_message
              WHERE EXISTS (SELECT 1 FROM messages m
                            WHERE m.kind = dialogs.kind AND m.peer_id = dialogs.id AND m.id = dialogs.top_message);",
+        )?;
+    }
+    if version < 3 {
+        // Local message drafts (what the input field of each chat holds).
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS drafts (
+                kind INTEGER NOT NULL,
+                id   INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                date INTEGER NOT NULL,
+                PRIMARY KEY (kind, id)
+             ) WITHOUT ROWID;",
         )?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -352,16 +366,37 @@ impl Storage {
     }
 
     /// The chat list of `folder_id` (0 = main), pinned first, then by last message.
+    /// All local drafts: chat, text, date.
+    pub fn drafts(&self) -> Result<Vec<(PeerKey, String, i32)>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT kind, id, text, date FROM drafts")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                PeerKey {
+                    kind: PeerKind::from_i64(r.get(0)?),
+                    id: r.get(1)?,
+                },
+                r.get(2)?,
+                r.get(3)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
     pub fn dialogs(&self, folder_id: i32, limit: usize) -> Result<Vec<DialogView>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT d.kind, d.id, d.top_message, d.top_date, d.pinned, d.folder_id, d.unread_count, d.pts,
                     p.kind, p.id, p.access_hash, p.is_min, p.is_megagroup, p.name, p.username, p.raw_layer, p.raw,
-                    m.date, m.from_kind, m.from_id, m.out, m.text, m.raw_layer, m.raw
+                    m.date, m.from_kind, m.from_id, m.out, m.text, m.raw_layer, m.raw,
+                    dr.text, dr.date
              FROM dialogs d
              LEFT JOIN peers p ON p.kind = d.kind AND p.id = d.id
              LEFT JOIN messages m ON m.kind = d.kind AND m.peer_id = d.id AND m.id = d.top_message
+             LEFT JOIN drafts dr ON dr.kind = d.kind AND dr.id = d.id
              WHERE d.folder_id = ?1
-             ORDER BY d.pinned DESC, d.top_date DESC
+             -- A draft lifts its chat like a new message (tdesktop's adjustedChatListTimeId).
+             ORDER BY d.pinned DESC, MAX(d.top_date, COALESCE(dr.date, 0)) DESC
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![folder_id, limit as i64], |r| {
@@ -393,7 +428,16 @@ impl Storage {
                 }),
                 None => None,
             };
-            Ok(DialogView { dialog, peer, top })
+            let draft = match r.get::<_, Option<String>>(24)? {
+                Some(text) => Some((text, r.get(25)?)),
+                None => None,
+            };
+            Ok(DialogView {
+                dialog,
+                peer,
+                top,
+                draft,
+            })
         })?;
         rows.collect()
     }
@@ -552,6 +596,24 @@ impl Writer<'_> {
     /// Inserts or refreshes a chat-list entry (from `messages.getDialogs`). Its top
     /// message must be stored too. If the top message changed without us seeing the
     /// messages in between, the cached history segment restarts at the new top.
+    /// Stores the local draft of a chat (`None` removes it).
+    pub fn set_draft(&self, peer: PeerKey, draft: Option<(&str, i32)>) -> Result<()> {
+        match draft {
+            Some((text, date)) => self
+                .tx
+                .prepare_cached(
+                    "INSERT INTO drafts (kind, id, text, date) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (kind, id) DO UPDATE SET text = excluded.text, date = excluded.date",
+                )?
+                .execute(params![peer.kind as i64, peer.id, text, date])?,
+            None => self
+                .tx
+                .prepare_cached("DELETE FROM drafts WHERE kind = ?1 AND id = ?2")?
+                .execute(params![peer.kind as i64, peer.id])?,
+        };
+        Ok(())
+    }
+
     pub fn put_dialog(&self, d: &DialogRow) -> Result<()> {
         self.tx
             .prepare_cached(
@@ -679,6 +741,45 @@ mod tests {
             text: text.into(),
             raw: None,
         }
+    }
+
+    #[test]
+    fn drafts_are_stored_and_lift_their_chat() {
+        let mut s = Storage::open_in_memory().unwrap();
+        let (a, b) = (PeerKey::user(1), PeerKey::user(2));
+        s.write(|w| {
+            for (peer, id, date) in [(a, 10, 100), (b, 20, 200)] {
+                w.put_dialog(&DialogRow {
+                    peer,
+                    top_message: id,
+                    top_date: date,
+                    pinned: false,
+                    folder_id: 0,
+                    unread_count: 0,
+                    pts: None,
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let order = |s: &Storage| -> Vec<PeerKey> {
+            s.dialogs(0, 10)
+                .unwrap()
+                .iter()
+                .map(|d| d.dialog.peer)
+                .collect()
+        };
+        assert_eq!(order(&s), vec![b, a]);
+        // A draft newer than b's last message moves a up.
+        s.write(|w| w.set_draft(a, Some(("draft text", 300))))
+            .unwrap();
+        assert_eq!(order(&s), vec![a, b]);
+        let first = &s.dialogs(0, 10).unwrap()[0];
+        assert_eq!(first.draft, Some(("draft text".into(), 300)));
+        assert_eq!(s.drafts().unwrap(), vec![(a, "draft text".into(), 300)]);
+        s.write(|w| w.set_draft(a, None)).unwrap();
+        assert_eq!(order(&s), vec![b, a]);
+        assert!(s.drafts().unwrap().is_empty());
     }
 
     #[test]

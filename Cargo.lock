@@ -5658,6 +5658,8 @@ dependencies = [
  "embed-resource",
  "gpui",
  "image",
+ "raw-window-handle",
+ "resvg",
  "smallvec",
  "tdr-api",
  "tdr-data",
@@ -5666,6 +5668,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-segmentation",
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -5735,6 +5738,7 @@ dependencies = [
 name = "tdr-theme"
 version = "0.1.0"
 dependencies = [
+ "png 0.18.1",
  "zip",
 ]
 

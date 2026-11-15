@@ -101,6 +101,34 @@ fn snake(name: &str) -> String {
     out
 }
 
+/// Average color of the theme's `background.png` (the built-in night theme ships a 1x1
+/// tile: a solid chat background).
+fn background_color(path: &Path) -> u32 {
+    let file = fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut zip = zip::ZipArchive::new(file).expect("theme is a zip archive");
+    let mut bytes = Vec::new();
+    zip.by_name("background.png")
+        .expect("theme has background.png")
+        .read_to_end(&mut bytes)
+        .unwrap();
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().expect("background.png");
+    let mut buf = vec![0; reader.output_buffer_size().expect("png size")];
+    let info = reader.next_frame(&mut buf).expect("background.png frame");
+    let channels = info.color_type.samples();
+    let pixels = &buf[..info.buffer_size()];
+    let count = (pixels.len() / channels) as u64;
+    let mut sum = [0u64; 3];
+    for px in pixels.chunks(channels) {
+        for (c, total) in sum.iter_mut().enumerate() {
+            *total += u64::from(px[c.min(channels - 1)]);
+        }
+    }
+    let avg = |c: usize| (sum[c] / count) as u32;
+    (avg(0) << 24) | (avg(1) << 16) | (avg(2) << 8) | 0xff
+}
+
 fn read_zip_entry(path: &Path, entry: &str) -> String {
     let file = fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let mut zip = zip::ZipArchive::new(file).expect("theme is a zip archive");
@@ -157,6 +185,12 @@ fn main() {
         }
         out.push_str("};\n\n");
     }
+    let _ = writeln!(
+        out,
+        "/// Chat background of the night theme (its `background.png`).\n\
+         pub const NIGHT_CHAT_BACKGROUND: Color = Color({:#010x});\n",
+        background_color(&night_path)
+    );
     let _ = writeln!(
         out,
         "/// Number of colors in the palette.\npub const COLOR_COUNT: usize = {};",

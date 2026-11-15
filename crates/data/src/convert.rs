@@ -15,6 +15,19 @@ pub fn peer_key(peer: &enums::Peer) -> PeerKey {
     }
 }
 
+pub fn cloud_draft(draft: &enums::DraftMessage) -> crate::drafts::CloudDraft {
+    use crate::drafts::CloudDraft;
+    match draft {
+        enums::DraftMessage::Empty(d) => CloudDraft::Empty {
+            date: d.date.unwrap_or(0),
+        },
+        enums::DraftMessage::DraftMessage(d) => CloudDraft::Text {
+            text: d.message.clone(),
+            date: d.date,
+        },
+    }
+}
+
 pub fn user_row(user: &enums::User) -> Option<PeerRow> {
     let enums::User::User(u) = user else {
         return None;

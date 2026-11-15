@@ -7,9 +7,11 @@
 //! state it leads to, so after a crash the cache and the state always agree.
 
 pub mod convert;
+pub mod drafts;
 
 use std::time::{Duration, Instant};
 
+use drafts::Drafts;
 use tdr_api::{Client, Error as ApiError, Event};
 use tdr_storage::{DialogRow, MessageRow, PeerKey, PeerKind, Storage, UpdateState};
 use tdr_tl::{Deserializable, enums, functions, types};
@@ -64,6 +66,11 @@ pub struct Applied {
     pub deleted: usize,
     /// The chat list was reloaded from scratch.
     pub reloaded: bool,
+    /// Local drafts changed by the server (another device): the input field of an
+    /// open chat should show the new text (`None`: cleared).
+    pub draft_changes: Vec<drafts::Change>,
+    /// Cloud drafts seen while applying; turned into `draft_changes` by `Sync`.
+    cloud_drafts: Vec<(PeerKey, drafts::CloudDraft, bool)>,
 }
 
 impl Applied {
@@ -72,6 +79,8 @@ impl Applied {
         self.edited += other.edited;
         self.deleted += other.deleted;
         self.reloaded |= other.reloaded;
+        self.draft_changes.extend(other.draft_changes);
+        self.cloud_drafts.extend(other.cloud_drafts);
     }
 }
 
@@ -85,6 +94,9 @@ pub struct Sync {
     store: Storage,
     engine: Engine,
     self_id: i64,
+    drafts: Drafts,
+    /// Drafts that came with the chat list, applied with the next `Applied`.
+    dialog_drafts: Vec<(PeerKey, drafts::CloudDraft, bool)>,
 }
 
 fn to_engine(s: UpdateState) -> State {
@@ -110,11 +122,17 @@ impl Sync {
         let state = store.update_state()?.map(to_engine);
         let engine = Engine::new(state, store.channel_pts()?);
         let self_id = store.meta_i64("self_id")?.unwrap_or(0);
+        let mut drafts = Drafts::new(true);
+        for (peer, text, date) in store.drafts()? {
+            drafts.restore_local(peer, text, date);
+        }
         Ok(Self {
             client,
             store,
             engine,
             self_id,
+            drafts,
+            dialog_drafts: Vec::new(),
         })
     }
 
@@ -152,12 +170,13 @@ impl Sync {
             return self.full_load().await;
         }
         let out = self.engine.connection_restored();
-        let applied = self.run(out).await?;
+        let mut applied = self.run(out).await?;
         // Channels are not part of the common difference: refresh the top of the chat
         // list so that channels with new posts move up (tdesktop reloads the whole list).
         let t = Instant::now();
         self.load_dialogs(DIALOGS_PAGE as usize).await?;
         debug!(elapsed = ?t.elapsed(), "chat list refreshed");
+        self.apply_drafts(&mut applied)?;
         Ok(applied)
     }
 
@@ -174,6 +193,7 @@ impl Sync {
         let out = self.engine.set_state(state);
         let mut applied = self.commit(out)?;
         applied.reloaded = true;
+        self.apply_drafts(&mut applied)?;
         info!(loaded, elapsed = ?started.elapsed(), "chat list loaded");
         Ok(applied)
     }
@@ -227,6 +247,10 @@ impl Sync {
                     && let Some(pts) = d.pts
                 {
                     self.engine.set_channel_pts(peer.id, pts);
+                }
+                if let Some(draft) = &d.draft {
+                    self.dialog_drafts
+                        .push((peer, convert::cloud_draft(draft), true));
                 }
                 rows.push(DialogRow {
                     peer,
@@ -312,8 +336,89 @@ impl Sync {
         self.run(out).await
     }
 
+    /// The field of `peer` holds `text` (typed, or the chat was left): keep it as the
+    /// local draft. Returns whether it changed; [`Sync::save_drafts_to_cloud`] uploads.
+    pub fn set_draft(&mut self, peer: PeerKey, text: &str) -> Result<bool> {
+        let now = self.client.server_time();
+        if !self.drafts.set_local(peer, text, now) {
+            return Ok(false);
+        }
+        let draft = self.drafts.local(peer).map(|d| (d.text.clone(), d.date));
+        self.store
+            .write(|w| w.set_draft(peer, draft.as_ref().map(|(t, d)| (t.as_str(), *d))))?;
+        Ok(true)
+    }
+
+    /// Local drafts not yet saved to the cloud.
+    pub fn has_unsaved_drafts(&self) -> bool {
+        !self.drafts.pending_cloud_saves().is_empty()
+    }
+
+    /// `ApiWrap::saveDraftsToCloud`: `messages.saveDraft` for every changed draft.
+    pub async fn save_drafts_to_cloud(&mut self) -> Result<()> {
+        for peer in self.drafts.pending_cloud_saves() {
+            let access_hash = self.store.access_hash(peer)?;
+            let Some(input) = convert::input_peer(peer, access_hash) else {
+                self.drafts.start_save(peer, 0);
+                self.drafts.finish_save(peer, 0);
+                continue;
+            };
+            let message = self.drafts.start_save(peer, self.client.server_time());
+            let result = self
+                .client
+                .invoke(&functions::messages::SaveDraft {
+                    no_webpage: false,
+                    invert_media: false,
+                    reply_to: None,
+                    peer: input,
+                    message,
+                    entities: None,
+                    media: None,
+                    effect: None,
+                    suggested_post: None,
+                    rich_message: None,
+                })
+                .await;
+            self.drafts.finish_save(peer, self.client.server_time());
+            if let Err(e) = result {
+                debug!(?peer, "saveDraft failed: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Turns the cloud drafts collected while applying into local draft changes, and
+    /// clears drafts that were sent from another device.
+    fn apply_drafts(&mut self, applied: &mut Applied) -> Result<()> {
+        let mut changes = Vec::new();
+        let mut cloud = std::mem::take(&mut self.dialog_drafts);
+        cloud.append(&mut applied.cloud_drafts);
+        for (peer, draft, from_dialog) in cloud {
+            changes.extend(self.drafts.cloud_update(peer, draft, from_dialog));
+        }
+        for m in applied.new_messages.iter().filter(|m| m.out) {
+            changes.extend(self.drafts.outgoing_message(m.peer, &m.text));
+        }
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let drafts = &self.drafts;
+        self.store.write(|w| {
+            for (peer, _) in &changes {
+                let local = drafts.local(*peer);
+                w.set_draft(*peer, local.map(|d| (d.text.as_str(), d.date)))?;
+            }
+            Ok(())
+        })?;
+        applied.draft_changes.extend(changes);
+        Ok(())
+    }
+
     /// Sends a text message and records it in the cache.
     pub async fn send_text(&mut self, peer: PeerKey, text: &str) -> Result<Applied> {
+        // Sent with `clear_draft`: the server drops the cloud draft, we drop ours.
+        self.drafts.message_sent(peer);
+        self.store.write(|w| w.set_draft(peer, None))?;
         let access_hash = self.store.access_hash(peer)?;
         let Some(input) = convert::input_peer(peer, access_hash) else {
             return Ok(Applied::default());
@@ -391,6 +496,7 @@ impl Sync {
         if self.reload_if_stale().await? {
             applied.reloaded = true;
         }
+        self.apply_drafts(&mut applied)?;
         Ok(applied)
     }
 
@@ -574,6 +680,13 @@ fn apply_update(
         U::DeleteChannelMessages(x) => {
             w.delete_messages(PeerKey::channel(x.channel_id), &x.messages)?;
             applied.deleted += x.messages.len();
+        }
+        U::DraftMessage(x) if x.top_msg_id.is_none() && x.saved_peer_id.is_none() => {
+            applied.cloud_drafts.push((
+                convert::peer_key(&x.peer),
+                convert::cloud_draft(&x.draft),
+                false,
+            ));
         }
         U::ReadHistoryInbox(x) => w.set_unread(convert::peer_key(&x.peer), x.still_unread_count)?,
         U::ReadChannelInbox(x) => {

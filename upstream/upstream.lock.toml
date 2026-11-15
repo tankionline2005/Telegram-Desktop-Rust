@@ -145,3 +145,8 @@ sha256 = "cfddb867eb94d4299b8d66c59c92f1cfe2ad4e84c356ece029dbf9def5f153a9"
 path = "assets/tdesktop-icons/history_down_shadow@3x.png"
 upstream = "Telegram/Resources/icons/history_down_shadow@3x.png"
 sha256 = "cc524f7cc89c3be712af3d652b9ea39d043d22ed5f697abe899b3c3e3d427faf"
+
+[[vendored]]
+path = "assets/tdesktop-icons/tray_monochrome.svg"
+upstream = "Telegram/Resources/icons/tray_monochrome.svg"
+sha256 = "a93380f2c7e6aae4d5fde8940020bd966e97ad8c4880f45c016edfef3f5193e1"

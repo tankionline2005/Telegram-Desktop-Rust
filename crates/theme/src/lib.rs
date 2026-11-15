@@ -19,6 +19,15 @@ impl Color {
 
 include!(concat!(env!("OUT_DIR"), "/palette.rs"));
 
+/// tdesktop's default wallpaper (`Data::WallPaper::ConstructDefault`): a four-color
+/// gradient with the `background.tgv` pattern at intensity 50.
+pub const DEFAULT_WALLPAPER_COLORS: [Color; 4] = [
+    Color(0xdbddbbff),
+    Color(0x6ba587ff),
+    Color(0xd5d88dff),
+    Color(0x88b884ff),
+];
+
 /// The palette for a dark or light appearance.
 pub fn palette(dark: bool) -> &'static Palette {
     if dark { &NIGHT } else { &DAY }
@@ -38,6 +47,8 @@ mod tests {
         assert_eq!(DAY.dialogs_bg, DAY.window_bg);
         assert_eq!(DAY.shadow_fg, Color(0x00000018));
         const { assert!(COLOR_COUNT > 500) };
+        // night.tdesktop-theme's background.png is a #0e1621 tile.
+        assert_eq!(NIGHT_CHAT_BACKGROUND, Color(0x0e1621ff));
     }
 
     #[test]

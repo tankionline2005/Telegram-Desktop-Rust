@@ -23,6 +23,22 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tracing::{debug, info};
 
 pub use session::{DcKeys, SessionData, SessionError, TempKey};
+
+/// Replaces `path` with `data` so that a crash at any moment leaves either the old or
+/// the new file, never a truncated one: write a sibling temp file, flush it to disk,
+/// rename it over the target (an atomic replace on Windows and Unix).
+pub fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
 pub use tdr_mtproto::{Error, Event};
 
 /// Lifetime of temporary keys, as in tdesktop (`kTemporaryExpiresIn`).
@@ -169,6 +185,16 @@ impl Client {
     /// Serialized session, honoring `Config::persist_temp_keys`.
     pub fn session_bytes(&self) -> Vec<u8> {
         self.session().to_bytes(self.inner.config.persist_temp_keys)
+    }
+
+    /// Current Unix time on the server's clock (local clock plus the known offset).
+    pub fn server_time(&self) -> i32 {
+        server_now(self.session().time_offset)
+    }
+
+    /// Writes the session to `path` atomically (see [`write_atomic`]).
+    pub fn save_session(&self, path: &std::path::Path) -> std::io::Result<()> {
+        write_atomic(path, &self.session_bytes())
     }
 
     pub fn home_dc(&self) -> i32 {
@@ -537,6 +563,18 @@ fn migrate_target(e: &RpcError) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("tdr-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.bin");
+        super::write_atomic(&path, b"old").unwrap();
+        super::write_atomic(&path, b"new contents").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new contents");
+        assert!(!dir.join("session.bin.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     #[test]

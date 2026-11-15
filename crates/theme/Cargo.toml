@@ -14,3 +14,4 @@ workspace = true
 
 [build-dependencies]
 zip = { version = "9.5.1", default-features = false, features = ["deflate"] }
+png = "0.18.1"

@@ -289,7 +289,7 @@ impl TextInput {
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
+                self.content[self.valid(self.selected_range.clone())].to_string(),
             ));
         }
     }
@@ -297,13 +297,30 @@ impl TextInput {
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
+                self.content[self.valid(self.selected_range.clone())].to_string(),
             ));
             self.replace_text_in_range(None, "", window, cx)
         }
     }
 
+    /// Clamps a byte offset into the text, onto a character boundary. Offsets come from
+    /// layouts, the platform input method and mouse positions; slicing at a bad one
+    /// would panic, and a panic in a GPUI callback ends the process.
+    fn clamp(&self, offset: usize) -> usize {
+        let mut offset = offset.min(self.content.len());
+        while !self.content.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        offset
+    }
+
+    fn valid(&self, range: Range<usize>) -> Range<usize> {
+        let start = self.clamp(range.start);
+        start..self.clamp(range.end).max(start)
+    }
+
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = self.clamp(offset);
         self.selected_range = offset..offset;
         cx.notify()
     }
@@ -399,6 +416,8 @@ impl TextInput {
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = self.clamp(offset);
+        self.selected_range = self.valid(self.selected_range.clone());
         if self.selection_reversed {
             self.selected_range.start = offset
         } else {
@@ -471,7 +490,7 @@ impl EntityInputHandler for TextInput {
     ) -> Option<String> {
         let range = self.range_from_utf16(&range_utf16);
         actual_range.replace(self.range_to_utf16(&range));
-        Some(self.content[range].to_string())
+        Some(self.content[self.valid(range)].to_string())
     }
 
     fn selected_text_range(
@@ -512,6 +531,7 @@ impl EntityInputHandler for TextInput {
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        let range = self.valid(range);
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
@@ -533,6 +553,7 @@ impl EntityInputHandler for TextInput {
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        let range = self.valid(range);
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
@@ -541,11 +562,23 @@ impl EntityInputHandler for TextInput {
         } else {
             Some(range.start..range.start + new_text.len())
         };
-        self.selected_range = new_selected_range_utf16
+        // The new selection is relative to `new_text` (in UTF-16 units), not to the
+        // whole content.
+        let in_new = |utf16: usize| {
+            let mut units = 0;
+            for (i, ch) in new_text.char_indices() {
+                if units >= utf16 {
+                    return i;
+                }
+                units += ch.len_utf16();
+            }
+            new_text.len()
+        };
+        let selected = new_selected_range_utf16
             .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
+            .map(|r| range.start + in_new(r.start)..range.start + in_new(r.end))
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.selected_range = self.valid(selected);
         cx.notify();
     }
 
