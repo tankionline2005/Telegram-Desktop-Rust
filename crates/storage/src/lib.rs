@@ -24,7 +24,7 @@ pub use rusqlite::Error;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Schema version (`PRAGMA user_version`); bump with a migration in [`migrate`].
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 /// Message ids above this are made by the client (tdesktop's `ServerMaxMsgId`), e.g.
 /// service notifications that the server sends as updates rather than messages.
@@ -199,6 +199,11 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tx.execute_batch(
             "ALTER TABLE dialogs ADD COLUMN pinned_order INTEGER NOT NULL DEFAULT 0;",
         )?;
+    }
+    if version < 6 {
+        // "The start of the chat is loaded" was set on any short page, which the
+        // server also returns in the middle of a history: check again.
+        tx.execute_batch("UPDATE dialogs SET history_complete = 0;")?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()
@@ -935,19 +940,20 @@ impl Writer<'_> {
 
     /// Stores older messages loaded with `offset_id` (newest first, as the server
     /// returns them). If they continue the cached segment, the segment grows down to
-    /// the oldest of them; fewer than `limit` messages means the start of the chat.
+    /// the oldest of them; `complete`: nothing is older (the caller knows it from an
+    /// empty page, as tdesktop does: a short page can be in the middle of a history).
     pub fn extend_history(
         &self,
         peer: PeerKey,
         offset_id: i32,
-        limit: usize,
+        complete: bool,
         rows: &[MessageRow],
     ) -> Result<()> {
         for m in rows {
             self.put_message(m)?;
         }
         let Some(oldest) = rows.iter().map(|m| m.id).min() else {
-            if offset_id != 0 {
+            if complete && offset_id != 0 {
                 self.mark_complete(peer, offset_id)?;
             }
             return Ok(());
@@ -958,7 +964,7 @@ impl Writer<'_> {
                  WHERE kind = ?1 AND id = ?2 AND (cached_from = ?3 OR (?3 = 0 AND cached_from IS NULL))",
             )?
             .execute(params![peer.kind as i64, peer.id, offset_id, oldest])?;
-        if rows.len() < limit {
+        if complete {
             self.mark_complete(peer, oldest)?;
         }
         Ok(())
@@ -1226,7 +1232,8 @@ mod tests {
             .rev()
             .map(|id| msg(a, id, id, false, "old"))
             .collect();
-        s.write(|w| w.extend_history(a, 100, 10, &older)).unwrap();
+        s.write(|w| w.extend_history(a, 100, false, &older))
+            .unwrap();
         assert_eq!(s.history(a, 50).unwrap().messages.len(), 11);
 
         // A live message (in order) keeps the segment contiguous.
@@ -1242,12 +1249,15 @@ mod tests {
             (12, 101, Some(90))
         );
 
-        // A short page means the start of the chat.
-        s.write(|w| w.extend_history(a, 90, 10, &[msg(a, 50, 50, false, "first")]))
+        // A short page is not the start of the chat (the server returns those in the
+        // middle too); the caller says when it is.
+        s.write(|w| w.extend_history(a, 90, false, &[msg(a, 50, 50, false, "first")]))
             .unwrap();
         let h = s.history(a, 50).unwrap();
-        assert!(h.complete);
+        assert!(!h.complete);
         assert_eq!(h.cached_from, Some(50));
+        s.write(|w| w.extend_history(a, 50, true, &[])).unwrap();
+        assert!(s.history(a, 50).unwrap().complete);
 
         // The chat list says the top moved without us seeing it: the segment restarts.
         s.write(|w| {
@@ -1262,7 +1272,8 @@ mod tests {
         );
 
         // Refreshing with the same top keeps the segment.
-        s.write(|w| w.extend_history(a, 200, 10, &older)).unwrap();
+        s.write(|w| w.extend_history(a, 200, false, &older))
+            .unwrap();
         s.write(|w| w.put_dialog(&dialog(200))).unwrap();
         assert_eq!(s.history(a, 50).unwrap().cached_from, Some(90));
     }

@@ -1272,7 +1272,7 @@ impl Sync {
         }
         // Not fewer than asked for: this is not the start of the chat.
         self.store
-            .write(|w| w.extend_history(peer, from, older.len(), &older))?;
+            .write(|w| w.extend_history(peer, from, false, &older))?;
         Ok(())
     }
 
@@ -1314,12 +1314,17 @@ impl Sync {
                     hash: 0,
                 })
                 .await?;
-            let (messages, chats, users) = match answer {
-                enums::messages::Messages::Messages(m) => (m.messages, m.chats, m.users),
-                enums::messages::Messages::Slice(m) => (m.messages, m.chats, m.users),
-                enums::messages::Messages::ChannelMessages(m) => (m.messages, m.chats, m.users),
+            // `messages.messages` is the whole history at once; otherwise only an
+            // empty page says the start was reached (a short one may not).
+            let (messages, chats, users, whole) = match answer {
+                enums::messages::Messages::Messages(m) => (m.messages, m.chats, m.users, true),
+                enums::messages::Messages::Slice(m) => (m.messages, m.chats, m.users, false),
+                enums::messages::Messages::ChannelMessages(m) => {
+                    (m.messages, m.chats, m.users, false)
+                }
                 enums::messages::Messages::NotModified(_) => break,
             };
+            let start_reached = messages.is_empty() || (whole && messages.len() < page);
             let rows: Vec<MessageRow> = messages.iter().filter_map(convert::message_row).collect();
             let peers: Vec<_> = users
                 .iter()
@@ -1330,11 +1335,11 @@ impl Sync {
                 for p in &peers {
                     w.put_peer(p)?;
                 }
-                w.extend_history(peer, offset, page, &rows)
+                w.extend_history(peer, offset, start_reached, &rows)
             })?;
             fetched += rows.len();
             have += rows.len();
-            complete = rows.len() < page;
+            complete = start_reached;
             match rows.iter().map(|m| m.id).min() {
                 Some(oldest) => offset = oldest,
                 None => break,

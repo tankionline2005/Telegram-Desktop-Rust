@@ -734,6 +734,8 @@ pub struct MainView {
     more_dialogs_requested: usize,
     /// The main menu's "Night Mode" row is under the mouse.
     menu_hovered: bool,
+    /// Header data of opened chats that are not in the loaded chat list.
+    extra_chats: HashMap<PeerKey, DialogItem>,
     /// Chats to go back to (`showBackFromStack`), the last on top.
     back_stack: Vec<SavedPane>,
     slide: Option<Slide>,
@@ -881,6 +883,7 @@ impl MainView {
             scroll_anim: None,
             more_dialogs_requested: 0,
             menu_hovered: false,
+            extra_chats: HashMap::new(),
             back_stack: Vec::new(),
             slide: None,
             newer_available: false,
@@ -958,6 +961,30 @@ impl MainView {
             self.loading_newer = true;
             let _ = self.commands.send(Command::LoadNewer(peer));
         }
+    }
+
+    /// A chat's list row, or its header data when it is not in the loaded list.
+    fn chat_item(&self, peer: PeerKey) -> Option<&DialogItem> {
+        self.dialogs
+            .iter()
+            .find(|d| d.peer == peer)
+            .or_else(|| self.extra_chats.get(&peer))
+    }
+
+    /// `InnerWidget::scrollToEntry`: the chat list scrolls just enough to show the
+    /// open chat's row.
+    fn reveal_in_list(&self, peer: PeerKey) {
+        let Some(ix) = self.dialogs.iter().position(|d| d.peer == peer) else {
+            return;
+        };
+        let (_, _, offset) = self.scroll_metrics(Area::Dialogs);
+        let first_visible = (offset / lg(DIALOG_ROW_HEIGHT)).floor() as usize;
+        let strategy = if ix < first_visible {
+            gpui::ScrollStrategy::Top
+        } else {
+            gpui::ScrollStrategy::Bottom
+        };
+        self.dialogs_scroll.scroll_to_item(ix, strategy);
     }
 
     /// The open chat, set aside with its list (a fresh list takes its place).
@@ -1043,6 +1070,7 @@ impl MainView {
         self.scroll_anim = None;
         self.history_bar.drag = None;
         let _ = self.commands.send(Command::OpenChatAt { peer, msg_id });
+        self.reveal_in_list(peer);
         window.focus(&self.input.focus_handle(cx));
         cx.notify();
     }
@@ -1066,7 +1094,9 @@ impl MainView {
         }
         let draft = self.draft_of(peer).unwrap_or_default();
         self.set_input_text(draft, cx);
-        let _ = self.commands.send(Command::OpenChat(peer));
+        // The data side gives back the same history: the list keeps its position.
+        let _ = self.commands.send(Command::Back);
+        self.reveal_in_list(peer);
         window.focus(&self.input.focus_handle(cx));
         cx.notify();
     }
@@ -1534,6 +1564,9 @@ impl MainView {
                     self.draft_dirty_since = None;
                     self.set_input_text(text.unwrap_or_default(), cx);
                 }
+            }
+            Update::ChatInfo(item) => {
+                self.extra_chats.insert(item.peer, *item);
             }
             Update::Members { peer, text } => {
                 self.members.insert(peer, text);
@@ -2518,9 +2551,7 @@ impl MainView {
         view: &WeakEntity<Self>,
     ) -> AnyElement {
         let p = self.palette();
-        let chat = pane
-            .peer
-            .and_then(|peer| self.dialogs.iter().find(|d| d.peer == peer));
+        let chat = pane.peer.and_then(|peer| self.chat_item(peer));
         let is_group = chat.is_some_and(|d| d.is_group());
         let is_saved = chat.is_some_and(|d| d.is_saved);
         let wide = chat_width >= CHAT_WIDE_WIDTH;
@@ -3128,7 +3159,7 @@ impl MainView {
             true
         };
         let p = self.palette();
-        let Some(other_chat) = self.dialogs.iter().find(|d| d.peer == peer).cloned() else {
+        let Some(other_chat) = self.chat_item(peer).cloned() else {
             return live;
         };
         let header = self.render_header(&other_chat, border, still_back, window, cx);
@@ -3681,10 +3712,7 @@ impl Render for MainView {
             };
             self.day_background(top, window, cx)
         };
-        let right = match self
-            .selected
-            .and_then(|peer| self.dialogs.iter().find(|d| d.peer == peer))
-        {
+        let right = match self.selected.and_then(|peer| self.chat_item(peer)) {
             None => self
                 .with_chat_background(div(), day)
                 .flex_1()

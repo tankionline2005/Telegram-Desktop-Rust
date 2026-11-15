@@ -39,6 +39,8 @@ pub enum Command {
     },
     /// A chat shown around an older message was scrolled to its bottom: load newer.
     LoadNewer(PeerKey),
+    /// Back to the chat open before the last `OpenChatAt`, with the same history.
+    Back,
     Send {
         peer: PeerKey,
         text: String,
@@ -93,6 +95,8 @@ pub enum Update {
         photo_id: i64,
         image: Arc<RenderImage>,
     },
+    /// An opened chat's header data, for chats not in the loaded chat list.
+    ChatInfo(Box<DialogItem>),
     /// Connection state for the header ("Connecting…"), empty when online.
     Status(String),
     Fatal(String),
@@ -647,6 +651,30 @@ fn send_dialogs(
     Ok(())
 }
 
+/// The header data of a chat that may not be in the loaded list (a chat opened
+/// from a forward): from its cached dialog, or just its peer.
+fn chat_info(store: &Storage, peer: PeerKey) -> Option<DialogItem> {
+    let row = store.peer(peer).ok().flatten()?;
+    let view = DialogView {
+        dialog: tdr_data::tdr_storage::DialogRow {
+            peer,
+            top_message: 0,
+            top_date: 0,
+            pinned: false,
+            folder_id: 0,
+            unread_count: 0,
+            pts: None,
+            read_inbox_max_id: 0,
+            read_outbox_max_id: 0,
+            mute_until: None,
+        },
+        peer: Some(row),
+        top: None,
+        draft: None,
+    };
+    Some(dialog_item(store, &view, &Context::load(store)))
+}
+
 /// What part of the open chat's history is shown.
 enum Shown {
     /// The newest messages of the cached segment.
@@ -806,6 +834,8 @@ async fn run(
     let mut open: Option<PeerKey> = None;
     // How many messages of the open chat are shown (grows as the user scrolls up).
     let mut shown = Shown::Latest(HISTORY);
+    // Chats `OpenChatAt` went away from, with what they showed (`Back` returns).
+    let mut back: Vec<(PeerKey, Shown)> = Vec::new();
     loop {
         tokio::select! {
             cmd = commands.recv() => {
@@ -825,6 +855,7 @@ async fn run(
                         send_dialogs(sync.store(), shown_dialogs, &tx)?;
                     }
                     Command::OpenChat(peer) => {
+                        back.clear();
                         open = Some(peer);
                         let count = open_count(sync.store(), peer);
                         shown = Shown::Latest(count);
@@ -894,7 +925,8 @@ async fn run(
                             if let Some(oldest) = rows.last().map(|m| m.id) {
                                 match sync.history_page(peer, oldest, 0, WINDOW_PAGE).await {
                                     Ok(page) => {
-                                        *older_done = page.len() < WINDOW_PAGE as usize;
+                                        // Only an empty page is the start.
+                                        *older_done = page.is_empty();
                                         rows.extend(page.into_iter().filter(|m| m.id < oldest));
                                     }
                                     Err(e) => error!("history: {e}"),
@@ -932,8 +964,21 @@ async fn run(
                         }
                     }
                     Command::LoadNewer(_) => {}
+                    Command::Back => {
+                        if let Some((peer, was)) = back.pop() {
+                            open = Some(peer);
+                            shown = was;
+                            send_history(sync.store(), peer, &shown, None, &tx)?;
+                        }
+                    }
                     Command::OpenChatAt { peer, msg_id } => {
+                        if let Some(previous) = open.filter(|p| *p != peer) {
+                            back.push((previous, std::mem::replace(&mut shown, Shown::Latest(HISTORY))));
+                        }
                         open = Some(peer);
+                        if let Some(item) = chat_info(sync.store(), peer) {
+                            let _ = tx.send(Update::ChatInfo(Box::new(item)));
+                        }
                         // In the cached history: shown from the newest down to it.
                         if let Some(n) = sync.store().count_from(peer, msg_id)? {
                             shown = Shown::Latest(open_count(sync.store(), peer).max(n + 30));
@@ -953,6 +998,10 @@ async fn run(
                             }
                         }
                         send_history(sync.store(), peer, &shown, Some(msg_id), &tx)?;
+                        // Its peer came with the history if it was unknown.
+                        if let Some(item) = chat_info(sync.store(), peer) {
+                            let _ = tx.send(Update::ChatInfo(Box::new(item)));
+                        }
                         if let Err(e) = sync.refresh_user(peer).await {
                             error!("user: {e}");
                         }
@@ -1288,7 +1337,7 @@ pub fn start_demo() -> (
                     let _ = up_tx.send(Update::Dialogs(dialogs.clone()));
                     continue;
                 }
-                Command::LoadMoreDialogs | Command::LoadNewer(_) => continue,
+                Command::LoadMoreDialogs | Command::LoadNewer(_) | Command::Back => continue,
                 Command::OpenChatAt { peer, msg_id } => focus = Some((peer, msg_id)),
                 Command::OpenChat(_)
                 | Command::CloseChat
