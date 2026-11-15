@@ -255,3 +255,23 @@ sha256 = "5e3b829d1f7e11fb0eb02e7ea0f9d88737fb3c07faa2a6fb5f90986b5e057400"
 path = "assets/tdesktop-icons/history_received@3x.png"
 upstream = "Telegram/Resources/icons/history_received@3x.png"
 sha256 = "b2844f8c1674bd059ddd3f8d18b309a69640839f8adc646d2643b5471bca3515"
+
+[[vendored]]
+path = "assets/tdesktop-icons/bubble_tail.png"
+upstream = "Telegram/Resources/icons/bubble_tail.png"
+sha256 = "e7442ebc6bc48402af5306c123f194936375471d84b83d9ab53bf6320c1bcf94"
+
+[[vendored]]
+path = "assets/tdesktop-icons/bubble_tail@2x.png"
+upstream = "Telegram/Resources/icons/bubble_tail@2x.png"
+sha256 = "23dc1a2017341344b580cd76868912a826fd71e8f29600ad3c9a59cd7ed2f775"
+
+[[vendored]]
+path = "assets/tdesktop-icons/bubble_tail@3x.png"
+upstream = "Telegram/Resources/icons/bubble_tail@3x.png"
+sha256 = "d1c5eefe2fe866d50c941d0a1be6704983bf025dd950f4e2fe8bc1574bc5144f"
+
+[[vendored]]
+path = "assets/tdesktop-art/background.tgv"
+upstream = "Telegram/Resources/art/background.tgv"
+sha256 = "3c5ef666d033ce9effe703b80348b9d7363323f0076b2856ec041923c78b0ab8"

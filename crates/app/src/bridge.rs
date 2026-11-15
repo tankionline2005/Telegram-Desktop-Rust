@@ -23,6 +23,10 @@ use crate::present;
 #[derive(Debug, Clone)]
 pub enum Command {
     OpenChat(PeerKey),
+    /// The chat list was scrolled near its end: show (and load) more chats.
+    LoadMoreDialogs,
+    /// The pinned chats were dragged into this order.
+    ReorderPinned(Vec<PeerKey>),
     /// The chat view was closed (Esc).
     CloseChat,
     /// The user scrolled to the top of the open chat: load older messages.
@@ -423,7 +427,9 @@ fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec
         .collect()
 }
 
+/// Chats shown at first; every `LoadMoreDialogs` adds a page.
 const DIALOGS: usize = 200;
+const DIALOGS_STEP: usize = 100;
 const HISTORY: usize = 60;
 
 pub struct Paths {
@@ -506,8 +512,12 @@ pub fn start(
     (cmd_tx, up_rx)
 }
 
-fn send_dialogs(store: &Storage, tx: &mpsc::UnboundedSender<Update>) -> anyhow::Result<()> {
-    let list = store.dialogs(0, DIALOGS)?;
+fn send_dialogs(
+    store: &Storage,
+    shown: usize,
+    tx: &mpsc::UnboundedSender<Update>,
+) -> anyhow::Result<()> {
+    let list = store.dialogs(0, shown)?;
     let ctx = Context::load(store);
     let items = list.iter().map(|d| dialog_item(store, d, &ctx)).collect();
     let _ = tx.send(Update::Dialogs(items));
@@ -534,7 +544,25 @@ fn changed(a: &Applied) -> bool {
         || a.edited > 0
         || a.deleted > 0
         || a.reloaded
+        || a.marks_changed
+        || a.pinned_changed
         || !a.draft_changes.is_empty()
+}
+
+/// Loads pages of the server's chat list until the `shown` first chats are confirmed
+/// (or the list ends). Returns whether anything was loaded.
+async fn confirm_dialogs(sync: &mut Sync, shown: usize) -> bool {
+    let mut any = false;
+    while sync.dialogs_loaded() < shown && !sync.dialogs_complete() {
+        match sync.load_more_dialogs().await {
+            Ok(n) => any |= n > 0,
+            Err(e) => {
+                error!("chat list: {e}");
+                break;
+            }
+        }
+    }
+    any
 }
 
 /// Drafts changed from another device go to the input fields.
@@ -562,7 +590,9 @@ async fn run(
         std::fs::create_dir_all(dir)?;
     }
     let store = Storage::open(&paths.cache)?;
-    send_dialogs(&store, &tx)?;
+    // How many chats the list shows (grows as it is scrolled down).
+    let mut shown = DIALOGS;
+    send_dialogs(&store, shown, &tx)?;
     info!(elapsed = ?crate::STARTED.elapsed(), "data: cached chat list sent");
 
     let session = match std::fs::read(&paths.session) {
@@ -592,9 +622,13 @@ async fn run(
     let applied = sync.start().await?;
     info!(elapsed = ?started.elapsed(), "synced");
     save(&client);
-    send_dialogs(sync.store(), &tx)?;
+    send_dialogs(sync.store(), shown, &tx)?;
     send_draft_changes(&applied, &tx);
     let _ = tx.send(Update::Status(String::new()));
+    // The shown part of the cached list may be stale below what the start refreshed.
+    if confirm_dialogs(&mut sync, shown).await {
+        send_dialogs(sync.store(), shown, &tx)?;
+    }
     // When to save drafts to the cloud. Drafts left unsaved last time (the app quit
     // first) go up right away.
     let mut cloud_save_at = sync
@@ -616,6 +650,19 @@ async fn run(
             cmd = commands.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
+                    Command::LoadMoreDialogs => {
+                        shown += DIALOGS_STEP;
+                        send_dialogs(sync.store(), shown, &tx)?;
+                        if confirm_dialogs(&mut sync, shown).await {
+                            send_dialogs(sync.store(), shown, &tx)?;
+                        }
+                    }
+                    Command::ReorderPinned(order) => {
+                        if let Err(e) = sync.reorder_pinned(order).await {
+                            error!("pinned order: {e}");
+                        }
+                        send_dialogs(sync.store(), shown, &tx)?;
+                    }
                     Command::OpenChat(peer) => {
                         open = Some(peer);
                         count = open_count(sync.store(), peer);
@@ -624,7 +671,7 @@ async fn run(
                             Ok(_) => send_history(sync.store(), peer, count, &tx)?,
                             Err(e) => error!("history: {e}"),
                         }
-                        send_dialogs(sync.store(), &tx)?;
+                        send_dialogs(sync.store(), shown, &tx)?;
                         // Supergroups and channels: the member count is in the full info.
                         match sync.member_count(peer).await {
                             Ok(Some(n)) => {
@@ -636,7 +683,7 @@ async fn run(
                         }
                     }
                     Command::Read { peer, max_id } => match sync.read_history(peer, max_id).await {
-                        Ok(_) => send_dialogs(sync.store(), &tx)?,
+                        Ok(_) => send_dialogs(sync.store(), shown, &tx)?,
                         Err(e) => error!("read: {e}"),
                     },
                     Command::LoadUserpic { peer, photo_id, dc_id } => {
@@ -662,7 +709,7 @@ async fn run(
                     Command::CloseChat => open = None,
                     Command::SaveDraft { peer, text, cloud } => {
                         if sync.set_draft(peer, &text)? {
-                            send_dialogs(sync.store(), &tx)?;
+                            send_dialogs(sync.store(), shown, &tx)?;
                         }
                         if cloud && sync.has_unsaved_drafts() && cloud_save_at.is_none() {
                             cloud_save_at = Some(tokio::time::Instant::now() + SAVE_CLOUD_DRAFT_DELAY);
@@ -680,7 +727,7 @@ async fn run(
                     Command::Send { peer, text } => {
                         match sync.send_text(peer, &text).await {
                             Ok(_) => {
-                                send_dialogs(sync.store(), &tx)?;
+                                send_dialogs(sync.store(), shown, &tx)?;
                                 if open == Some(peer) {
                                     send_history(sync.store(), peer, count, &tx)?;
                                 }
@@ -716,7 +763,7 @@ async fn run(
             event = sync.wait_event(Duration::from_secs(5)) => {
                 let applied = sync.process(event).await?;
                 if changed(&applied) {
-                    send_dialogs(sync.store(), &tx)?;
+                    send_dialogs(sync.store(), shown, &tx)?;
                     send_draft_changes(&applied, &tx);
                     if let Some(peer) = open {
                         let touched = applied.new_messages.iter().any(|m| m.peer == peer)
@@ -791,7 +838,7 @@ pub fn start_demo() -> (
             line(Some("Bob"), None, "the new borrow checker is great"),
             14,
             false,
-            false,
+            true,
             None,
             today(8, 7),
         ),
@@ -923,7 +970,7 @@ pub fn start_demo() -> (
             status: "last seen a long time ago".into(),
         });
     }
-    let _ = up_tx.send(Update::Dialogs(dialogs));
+    let _ = up_tx.send(Update::Dialogs(dialogs.clone()));
     std::thread::spawn(move || {
         let text =
             |out: bool, text: &str| (out, Some(text.to_string()), None::<&str>, None::<&str>);
@@ -984,6 +1031,14 @@ pub fn start_demo() -> (
         let mut next_id = 2000;
         while let Some(cmd) = cmd_rx.blocking_recv() {
             match cmd {
+                Command::ReorderPinned(order) => {
+                    let rank = |d: &DialogItem| order.iter().position(|p| *p == d.peer);
+                    let pinned = dialogs.iter().take_while(|d| d.pinned).count();
+                    dialogs[..pinned].sort_by_key(|d| rank(d).unwrap_or(usize::MAX));
+                    let _ = up_tx.send(Update::Dialogs(dialogs.clone()));
+                    continue;
+                }
+                Command::LoadMoreDialogs => continue,
                 Command::OpenChat(_)
                 | Command::CloseChat
                 | Command::SaveDraft { .. }

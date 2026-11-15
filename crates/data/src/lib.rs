@@ -72,6 +72,8 @@ pub struct Applied {
     pub reloaded: bool,
     /// Read marks or mute settings changed (check marks, badges).
     pub marks_changed: bool,
+    /// Chats were pinned, unpinned or reordered.
+    pub pinned_changed: bool,
     /// Local drafts changed by the server (another device): the input field of an
     /// open chat should show the new text (`None`: cleared).
     pub draft_changes: Vec<drafts::Change>,
@@ -86,6 +88,7 @@ impl Applied {
         self.deleted += other.deleted;
         self.reloaded |= other.reloaded;
         self.marks_changed |= other.marks_changed;
+        self.pinned_changed |= other.pinned_changed;
         self.draft_changes.extend(other.draft_changes);
         self.cloud_drafts.extend(other.cloud_drafts);
     }
@@ -104,6 +107,23 @@ pub struct Sync {
     drafts: Drafts,
     /// Drafts that came with the chat list, applied with the next `Applied`.
     dialog_drafts: Vec<(PeerKey, drafts::CloudDraft, bool)>,
+    /// Where the next page of the server's chat list starts (`None`: at the top).
+    dialogs_cursor: Option<DialogsCursor>,
+    /// The server's chat list was loaded to its end in this session.
+    dialogs_complete: bool,
+    /// Chats loaded from the top of the server's list in this session.
+    dialogs_loaded: usize,
+    /// Pinned entries of the main list that are not chats we keep (the archive folder,
+    /// communities), with their place among the pinned: a reorder must keep them.
+    pinned_extra: Vec<(usize, enums::InputDialogPeer)>,
+}
+
+/// `messages.getDialogs` offsets: the last chat of the previous page.
+#[derive(Clone)]
+struct DialogsCursor {
+    date: i32,
+    id: i32,
+    peer: enums::InputPeer,
 }
 
 fn to_engine(s: UpdateState) -> State {
@@ -140,7 +160,58 @@ impl Sync {
             self_id,
             drafts,
             dialog_drafts: Vec::new(),
+            dialogs_cursor: None,
+            dialogs_complete: false,
+            dialogs_loaded: 0,
+            pinned_extra: Vec::new(),
         })
+    }
+
+    /// The whole chat list has been loaded from the server in this session.
+    pub fn dialogs_complete(&self) -> bool {
+        self.dialogs_complete
+    }
+
+    /// How many chats from the top of the list are confirmed by the server in this
+    /// session (the cache below them may be stale).
+    pub fn dialogs_loaded(&self) -> usize {
+        self.dialogs_loaded
+    }
+
+    /// The next page of the chat list (tdesktop loads it as the list is scrolled down).
+    /// Returns how many chats came.
+    pub async fn load_more_dialogs(&mut self) -> Result<usize> {
+        if self.dialogs_complete {
+            return Ok(0);
+        }
+        self.load_dialogs_page().await
+    }
+
+    /// The user dragged the pinned chats of the main list into `order`: stored, then
+    /// sent as tdesktop's `ApiWrap::savePinnedOrder` does.
+    pub async fn reorder_pinned(&mut self, order: Vec<PeerKey>) -> Result<()> {
+        self.store.write(|w| w.set_pinned_order(0, &order))?;
+        let mut input: Vec<enums::InputDialogPeer> = order
+            .iter()
+            .filter_map(|&peer| self.input_peer(peer))
+            .map(|peer| {
+                enums::InputDialogPeer::InputDialogPeer(Box::new(types::InputDialogPeer { peer }))
+            })
+            .collect();
+        // `force` unpins whatever the order leaves out: only send it when nothing is
+        // missing.
+        let complete = input.len() == order.len();
+        for (index, extra) in &self.pinned_extra {
+            input.insert((*index).min(input.len()), extra.clone());
+        }
+        self.client
+            .invoke(&functions::messages::ReorderPinnedDialogs {
+                force: complete,
+                folder_id: 0,
+                order: input,
+            })
+            .await?;
+        Ok(())
     }
 
     pub fn store(&self) -> &Storage {
@@ -236,107 +307,184 @@ impl Sync {
         Ok(applied)
     }
 
+    /// Loads the chat list from the top until `limit` chats came (or its end).
     async fn load_dialogs(&mut self, limit: usize) -> Result<usize> {
-        let mut offset_date = 0;
-        let mut offset_id = 0;
-        let mut offset_peer = enums::InputPeer::Empty;
+        self.dialogs_cursor = None;
+        self.dialogs_complete = false;
+        self.dialogs_loaded = 0;
         let mut loaded = 0;
-        while loaded < limit {
-            let page = self
-                .client
-                .invoke(&functions::messages::GetDialogs {
-                    exclude_pinned: false,
-                    folder_id: None,
-                    offset_date,
-                    offset_id,
-                    offset_peer: offset_peer.clone(),
-                    limit: DIALOGS_PAGE,
-                    hash: 0,
-                })
-                .await?;
-            let (dialogs, messages, chats, users, total) = match page {
-                enums::messages::Dialogs::Dialogs(d) => {
-                    let n = d.dialogs.len();
-                    (d.dialogs, d.messages, d.chats, d.users, n)
-                }
-                enums::messages::Dialogs::Slice(d) => {
-                    (d.dialogs, d.messages, d.chats, d.users, d.count as usize)
-                }
-                enums::messages::Dialogs::NotModified(_) => break,
-            };
-            let message_rows: Vec<MessageRow> =
-                messages.iter().filter_map(convert::message_row).collect();
-            let peer_rows: Vec<_> = users
-                .iter()
-                .filter_map(convert::user_row)
-                .chain(chats.iter().filter_map(convert::chat_row))
-                .collect();
-            let mut rows = Vec::new();
-            for d in &dialogs {
-                let enums::Dialog::Dialog(d) = d else {
-                    continue;
-                };
-                let peer = convert::peer_key(&d.peer);
-                let top_date = message_rows
-                    .iter()
-                    .find(|m| m.peer == peer && m.id == d.top_message)
-                    .map_or(0, |m| m.date);
-                if peer.kind == PeerKind::Channel
-                    && let Some(pts) = d.pts
-                {
-                    self.engine.set_channel_pts(peer.id, pts);
-                }
-                if let Some(draft) = &d.draft {
-                    self.dialog_drafts
-                        .push((peer, convert::cloud_draft(draft), true));
-                }
-                rows.push(DialogRow {
-                    peer,
-                    top_message: d.top_message,
-                    top_date,
-                    pinned: d.pinned,
-                    folder_id: d.folder_id.unwrap_or(0),
-                    unread_count: d.unread_count,
-                    pts: d.pts,
-                    read_inbox_max_id: d.read_inbox_max_id,
-                    read_outbox_max_id: d.read_outbox_max_id,
-                    mute_until: convert::mute_until(&d.notify_settings),
-                });
-            }
-            let dirty = self.engine.take_dirty_channels();
-            self.store.write(|w| {
-                for p in &peer_rows {
-                    w.put_peer(p)?;
-                }
-                for m in &message_rows {
-                    w.put_message(m)?;
-                }
-                for d in &rows {
-                    w.put_dialog(d)?;
-                }
-                for (id, pts) in &dirty {
-                    w.set_channel_pts(*id, *pts)?;
-                }
-                Ok(())
-            })?;
-            loaded += rows.len();
-            if dialogs.len() < DIALOGS_PAGE as usize || loaded >= total {
-                break;
-            }
-            // Continue after the last chat of this page.
-            let Some(last) = rows.last() else { break };
-            offset_date = last.top_date;
-            offset_id = last.top_message;
-            let hash = peer_rows
-                .iter()
-                .find(|p| p.key == last.peer)
-                .and_then(|p| p.access_hash);
-            match convert::input_peer(last.peer, hash) {
-                Some(p) => offset_peer = p,
-                None => break,
-            }
+        while loaded < limit && !self.dialogs_complete {
+            loaded += self.load_dialogs_page().await?;
         }
         Ok(loaded)
+    }
+
+    /// One page of the chat list after `dialogs_cursor`. The cache may hold chats from
+    /// earlier sessions that are no longer in the list or have moved: every page
+    /// replaces the cached chats in the range of dates it covers, so the part of the
+    /// list loaded in this session is exact.
+    async fn load_dialogs_page(&mut self) -> Result<usize> {
+        let first = self.dialogs_cursor.is_none();
+        let (offset_date, offset_id, offset_peer) = match &self.dialogs_cursor {
+            Some(c) => (c.date, c.id, c.peer.clone()),
+            None => (0, 0, enums::InputPeer::Empty),
+        };
+        let page = self
+            .client
+            .invoke(&functions::messages::GetDialogs {
+                exclude_pinned: false,
+                folder_id: None,
+                offset_date,
+                offset_id,
+                offset_peer,
+                limit: DIALOGS_PAGE,
+                hash: 0,
+            })
+            .await?;
+        let (dialogs, messages, chats, users, slice) = match page {
+            enums::messages::Dialogs::Dialogs(d) => {
+                (d.dialogs, d.messages, d.chats, d.users, false)
+            }
+            enums::messages::Dialogs::Slice(d) => (d.dialogs, d.messages, d.chats, d.users, true),
+            enums::messages::Dialogs::NotModified(_) => {
+                self.dialogs_complete = true;
+                return Ok(0);
+            }
+        };
+        let message_rows: Vec<MessageRow> =
+            messages.iter().filter_map(convert::message_row).collect();
+        let peer_rows: Vec<_> = users
+            .iter()
+            .filter_map(convert::user_row)
+            .chain(chats.iter().filter_map(convert::chat_row))
+            .collect();
+        let hash_of = |key: PeerKey| {
+            peer_rows
+                .iter()
+                .find(|p| p.key == key)
+                .and_then(|p| p.access_hash)
+        };
+        let mut rows = Vec::new();
+        // The first page starts with every pinned entry, in order.
+        let mut pinned_order = Vec::new();
+        let mut pinned_extra = Vec::new();
+        for d in &dialogs {
+            let d = match d {
+                enums::Dialog::Dialog(d) => d,
+                enums::Dialog::Folder(f) => {
+                    if f.pinned {
+                        let enums::Folder::Folder(folder) = &f.folder;
+                        pinned_extra.push((
+                            pinned_order.len() + pinned_extra.len(),
+                            enums::InputDialogPeer::Folder(types::InputDialogPeerFolder {
+                                folder_id: folder.id,
+                            }),
+                        ));
+                    }
+                    continue;
+                }
+                enums::Dialog::Community(c) => {
+                    if c.pinned
+                        && let Some(access_hash) = hash_of(PeerKey::channel(c.community_id))
+                    {
+                        pinned_extra.push((
+                            pinned_order.len() + pinned_extra.len(),
+                            enums::InputDialogPeer::Community(Box::new(
+                                types::InputDialogPeerCommunity {
+                                    community: enums::InputChannel::InputChannel(
+                                        types::InputChannel {
+                                            channel_id: c.community_id,
+                                            access_hash,
+                                        },
+                                    ),
+                                },
+                            )),
+                        ));
+                    }
+                    continue;
+                }
+            };
+            let peer = convert::peer_key(&d.peer);
+            let top_date = message_rows
+                .iter()
+                .find(|m| m.peer == peer && m.id == d.top_message)
+                .map_or(0, |m| m.date);
+            if peer.kind == PeerKind::Channel
+                && let Some(pts) = d.pts
+            {
+                self.engine.set_channel_pts(peer.id, pts);
+            }
+            if let Some(draft) = &d.draft {
+                self.dialog_drafts
+                    .push((peer, convert::cloud_draft(draft), true));
+            }
+            if d.pinned {
+                pinned_order.push(peer);
+            }
+            rows.push(DialogRow {
+                peer,
+                top_message: d.top_message,
+                top_date,
+                pinned: d.pinned,
+                folder_id: d.folder_id.unwrap_or(0),
+                unread_count: d.unread_count,
+                pts: d.pts,
+                read_inbox_max_id: d.read_inbox_max_id,
+                read_outbox_max_id: d.read_outbox_max_id,
+                mute_until: convert::mute_until(&d.notify_settings),
+            });
+        }
+        let complete = !slice || dialogs.len() < DIALOGS_PAGE as usize || rows.is_empty();
+        // The page's range of dates among unpinned chats: (its oldest, the cursor).
+        let oldest = rows.iter().filter(|r| !r.pinned).map(|r| r.top_date).min();
+        let after = if complete { None } else { oldest };
+        let before = (!first).then_some(offset_date);
+        let prune = complete || oldest.is_some();
+        let keep: Vec<PeerKey> = rows.iter().map(|r| r.peer).collect();
+        let dirty = self.engine.take_dirty_channels();
+        let removed = self.store.write(|w| {
+            for p in &peer_rows {
+                w.put_peer(p)?;
+            }
+            for m in &message_rows {
+                w.put_message(m)?;
+            }
+            for d in &rows {
+                w.put_dialog(d)?;
+            }
+            for (id, pts) in &dirty {
+                w.set_channel_pts(*id, *pts)?;
+            }
+            if first {
+                w.set_pinned_order(0, &pinned_order)?;
+            }
+            if prune {
+                w.prune_dialogs(0, after, before, &keep)
+            } else {
+                Ok(0)
+            }
+        })?;
+        if first {
+            self.pinned_extra = pinned_extra;
+        }
+        if removed > 0 {
+            debug!(removed, "stale chats dropped from the cached list");
+        }
+        self.dialogs_complete = complete;
+        self.dialogs_loaded += rows.len();
+        // Continue after the last chat of this page.
+        self.dialogs_cursor = rows.last().and_then(|last| {
+            let peer = convert::input_peer(last.peer, hash_of(last.peer))?;
+            Some(DialogsCursor {
+                date: last.top_date,
+                id: last.top_message,
+                peer,
+            })
+        });
+        if self.dialogs_cursor.is_none() {
+            self.dialogs_complete = true;
+        }
+        Ok(rows.len())
     }
 
     /// Waits up to `timeout` for updates and applies them.
@@ -937,6 +1085,26 @@ fn apply_update(
                 _ => {}
             }
             applied.marks_changed = true;
+        }
+        U::DialogPinned(x) if x.folder_id.unwrap_or(0) == 0 => {
+            if let enums::DialogPeer::DialogPeer(d) = &x.peer {
+                w.set_pinned(convert::peer_key(&d.peer), x.pinned)?;
+                applied.pinned_changed = true;
+            }
+        }
+        U::PinnedDialogs(x) if x.folder_id.unwrap_or(0) == 0 => {
+            // Without the order the next chat list refresh brings it.
+            if let Some(order) = &x.order {
+                let peers: Vec<PeerKey> = order
+                    .iter()
+                    .filter_map(|p| match p {
+                        enums::DialogPeer::DialogPeer(d) => Some(convert::peer_key(&d.peer)),
+                        _ => None,
+                    })
+                    .collect();
+                w.set_pinned_order(0, &peers)?;
+                applied.pinned_changed = true;
+            }
         }
         // Statuses, typing, reactions, ... are not cached yet.
         _ => {}

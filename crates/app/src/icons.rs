@@ -31,6 +31,9 @@ pub enum Icon {
     /// The same in an outgoing bubble.
     HistorySent,
     HistoryReceived,
+    /// The bubble tail on the left (`historyBubbleTailInLeft`) and its mirror.
+    BubbleTail,
+    BubbleTailRight,
 }
 
 macro_rules! icon_bytes {
@@ -60,6 +63,7 @@ impl Icon {
             Icon::DialogsReceived => icon_bytes!("dialogs__dialogs_received"),
             Icon::HistorySent => icon_bytes!("history_sent"),
             Icon::HistoryReceived => icon_bytes!("history_received"),
+            Icon::BubbleTail | Icon::BubbleTailRight => icon_bytes!("bubble_tail"),
         }
     }
 }
@@ -109,8 +113,10 @@ fn tinted(icon: Icon, color: Color, scale: usize) -> Arc<Tinted> {
     };
     let base = decode(files[0]);
     let mut mask = decode(files[scale]);
-    if icon == Icon::UpArrow {
-        image::imageops::flip_vertical_in_place(&mut mask);
+    match icon {
+        Icon::UpArrow => image::imageops::flip_vertical_in_place(&mut mask),
+        Icon::BubbleTailRight => image::imageops::flip_horizontal_in_place(&mut mask),
+        _ => {}
     }
     let rgba = color.rgba();
     let (r, g, b, a) = (

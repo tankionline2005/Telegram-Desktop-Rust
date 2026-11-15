@@ -82,6 +82,8 @@ const UNREAD_BAR_MARGIN: f32 = 8.;
 /// Room after the time for the ✓ / ✓✓ of outgoing messages (`historySendStateSpace`
 /// minus the gap already there).
 const SEND_STATE_SPACE: f32 = 18.;
+/// `bubble_tail` width.
+const TAIL_WIDTH: f32 = 6.;
 /// Messages of one author closer than this are drawn as a group
 /// (tdesktop: `kAttachMessageToPreviousSecondsDelta`).
 const ATTACH_SECONDS: i32 = 900;
@@ -246,6 +248,57 @@ fn service_pill(p: &Palette, text: String, width: f32) -> gpui::Div {
         .child(text)
 }
 
+/// `slideDuration`: the "scroll to top" / "scroll down" animations.
+const SLIDE_DURATION: Duration = Duration::from_millis(240);
+/// `stickersRowDuration`: pinned chats sliding into place while one is dragged.
+const PINNED_SHIFT_DURATION: Duration = Duration::from_millis(200);
+/// `kStartReorderThreshold`: how far a pressed pinned chat moves before it is dragged.
+const REORDER_THRESHOLD: f32 = 30.;
+
+fn sine_in_out(t: f32) -> f32 {
+    -((std::f32::consts::PI * t).cos() - 1.) / 2.
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    1. - (1. - t).powi(3)
+}
+
+/// The pinned chats of `list` (its first rows) put in `order`.
+fn apply_pinned_order(list: &mut [DialogItem], order: &[PeerKey]) {
+    let pinned = list.iter().take_while(|d| d.pinned).count();
+    list[..pinned].sort_by_key(|d| {
+        order
+            .iter()
+            .position(|p| *p == d.peer)
+            .unwrap_or(usize::MAX)
+    });
+}
+
+/// A chat row pressed (left or right button): it may become a pinned-chat drag.
+struct RowPress {
+    peer: PeerKey,
+    start_y: Pixels,
+}
+
+/// A pinned chat being dragged (`InnerWidget::_dragging`).
+struct PinDrag {
+    peer: PeerKey,
+    /// The mouse position the row's slot corresponds to (moves with each swap).
+    start_y: f32,
+    /// The row's offset from its slot.
+    yadd: f32,
+    start_order: Vec<PeerKey>,
+}
+
+/// An animated scroll (`_scrollToAnimation`).
+struct ScrollAnim {
+    area: Area,
+    from: f32,
+    to: f32,
+    start: Instant,
+    ease_out: bool,
+}
+
 /// The column edge being dragged: where it started.
 struct ColumnDrag {
     start_mouse_x: Pixels,
@@ -321,6 +374,22 @@ pub struct MainView {
     columns: Columns,
     columns_path: Option<PathBuf>,
     column_drag: Option<ColumnDrag>,
+    row_press: Option<RowPress>,
+    pin_drag: Option<PinDrag>,
+    /// Rows sliding into place after a reorder: offset at the start, start time.
+    row_shifts: HashMap<PeerKey, (f32, Instant)>,
+    /// The order just set by a drag, kept on incoming lists until they have it.
+    pinned_override: Option<(Vec<PeerKey>, Instant)>,
+    /// A drag ended with this mouse release: the click it makes must not open a chat.
+    suppress_open: bool,
+    scroll_anim: Option<ScrollAnim>,
+    /// The list length when more chats were last asked for.
+    more_dialogs_requested: usize,
+    /// The main menu's "Night Mode" row is under the mouse.
+    menu_hovered: bool,
+    /// The day wallpaper for a chat area of this many device pixels.
+    day_background: Option<((u32, u32), Arc<RenderImage>)>,
+    day_background_busy: bool,
     /// Opening a chat with unread messages: its `read_inbox_max_id`, until the history
     /// arrives and the view is placed at the first unread message.
     unread_target: Option<i32>,
@@ -412,6 +481,7 @@ impl MainView {
             cx.defer(move |cx| {
                 let _ = view.update(cx, |v, cx| {
                     v.stick_to_bottom = at_bottom;
+                    v.stop_scroll_anim(Area::History);
                     v.scrolled(Area::History, cx);
                     v.mark_read(visible_end);
                     if near_top {
@@ -442,6 +512,16 @@ impl MainView {
             columns: Columns::default(),
             columns_path: None,
             column_drag: None,
+            row_press: None,
+            pin_drag: None,
+            row_shifts: HashMap::new(),
+            pinned_override: None,
+            suppress_open: false,
+            scroll_anim: None,
+            more_dialogs_requested: 0,
+            menu_hovered: false,
+            day_background: None,
+            day_background_busy: false,
             unread_target: None,
             unread_bar: None,
             read_till: 0,
@@ -497,6 +577,7 @@ impl MainView {
 
     fn dragging(&self) -> bool {
         self.column_drag.is_some()
+            || self.pin_drag.is_some()
             || self.history_bar.drag.is_some()
             || self.dialogs_bar.drag.is_some()
     }
@@ -504,10 +585,13 @@ impl MainView {
     /// The mouse moved while something is dragged: wherever it is, like Qt's mouse grab
     /// in tdesktop.
     fn drag_moved(&mut self, e: &gpui::MouseMoveEvent, window: &Window, cx: &mut Context<Self>) {
-        if e.pressed_button != Some(MouseButton::Left) {
+        if e.pressed_button.is_none() {
             // Released outside the window: no mouse up came.
             self.drag_ended(window, cx);
             return;
+        }
+        if self.pin_drag.is_some() {
+            self.update_pin_drag(f32::from(e.position.y), cx);
         }
         if let Some(drag) = &self.column_drag {
             let width = drag.start_width + f32::from(e.position.x - drag.start_mouse_x);
@@ -520,6 +604,8 @@ impl MainView {
     }
 
     fn drag_ended(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.row_press = None;
+        self.finish_pin_drag(cx);
         if self.column_drag.take().is_some() {
             let body = f32::from(window.viewport_size().width);
             self.columns.drag_finished(self.selected.is_none(), body);
@@ -530,6 +616,171 @@ impl MainView {
         }
         self.end_drag(Area::History, cx);
         self.end_drag(Area::Dialogs, cx);
+    }
+
+    fn pinned_order(&self) -> Vec<PeerKey> {
+        self.dialogs
+            .iter()
+            .take_while(|d| d.pinned)
+            .map(|d| d.peer)
+            .collect()
+    }
+
+    fn row_pressed(&mut self, peer: PeerKey, y: Pixels) {
+        self.row_press = Some(RowPress { peer, start_y: y });
+        self.suppress_open = false;
+    }
+
+    /// `checkReorderPinnedStart`: a pressed pinned chat moved far enough vertically.
+    fn row_press_moved(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        let Some(press) = &self.row_press else { return };
+        if self.pin_drag.is_some() || f32::from(y - press.start_y).abs() < REORDER_THRESHOLD {
+            return;
+        }
+        let (peer, start_y) = (press.peer, f32::from(press.start_y));
+        self.row_press = None;
+        let order = self.pinned_order();
+        if order.len() < 2 || !order.contains(&peer) {
+            return;
+        }
+        self.pin_drag = Some(PinDrag {
+            peer,
+            start_y,
+            yadd: 0.,
+            start_order: order,
+        });
+        self.update_pin_drag(f32::from(y), cx);
+    }
+
+    /// The current offset of a row sliding into place.
+    fn row_shift(&self, peer: PeerKey) -> f32 {
+        match self.row_shifts.get(&peer) {
+            Some((from, start)) => {
+                let t = start.elapsed().as_secs_f32() / PINNED_SHIFT_DURATION.as_secs_f32();
+                if t >= 1. {
+                    0.
+                } else {
+                    from * (1. - sine_in_out(t))
+                }
+            }
+            None => 0.,
+        }
+    }
+
+    /// `updateReorderPinned`: the dragged chat swaps places with a neighbour once it
+    /// covers half of it; the neighbour slides into the freed slot.
+    fn update_pin_drag(&mut self, y: f32, cx: &mut Context<Self>) {
+        let Some(mut drag) = self.pin_drag.take() else {
+            return;
+        };
+        let pinned = self.dialogs.iter().take_while(|d| d.pinned).count();
+        let Some(mut index) = self.dialogs[..pinned]
+            .iter()
+            .position(|d| d.peer == drag.peer)
+        else {
+            return;
+        };
+        let height = DIALOG_ROW_HEIGHT;
+        let threshold = (height / 2.).max(height - height / 2.);
+        let now = Instant::now();
+        while index > 0 && drag.start_y - y >= threshold {
+            self.dialogs.swap(index, index - 1);
+            let displaced = self.dialogs[index].peer;
+            let from = self.row_shift(displaced) - height;
+            self.row_shifts.insert(displaced, (from, now));
+            index -= 1;
+            drag.start_y -= height;
+        }
+        while index + 1 < pinned && y - drag.start_y >= threshold {
+            self.dialogs.swap(index, index + 1);
+            let displaced = self.dialogs[index].peer;
+            let from = self.row_shift(displaced) + height;
+            self.row_shifts.insert(displaced, (from, now));
+            index += 1;
+            drag.start_y += height;
+        }
+        drag.yadd = y - drag.start_y;
+        self.pin_drag = Some(drag);
+        cx.notify();
+    }
+
+    /// The dragged chat is released: it slides into its slot, and a new order goes to
+    /// the server (`savePinnedOrder`). No chat opens.
+    fn finish_pin_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.pin_drag.take() else {
+            return;
+        };
+        self.row_shifts
+            .insert(drag.peer, (drag.yadd, Instant::now()));
+        self.suppress_open = true;
+        let order = self.pinned_order();
+        if order != drag.start_order {
+            self.pinned_override = Some((order.clone(), Instant::now()));
+            let _ = self.commands.send(Command::ReorderPinned(order));
+        }
+        cx.notify();
+    }
+
+    /// Scrolls `area` to `to` the way tdesktop does: from at most one screen away, in
+    /// `slideDuration` (a longer way jumps first).
+    fn start_scroll_anim(&mut self, area: Area, to: f32) {
+        let (viewport, max, offset) = self.scroll_metrics(area);
+        let to = to.clamp(0., max.max(0.));
+        let mut from = offset;
+        let mut ease_out = false;
+        if (to - from).abs() > viewport {
+            from = if to > from {
+                to - viewport
+            } else {
+                to + viewport
+            };
+            self.set_scroll(area, from);
+            // The chat ends a jump with easeOutCubic, the chat list keeps sineInOut.
+            ease_out = area == Area::History;
+        }
+        self.scroll_anim = Some(ScrollAnim {
+            area,
+            from,
+            to,
+            start: Instant::now(),
+            ease_out,
+        });
+    }
+
+    /// One frame of the scroll animation.
+    fn tick_scroll_anim(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(a) = &self.scroll_anim else { return };
+        let t = (a.start.elapsed().as_secs_f32() / SLIDE_DURATION.as_secs_f32()).min(1.);
+        let eased = if a.ease_out {
+            ease_out_cubic(t)
+        } else {
+            sine_in_out(t)
+        };
+        let (area, to) = (a.area, a.to);
+        self.set_scroll(area, a.from + (a.to - a.from) * eased);
+        self.bar_mut(area).last_scroll = Some(Instant::now());
+        if t < 1. {
+            window.request_animation_frame();
+            return;
+        }
+        self.scroll_anim = None;
+        if area == Area::History {
+            let (_, max, _) = self.scroll_metrics(area);
+            if to >= max - 1. && !self.messages.is_empty() {
+                self.stick_to_bottom = true;
+                self.messages_state
+                    .scroll_to_reveal_item(self.messages.len() - 1);
+                self.mark_read(self.messages.len());
+            }
+        }
+        self.scrolled(area, cx);
+    }
+
+    /// The user scrolled `area` by hand: an animation there stops.
+    fn stop_scroll_anim(&mut self, area: Area) {
+        if self.scroll_anim.as_ref().is_some_and(|a| a.area == area) {
+            self.scroll_anim = None;
+        }
     }
 
     /// While dragging: one layer over the whole window takes the mouse (no hover effects
@@ -571,7 +822,10 @@ impl MainView {
                             window.on_mouse_event(
                                 move |e: &gpui::MouseUpEvent, phase, window, cx| {
                                     if phase == gpui::DispatchPhase::Capture
-                                        && e.button == MouseButton::Left
+                                        && matches!(
+                                            e.button,
+                                            MouseButton::Left | MouseButton::Right
+                                        )
                                     {
                                         let _ = released
                                             .update(cx, |this, cx| this.drag_ended(window, cx));
@@ -586,13 +840,73 @@ impl MainView {
     }
 
     /// The chat background (under messages and the empty-chat placeholder): the night
-    /// theme's solid color, or the default wallpaper's gradient in the day theme.
-    fn with_chat_background(&self, d: gpui::Div) -> gpui::Div {
-        if self.dark {
-            d.bg(c(tdr_theme::NIGHT_CHAT_BACKGROUND))
-        } else {
-            d.relative().child(crate::wallpaper::default_gradient())
+    /// theme's solid color, or the day wallpaper (`day_background`).
+    fn with_chat_background(&self, d: gpui::Div, day: Option<AnyElement>) -> gpui::Div {
+        match day {
+            Some(day) => d.relative().overflow_hidden().child(day),
+            None => d.bg(c(tdr_theme::NIGHT_CHAT_BACKGROUND)),
         }
+    }
+
+    /// The day wallpaper, made for the whole area below the title bar right of the chat
+    /// list (as tdesktop fills the main section) and shown from `top` down. It is drawn
+    /// for the exact pixel size in the background; meanwhile the last one, or the bare
+    /// gradient, is stretched over the area.
+    fn day_background(
+        &mut self,
+        top: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.dark {
+            return None;
+        }
+        let width = self.chat_width(window);
+        let height = f32::from(window.viewport_size().height) - TITLE_HEIGHT;
+        let scale = window.scale_factor();
+        let size = (
+            (width * scale).round().max(1.) as u32,
+            (height * scale).round().max(1.) as u32,
+        );
+        if self.day_background.as_ref().is_none_or(|(s, _)| *s != size) && !self.day_background_busy
+        {
+            self.day_background_busy = true;
+            cx.spawn(async move |this, cx| {
+                let image = cx
+                    .background_executor()
+                    .spawn(async move { crate::wallpaper::day_background(size.0, size.1) })
+                    .await;
+                let _ = this.update(cx, |view, cx| {
+                    view.day_background_busy = false;
+                    if let Some((_, old)) = view.day_background.replace((size, Arc::new(image))) {
+                        // Its texture would stay in the atlas otherwise.
+                        cx.drop_image(old, None);
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        let element = match &self.day_background {
+            Some((_, image)) => img(image.clone())
+                .absolute()
+                .left_0()
+                .top(px(-top))
+                .w(px(width))
+                .h(px(height))
+                .object_fit(gpui::ObjectFit::Fill)
+                .into_any_element(),
+            None => div()
+                .absolute()
+                .left_0()
+                .top(px(-top))
+                .w(px(width))
+                .h(px(height))
+                .overflow_hidden()
+                .child(crate::wallpaper::default_gradient())
+                .into_any_element(),
+        };
+        Some(element)
     }
 
     /// The window gained or lost focus: messages count as seen only in an active window.
@@ -605,7 +919,22 @@ impl MainView {
 
     fn apply(&mut self, update: Update, cx: &mut Context<Self>) {
         match update {
-            Update::Dialogs(list) => {
+            Update::Dialogs(mut list) => {
+                if let Some((order, at)) = &self.pinned_override {
+                    let current: Vec<PeerKey> = list
+                        .iter()
+                        .take_while(|d| d.pinned)
+                        .map(|d| d.peer)
+                        .collect();
+                    if current == *order || at.elapsed() > Duration::from_secs(5) {
+                        self.pinned_override = None;
+                    } else {
+                        apply_pinned_order(&mut list, order);
+                    }
+                }
+                if self.pin_drag.is_some() {
+                    apply_pinned_order(&mut list, &self.pinned_order());
+                }
                 if self.dialogs.is_empty() {
                     tracing::info!(elapsed = ?crate::STARTED.elapsed(), chats = list.len(), "ui: chat list received");
                 }
@@ -937,16 +1266,6 @@ impl MainView {
         cx.notify();
     }
 
-    fn scroll_to_bottom(&mut self, cx: &mut Context<Self>) {
-        self.stick_to_bottom = true;
-        if !self.messages.is_empty() {
-            self.messages_state
-                .scroll_to_reveal_item(self.messages.len() - 1);
-            self.mark_read(self.messages.len());
-        }
-        cx.notify();
-    }
-
     /// Viewport height, scrollable height and offset of a list (the history counts
     /// loaded messages only, as in tdesktop).
     fn scroll_metrics(&self, area: Area) -> (f32, f32, f32) {
@@ -1110,12 +1429,18 @@ impl MainView {
     }
 
     /// A chat-list row (`Dialogs::Ui::PaintRow`).
+    /// `floating`: the dragged pinned chat, drawn over the list (pressed, so with the
+    /// hover background); its own slot in the list stays empty.
     fn render_dialog(
         &self,
         item: &DialogItem,
+        floating: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if !floating && self.pin_drag.as_ref().is_some_and(|d| d.peer == item.peer) {
+            return div().h(px(DIALOG_ROW_HEIGHT)).w_full().into_any_element();
+        }
         let p = self.palette();
         let active = self.selected == Some(item.peer);
         let (bg, name_fg, text_fg, date_fg, draft_fg, service_fg, icon_fg, sent_fg) = if active {
@@ -1141,8 +1466,14 @@ impl MainView {
                 p.dialogs_sent_icon_fg,
             )
         };
+        let bg = if floating && !active {
+            p.dialogs_bg_over
+        } else {
+            bg
+        };
         let peer = item.peer;
         let narrow = self.narrow(window);
+        let shift = self.row_shift(peer);
         let draft = (!active).then(|| self.draft_of(peer)).flatten();
         let has_draft = draft.is_some();
         // Unread badge: grey for muted chats (`UnreadBadgeStyle::muted`), the number as
@@ -1185,10 +1516,30 @@ impl MainView {
             )))
             .h(px(DIALOG_ROW_HEIGHT))
             .w_full()
+            .relative()
+            .top(px(shift))
             .bg(c(bg))
-            .when(!active, |d| d.hover(|s| s.bg(c(p.dialogs_bg_over))))
+            .when(!active && self.pin_drag.is_none(), |d| {
+                d.hover(|s| s.bg(c(p.dialogs_bg_over)))
+            })
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, window, cx| this.open(peer, window, cx)));
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &gpui::MouseDownEvent, _, _| {
+                    this.row_pressed(peer, e.position.y)
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &gpui::MouseDownEvent, _, _| {
+                    this.row_pressed(peer, e.position.y)
+                }),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if !std::mem::take(&mut this.suppress_open) {
+                    this.open(peer, window, cx);
+                }
+            }));
         let userpic = self.userpic(
             DIALOG_PHOTO,
             Some(peer),
@@ -1201,7 +1552,6 @@ impl MainView {
             // Userpics only; the counter sits on the userpic's bottom right corner
             // (`PaintNarrowCounter`), hidden while there is a draft.
             return row
-                .relative()
                 .child(
                     div()
                         .absolute()
@@ -1511,20 +1861,28 @@ impl MainView {
         let large = px(MSG_RADIUS_LARGE);
         // The group side is the one with the userpic (left) or, for outgoing messages in
         // a narrow chat, the right side.
+        // The last message of a group has a tail on the group side, where its bottom
+        // corner is square (`countMessageRounding`, `Corner::Tail`).
+        let tail_corner = if next_attached { small } else { px(0.) };
         let (tl, tr, bl, br) = if right_side {
             (
                 large,
                 if prev_attached { small } else { large },
                 large,
-                if next_attached { small } else { large },
+                tail_corner,
             )
         } else {
             (
                 if prev_attached { small } else { large },
                 large,
-                if next_attached { small } else { large },
+                tail_corner,
                 large,
             )
+        };
+        let shadow = if item.out {
+            p.msg_out_shadow
+        } else {
+            p.msg_in_shadow
         };
 
         let time = div()
@@ -1570,6 +1928,13 @@ impl MainView {
         };
         let bubble = div()
             .flex_none()
+            // `msgShadow`: a 1 px line under the bubble (and its rounded corners).
+            .shadow(vec![gpui::BoxShadow {
+                color: c(shadow).into(),
+                offset: point(px(0.), px(1.)),
+                blur_radius: px(0.),
+                spread_radius: px(0.),
+            }])
             .px(px(MSG_PADDING_X))
             .py(px(MSG_PADDING_Y))
             .rounded_tl(tl)
@@ -1595,6 +1960,26 @@ impl MainView {
                     .child(one_line(m.clone()))
             }))
             .child(body);
+        // The tail (`bubble_tail`) hangs outside the square corner, its shadow line
+        // continuing the bubble's.
+        let tail = (!next_attached).then(|| {
+            let kind = if right_side {
+                Icon::BubbleTailRight
+            } else {
+                Icon::BubbleTail
+            };
+            div()
+                .absolute()
+                .bottom(px(-1.))
+                .when(right_side, |d| d.right(px(-TAIL_WIDTH)))
+                .when(!right_side, |d| d.left(px(-TAIL_WIDTH)))
+                .w(px(TAIL_WIDTH))
+                .flex()
+                .flex_col()
+                .child(icon(kind, bg, window))
+                .child(div().w_full().h(px(1.)).bg(c(shadow)))
+        });
+        let bubble = div().relative().flex_none().child(bubble).children(tail);
 
         let avatar_slot = with_userpic.then(|| {
             let author = &item.author;
@@ -1632,32 +2017,55 @@ impl MainView {
 
     fn render_main_menu(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.palette();
+        let hovered = self.menu_hovered;
+        // `ToggleView::paint` with `defaultSettingsToggle`: a 28x14 track in the
+        // foreground color and a 16 px ring (2 px pen) filled with the window color.
         let toggle = {
-            let (border, fill, knob_left) = if self.dark {
-                (p.window_bg_active, p.window_bg_active, px(14.))
+            let on = self.dark;
+            let fg = if on {
+                p.window_bg_active
+            } else if hovered {
+                p.menu_icon_fg_over
             } else {
-                (p.menu_icon_fg, p.window_bg, px(0.))
+                p.menu_icon_fg
             };
+            const BORDER: f32 = 2.;
+            const SHIFT: f32 = 1.;
+            const DIAMETER: f32 = 16.;
+            const WIDTH: f32 = 14.;
+            let knob_left = BORDER + if on { WIDTH } else { 0. };
             div()
                 .relative()
                 .flex_none()
-                .w(px(30.))
-                .h(px(16.))
-                .rounded(px(8.))
-                .border_2()
-                .border_color(c(border))
-                .bg(c(fill))
+                .w(px(DIAMETER + WIDTH + 2. * BORDER))
+                .h(px(DIAMETER + 2. * BORDER))
                 .child(
                     div()
                         .absolute()
-                        .top(px(-2.))
-                        .left(knob_left - px(2.))
-                        .size(px(16.))
+                        .left(px(BORDER + SHIFT))
+                        .top(px(BORDER + SHIFT))
+                        .w(px(DIAMETER + WIDTH - 2. * SHIFT))
+                        .h(px(DIAMETER - 2. * SHIFT))
+                        .rounded(px((DIAMETER - 2. * SHIFT) / 2.))
+                        .bg(c(fg)),
+                )
+                .child(
+                    // The pen is centered on the circle's outline.
+                    div()
+                        .absolute()
+                        .left(px(knob_left - BORDER / 2.))
+                        .top(px(BORDER / 2.))
+                        .size(px(DIAMETER + BORDER))
                         .rounded_full()
                         .border_2()
-                        .border_color(c(border))
+                        .border_color(c(fg))
                         .bg(c(p.window_bg)),
                 )
+        };
+        let (row_bg, text_fg, icon_fg) = if hovered {
+            (p.window_bg_over, p.window_bold_fg_over, p.menu_icon_fg_over)
+        } else {
+            (p.window_bg, p.window_bold_fg, p.menu_icon_fg)
         };
         div()
             .absolute()
@@ -1676,24 +2084,40 @@ impl MainView {
                     .flex_col()
                     .pt(px(8.))
                     .child(
+                        // `mainMenuButton`: padding (61, 11, 20, 9), iconLeft 21,
+                        // toggleSkip 19, semibold text.
                         div()
                             .id("menu-night-mode")
-                            .h(px(44.))
-                            .px(px(24.))
+                            .relative()
+                            .h(px(40.))
                             .flex()
                             .items_center()
-                            .gap(px(20.))
+                            .bg(c(row_bg))
                             .cursor_pointer()
-                            .hover(|s| s.bg(c(p.menu_bg_over)))
+                            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                this.menu_hovered = *hovered;
+                                cx.notify();
+                            }))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx)))
-                            .child(icon(Icon::NightMode, p.menu_icon_fg, window))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(21.))
+                                    .top_0()
+                                    .h_full()
+                                    .flex()
+                                    .items_center()
+                                    .child(icon(Icon::NightMode, icon_fg, window)),
+                            )
                             .child(
                                 div()
                                     .flex_1()
-                                    .text_color(c(p.window_bold_fg))
+                                    .pl(px(61.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(c(text_fg))
                                     .child("Night Mode"),
                             )
-                            .child(toggle),
+                            .child(div().pr(px(19.)).child(toggle)),
                     ),
             )
             .child(
@@ -1818,6 +2242,8 @@ impl MainView {
             .right(px(TO_DOWN_RIGHT))
             .w(px(TO_DOWN_WIDTH))
             .h(px(TO_DOWN_HEIGHT))
+            // Clicks stay on the button; the wheel still scrolls the list under it.
+            .block_mouse_except_scroll()
             .cursor_pointer()
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 if *hovered {
@@ -1931,6 +2357,12 @@ impl Render for MainView {
                 "first frame with the chat list"
             );
         }
+        self.tick_scroll_anim(window, cx);
+        self.row_shifts
+            .retain(|_, (_, start)| start.elapsed() < PINNED_SHIFT_DURATION);
+        if !self.row_shifts.is_empty() {
+            window.request_animation_frame();
+        }
         let p = self.palette();
         let border = c(p.shadow_fg);
         let dialogs_width = self.dialogs_width(window);
@@ -1981,7 +2413,7 @@ impl Render for MainView {
             cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
                 range
                     .filter_map(|i| this.dialogs.get(i).cloned())
-                    .map(|item| this.render_dialog(&item, window, cx))
+                    .map(|item| this.render_dialog(&item, false, window, cx))
                     .collect::<Vec<_>>()
             }),
         )
@@ -1991,7 +2423,29 @@ impl Render for MainView {
         // "Scroll to top" (`Dialogs::Widget::_scrollToTop`): once the list is scrolled
         // down by half of `historyToDownShownAfter`, and not at its very end; never in
         // the narrow column.
-        let (_, dialogs_max, dialogs_offset) = self.scroll_metrics(Area::Dialogs);
+        let (dialogs_viewport, dialogs_max, dialogs_offset) = self.scroll_metrics(Area::Dialogs);
+        // More chats when the end of the list is near (tdesktop preloads a few screens).
+        if !self.dialogs.is_empty()
+            && dialogs_max - dialogs_offset < 2. * dialogs_viewport
+            && self.more_dialogs_requested != self.dialogs.len()
+        {
+            self.more_dialogs_requested = self.dialogs.len();
+            let _ = self.commands.send(Command::LoadMoreDialogs);
+        }
+        // The dragged pinned chat, over the list.
+        let floating_row = self.pin_drag.as_ref().and_then(|drag| {
+            let index = self.dialogs.iter().position(|d| d.peer == drag.peer)?;
+            let item = self.dialogs[index].clone();
+            let top = index as f32 * DIALOG_ROW_HEIGHT + drag.yadd - dialogs_offset;
+            Some(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(px(top))
+                    .w_full()
+                    .child(self.render_dialog(&item, true, window, cx)),
+            )
+        });
         let show_to_up = !narrow
             && dialogs_offset > TO_DOWN_SHOWN_AFTER / 2.
             && dialogs_offset < dialogs_max - 0.5;
@@ -1999,8 +2453,11 @@ impl Render for MainView {
             self.render_jump_button("dialogs-to-up", Icon::UpArrow, 1., window, cx)
                 .bottom(px(TO_UP_BOTTOM))
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.set_scroll(Area::Dialogs, 0.);
-                    this.scrolled(Area::Dialogs, cx);
+                    // `scrollToDefaultChecked`: not again while it runs.
+                    if this.scroll_anim.is_none() {
+                        this.start_scroll_anim(Area::Dialogs, 0.);
+                    }
+                    cx.notify();
                 }))
         });
 
@@ -2009,8 +2466,32 @@ impl Render for MainView {
             .relative()
             .flex_1()
             .min_h(px(0.))
-            .on_scroll_wheel(cx.listener(|this, _, _, cx| this.scrolled(Area::Dialogs, cx)))
+            .overflow_hidden()
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                this.stop_scroll_anim(Area::Dialogs);
+                this.scrolled(Area::Dialogs, cx);
+            }))
+            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
+                this.row_press_moved(e.position.y, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, _, _, _| this.row_press = None),
+            )
+            .on_mouse_up_out(
+                MouseButton::Right,
+                cx.listener(|this, _, _, _| this.row_press = None),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.row_press = None),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.row_press = None),
+            )
             .child(dialogs)
+            .children(floating_row)
             .children(self.render_scrollbar(Area::Dialogs, cx))
             .children(to_up);
 
@@ -2026,12 +2507,20 @@ impl Render for MainView {
             .child(top_bar)
             .child(dialogs_area);
 
+        let day = {
+            let top = if self.selected.is_some() {
+                TOP_BAR_HEIGHT
+            } else {
+                0.
+            };
+            self.day_background(top, window, cx)
+        };
         let right = match self
             .selected
             .and_then(|peer| self.dialogs.iter().find(|d| d.peer == peer))
         {
             None => self
-                .with_chat_background(div())
+                .with_chat_background(div(), day)
                 .flex_1()
                 .h_full()
                 .flex()
@@ -2063,7 +2552,10 @@ impl Render for MainView {
                 let to_down = show_to_down.then(|| {
                     self.render_jump_button("history-to-down", Icon::DownArrow, 0., window, cx)
                         .bottom(px(TO_DOWN_BOTTOM))
-                        .on_click(cx.listener(|this, _, _, cx| this.scroll_to_bottom(cx)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.start_scroll_anim(Area::History, f32::MAX);
+                            cx.notify();
+                        }))
                 });
                 let column = service_column(self.chat_width(window));
                 let floating_date = self.floating_date().map(|text| {
@@ -2079,7 +2571,7 @@ impl Render for MainView {
                 });
                 let scrollbar = self.render_scrollbar(Area::History, cx);
                 let feed = self
-                    .with_chat_background(div())
+                    .with_chat_background(div(), day)
                     .id("history")
                     .relative()
                     .flex_1()

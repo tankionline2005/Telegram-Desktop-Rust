@@ -24,7 +24,7 @@ pub use rusqlite::Error;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Schema version (`PRAGMA user_version`); bump with a migration in [`migrate`].
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
 /// Message ids above this are made by the client (tdesktop's `ServerMaxMsgId`), e.g.
 /// service notifications that the server sends as updates rather than messages.
@@ -192,6 +192,12 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             "ALTER TABLE dialogs ADD COLUMN read_inbox_max_id INTEGER NOT NULL DEFAULT 0;
              ALTER TABLE dialogs ADD COLUMN read_outbox_max_id INTEGER NOT NULL DEFAULT 0;
              ALTER TABLE dialogs ADD COLUMN mute_until INTEGER;",
+        )?;
+    }
+    if version < 5 {
+        // The order of pinned chats (the server's, or the user's drag), smaller first.
+        tx.execute_batch(
+            "ALTER TABLE dialogs ADD COLUMN pinned_order INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -430,7 +436,7 @@ impl Storage {
              LEFT JOIN drafts dr ON dr.kind = d.kind AND dr.id = d.id
              WHERE d.folder_id = ?1
              -- A draft lifts its chat like a new message (tdesktop's adjustedChatListTimeId).
-             ORDER BY d.pinned DESC, MAX(d.top_date, COALESCE(dr.date, 0)) DESC
+             ORDER BY d.pinned DESC, d.pinned_order, MAX(d.top_date, COALESCE(dr.date, 0)) DESC
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![folder_id, limit as i64], |r| {
@@ -794,6 +800,89 @@ impl Writer<'_> {
         Ok(())
     }
 
+    /// The pinned chats of a folder, in this order; every other chat there is unpinned.
+    pub fn set_pinned_order(&self, folder_id: i32, order: &[PeerKey]) -> Result<()> {
+        self.tx
+            .prepare_cached(
+                "UPDATE dialogs SET pinned = 0, pinned_order = 0 WHERE folder_id = ?1 AND pinned = 1",
+            )?
+            .execute(params![folder_id])?;
+        let mut stmt = self.tx.prepare_cached(
+            "UPDATE dialogs SET pinned = 1, pinned_order = ?3 WHERE kind = ?1 AND id = ?2",
+        )?;
+        for (i, peer) in order.iter().enumerate() {
+            stmt.execute(params![peer.kind as i64, peer.id, i as i64])?;
+        }
+        Ok(())
+    }
+
+    /// `updateDialogPinned`: a newly pinned chat goes above the other pinned ones, as in
+    /// tdesktop.
+    pub fn set_pinned(&self, peer: PeerKey, pinned: bool) -> Result<()> {
+        if pinned {
+            self.tx
+                .prepare_cached(
+                    "UPDATE dialogs SET pinned = 1, pinned_order =
+                        (SELECT COALESCE(MIN(o.pinned_order), 0) - 1 FROM dialogs o
+                         WHERE o.pinned = 1 AND o.folder_id = dialogs.folder_id)
+                     WHERE kind = ?1 AND id = ?2 AND pinned = 0",
+                )?
+                .execute(params![peer.kind as i64, peer.id])?;
+        } else {
+            self.tx
+                .prepare_cached(
+                    "UPDATE dialogs SET pinned = 0, pinned_order = 0 WHERE kind = ?1 AND id = ?2",
+                )?
+                .execute(params![peer.kind as i64, peer.id])?;
+        }
+        Ok(())
+    }
+
+    /// A page of the server's chat list covered the unpinned chats of a folder with
+    /// last-message dates in (`after`, `before`) (`None`: unbounded): cached chats in
+    /// that range the page did not have are gone from the list (left, deleted, moved
+    /// to the archive) and are removed. Returns how many.
+    pub fn prune_dialogs(
+        &self,
+        folder_id: i32,
+        after: Option<i32>,
+        before: Option<i32>,
+        keep: &[PeerKey],
+    ) -> Result<usize> {
+        let stale: Vec<(i64, i64)> = {
+            let mut stmt = self.tx.prepare_cached(
+                // A client-made top message (a service notification) is newer than
+                // anything the server lists for that chat: such chats stay.
+                "SELECT kind, id, top_date FROM dialogs
+                 WHERE folder_id = ?1 AND pinned = 0 AND top_message <= ?2",
+            )?;
+            let rows = stmt.query_map(params![folder_id, SERVER_MAX_MESSAGE_ID], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i32>(2)?,
+                ))
+            })?;
+            let mut stale = Vec::new();
+            for row in rows {
+                let (kind, id, date) = row?;
+                let in_range = after.is_none_or(|a| date > a) && before.is_none_or(|b| date < b);
+                let kept = keep.iter().any(|k| k.kind as i64 == kind && k.id == id);
+                if in_range && !kept {
+                    stale.push((kind, id));
+                }
+            }
+            stale
+        };
+        let mut stmt = self
+            .tx
+            .prepare_cached("DELETE FROM dialogs WHERE kind = ?1 AND id = ?2")?;
+        for (kind, id) in &stale {
+            stmt.execute(params![kind, id])?;
+        }
+        Ok(stale.len())
+    }
+
     /// Stores older messages loaded with `offset_id` (newest first, as the server
     /// returns them). If they continue the cached segment, the segment grows down to
     /// the oldest of them; fewer than `limit` messages means the start of the chat.
@@ -1126,6 +1215,60 @@ mod tests {
         s.write(|w| w.extend_history(a, 200, 10, &older)).unwrap();
         s.write(|w| w.put_dialog(&dialog(200))).unwrap();
         assert_eq!(s.history(a, 50).unwrap().cached_from, Some(90));
+    }
+
+    #[test]
+    fn pinned_order_and_pruning() {
+        let mut s = Storage::open_in_memory().unwrap();
+        let row = |id: i64, date: i32| DialogRow {
+            peer: PeerKey::user(id),
+            top_message: 10,
+            top_date: date,
+            pinned: false,
+            folder_id: 0,
+            unread_count: 0,
+            pts: None,
+            read_inbox_max_id: 0,
+            read_outbox_max_id: 0,
+            mute_until: None,
+        };
+        s.write(|w| {
+            for (id, date) in [(1, 100), (2, 200), (3, 300), (4, 400), (5, 500)] {
+                w.put_dialog(&row(id, date))?;
+            }
+            w.set_pinned_order(0, &[PeerKey::user(1), PeerKey::user(2)])
+        })
+        .unwrap();
+        let ids = |s: &Storage| -> Vec<i64> {
+            s.dialogs(0, 10)
+                .unwrap()
+                .iter()
+                .map(|d| d.dialog.peer.id)
+                .collect()
+        };
+        assert_eq!(ids(&s), [1, 2, 5, 4, 3]);
+        // Reordered; a newly pinned chat goes on top.
+        s.write(|w| w.set_pinned_order(0, &[PeerKey::user(2), PeerKey::user(1)]))
+            .unwrap();
+        assert_eq!(ids(&s), [2, 1, 5, 4, 3]);
+        s.write(|w| w.set_pinned(PeerKey::user(4), true)).unwrap();
+        assert_eq!(ids(&s), [4, 2, 1, 5, 3]);
+        s.write(|w| w.set_pinned(PeerKey::user(4), false)).unwrap();
+        assert_eq!(ids(&s), [2, 1, 5, 4, 3]);
+        // A page that covered dates (250, 600) without chat 4: it is gone. Pinned chats
+        // and chats outside the range stay.
+        let removed = s
+            .write(|w| {
+                w.prune_dialogs(
+                    0,
+                    Some(250),
+                    Some(600),
+                    &[PeerKey::user(5), PeerKey::user(3)],
+                )
+            })
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(ids(&s), [2, 1, 5, 3]);
     }
 
     #[test]
