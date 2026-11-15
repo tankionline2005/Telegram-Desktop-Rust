@@ -116,10 +116,8 @@ pub struct Sync {
     dialogs_complete: bool,
     /// Chats loaded from the top of the server's list in this session.
     dialogs_loaded: usize,
-    /// Chats opened this session that the server's chat list does not have
-    /// (tdesktop lists every chat whose history it loaded): kept through the list's
-    /// clean-ups until the next start.
-    session_dialogs: Vec<PeerKey>,
+    /// Chats the server's chat list had in this session.
+    listed: std::collections::HashSet<PeerKey>,
     /// Pinned entries of the main list that are not chats we keep (the archive folder,
     /// communities), with their place among the pinned: a reorder must keep them.
     pinned_extra: Vec<(usize, enums::InputDialogPeer)>,
@@ -170,16 +168,18 @@ impl Sync {
             dialogs_cursor: None,
             dialogs_complete: false,
             dialogs_loaded: 0,
-            session_dialogs: Vec::new(),
+            listed: Default::default(),
             pinned_extra: Vec::new(),
         })
     }
 
-    /// `Histories::requestDialogEntry`: a chat opened outside the chat list gets its
-    /// dialog (`messages.getPeerDialogs`), so it is listed by its last message like
-    /// any other for this session. Returns whether one came.
+    /// `Histories::requestDialogEntry`: a chat opened that the server's chat list has
+    /// not shown in this session gets its dialog (`messages.getPeerDialogs`) and is
+    /// listed by its last message. Unlike tdesktop, which forgets it on restart, it
+    /// is kept in the cache: the chat exists, the list just leaves it out. Returns
+    /// whether one came.
     pub async fn request_dialog_entry(&mut self, peer: PeerKey) -> Result<bool> {
-        if self.store.read_marks(peer)?.is_some() {
+        if self.listed.contains(&peer) {
             return Ok(false);
         }
         let Some(input) = self.input_peer(peer) else {
@@ -231,6 +231,8 @@ impl Sync {
             })
             .collect();
         if rows.is_empty() {
+            // No such chat any more.
+            self.store.write(|w| w.delete_dialog(peer))?;
             return Ok(false);
         }
         self.store.write(|w| {
@@ -242,10 +244,10 @@ impl Sync {
             }
             for d in &rows {
                 w.put_dialog(d)?;
+                w.set_kept(d.peer, true)?;
             }
             Ok(())
         })?;
-        self.session_dialogs.extend(rows.iter().map(|r| r.peer));
         Ok(true)
     }
 
@@ -522,11 +524,8 @@ impl Sync {
         let after = if complete { None } else { oldest };
         let before = (!first).then_some(offset_date);
         let prune = complete || oldest.is_some();
-        let keep: Vec<PeerKey> = rows
-            .iter()
-            .map(|r| r.peer)
-            .chain(self.session_dialogs.iter().copied())
-            .collect();
+        let keep: Vec<PeerKey> = rows.iter().map(|r| r.peer).collect();
+        self.listed.extend(keep.iter().copied());
         let dirty = self.engine.take_dirty_channels();
         let removed = self.store.write(|w| {
             for p in &peer_rows {
@@ -537,6 +536,8 @@ impl Sync {
             }
             for d in &rows {
                 w.put_dialog(d)?;
+                // Listed after all: an ordinary chat again.
+                w.set_kept(d.peer, false)?;
             }
             for (id, pts) in &dirty {
                 w.set_channel_pts(*id, *pts)?;

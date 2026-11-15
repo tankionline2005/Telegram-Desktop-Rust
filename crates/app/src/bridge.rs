@@ -606,6 +606,99 @@ fn members_text(store: &Storage, peer: PeerKey, count: i32) -> String {
 }
 
 /// Starts the data thread.
+/// Work for the userpic thread.
+enum PicJob {
+    /// The UI wants this userpic.
+    Want {
+        peer: PeerKey,
+        photo_id: i64,
+        dc_id: i32,
+    },
+    /// It was downloaded: store it and show it.
+    Downloaded {
+        peer: PeerKey,
+        photo_id: i64,
+        bytes: Vec<u8>,
+    },
+}
+
+fn userpic_key(photo_id: i64) -> String {
+    format!("userpic:{photo_id}:small")
+}
+
+/// Userpics come from the file cache on a thread of their own, from the first frame:
+/// the data thread is busy catching up with the server at start (and once was the
+/// only one reading the cache, so cached userpics waited for that). Misses go to the
+/// data thread to download; downloads come back here to be stored.
+fn spawn_userpics(
+    files_dir: PathBuf,
+    jobs: std::sync::mpsc::Receiver<PicJob>,
+    misses: mpsc::UnboundedSender<Command>,
+    tx: mpsc::UnboundedSender<Update>,
+) {
+    std::thread::Builder::new()
+        .name("userpics".into())
+        .spawn(move || {
+            let mut files = match FileCache::open(&files_dir, FileCacheConfig::default()) {
+                Ok(f) => f,
+                Err(e) => {
+                    error!("file cache: {e}");
+                    return;
+                }
+            };
+            let mut from_cache = 0usize;
+            for job in jobs {
+                match job {
+                    PicJob::Want {
+                        peer,
+                        photo_id,
+                        dc_id,
+                    } => match files.get(&userpic_key(photo_id)) {
+                        Ok(Some(bytes)) if let Some(image) = userpic_image(&bytes) => {
+                            from_cache += 1;
+                            if from_cache == 1 || from_cache.is_multiple_of(10) {
+                                tracing::info!(
+                                    elapsed = ?crate::STARTED.elapsed(),
+                                    from_cache,
+                                    "userpics from the file cache"
+                                );
+                            }
+                            let _ = tx.send(Update::Userpic {
+                                peer,
+                                photo_id,
+                                image,
+                            });
+                        }
+                        _ => {
+                            let _ = misses.send(Command::LoadUserpic {
+                                peer,
+                                photo_id,
+                                dc_id,
+                            });
+                        }
+                    },
+                    PicJob::Downloaded {
+                        peer,
+                        photo_id,
+                        bytes,
+                    } => {
+                        if let Err(e) = files.put(&userpic_key(photo_id), &bytes) {
+                            error!("file cache: {e}");
+                        }
+                        if let Some(image) = userpic_image(&bytes) {
+                            let _ = tx.send(Update::Userpic {
+                                peer,
+                                photo_id,
+                                image,
+                            });
+                        }
+                    }
+                }
+            }
+        })
+        .expect("spawn userpic thread");
+}
+
 pub fn start(
     config: Config,
     paths: Paths,
@@ -613,8 +706,40 @@ pub fn start(
     mpsc::UnboundedSender<Command>,
     mpsc::UnboundedReceiver<Update>,
 ) {
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, mut ui_rx) = mpsc::unbounded_channel::<Command>();
+    let (data_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
     let (up_tx, up_rx) = mpsc::unbounded_channel();
+    let (pics_tx, pics_rx) = std::sync::mpsc::channel::<PicJob>();
+    spawn_userpics(paths.files.clone(), pics_rx, data_tx.clone(), up_tx.clone());
+    // Userpic requests go to the userpic thread, everything else to the data thread.
+    {
+        let pics_tx = pics_tx.clone();
+        std::thread::Builder::new()
+            .name("commands".into())
+            .spawn(move || {
+                while let Some(cmd) = ui_rx.blocking_recv() {
+                    match cmd {
+                        Command::LoadUserpic {
+                            peer,
+                            photo_id,
+                            dc_id,
+                        } => {
+                            let _ = pics_tx.send(PicJob::Want {
+                                peer,
+                                photo_id,
+                                dc_id,
+                            });
+                        }
+                        cmd => {
+                            if data_tx.send(cmd).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn command thread");
+    }
     std::thread::Builder::new()
         .name("data".into())
         .spawn(move || {
@@ -624,7 +749,7 @@ pub fn start(
                 .build()
                 .expect("tokio runtime");
             rt.block_on(async move {
-                if let Err(e) = run(config, paths, cmd_rx, up_tx.clone()).await {
+                if let Err(e) = run(config, paths, cmd_rx, up_tx.clone(), pics_tx).await {
                     error!("data thread: {e:#}");
                     let _ = up_tx.send(Update::Fatal(format!("{e:#}")));
                 }
@@ -778,6 +903,7 @@ async fn run(
     paths: Paths,
     mut commands: mpsc::UnboundedReceiver<Command>,
     tx: mpsc::UnboundedSender<Update>,
+    pics: std::sync::mpsc::Sender<PicJob>,
 ) -> anyhow::Result<()> {
     // 1. The cached chat list, before any network.
     if let Some(dir) = paths.cache.parent() {
@@ -837,7 +963,6 @@ async fn run(
         .then(|| tokio::time::Instant::now() + SAVE_CLOUD_DRAFT_DELAY);
 
     // Userpics: from the file cache, or downloaded in the background (a few at once).
-    let mut files = FileCache::open(&paths.files, FileCacheConfig::default())?;
     let (pics_tx, mut pics_rx) = mpsc::unbounded_channel::<(PeerKey, i64, Option<Vec<u8>>)>();
     let downloads = Arc::new(tokio::sync::Semaphore::new(4));
     let mut loading: HashSet<i64> = HashSet::new();
@@ -915,11 +1040,9 @@ async fn run(
                         Ok(_) => send_dialogs(sync.store(), shown_dialogs, &tx)?,
                         Err(e) => error!("read: {e}"),
                     },
+                    // Not in the file cache (the userpic thread looked): download.
                     Command::LoadUserpic { peer, photo_id, dc_id } => {
-                        let key = format!("userpic:{photo_id}:small");
-                        if let Some(image) = files.get(&key)?.as_deref().and_then(userpic_image) {
-                            let _ = tx.send(Update::Userpic { peer, photo_id, image });
-                        } else if loading.insert(photo_id)
+                        if loading.insert(photo_id)
                             && let Some(input) = sync.input_peer(peer)
                         {
                             let client = client.clone();
@@ -1063,15 +1186,12 @@ async fn run(
                         // Not in the chat list: it joins it by its last message, as
                         // tdesktop lists every chat it loaded; the list shows far
                         // enough down to have it.
-                        match sync.request_dialog_entry(peer).await {
-                            Ok(true) => {
-                                let all = sync.store().dialogs(0, usize::MAX >> 1)?;
-                                if let Some(pos) = all.iter().position(|d| d.dialog.peer == peer) {
-                                    shown_dialogs = shown_dialogs.max(pos + 1);
-                                }
-                            }
-                            Ok(false) => {}
-                            Err(e) => error!("dialog entry: {e}"),
+                        if let Err(e) = sync.request_dialog_entry(peer).await {
+                            error!("dialog entry: {e}");
+                        }
+                        let all = sync.store().dialogs(0, usize::MAX >> 1)?;
+                        if let Some(pos) = all.iter().position(|d| d.dialog.peer == peer) {
+                            shown_dialogs = shown_dialogs.max(pos + 1);
                         }
                         if let Err(e) = sync.refresh_user(peer).await {
                             error!("user: {e}");
@@ -1105,10 +1225,7 @@ async fn run(
             Some((peer, photo_id, bytes)) = pics_rx.recv() => {
                 loading.remove(&photo_id);
                 if let Some(bytes) = bytes {
-                    files.put(&format!("userpic:{photo_id}:small"), &bytes)?;
-                    if let Some(image) = userpic_image(&bytes) {
-                        let _ = tx.send(Update::Userpic { peer, photo_id, image });
-                    }
+                    let _ = pics.send(PicJob::Downloaded { peer, photo_id, bytes });
                 }
             }
             _ = async {

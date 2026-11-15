@@ -115,6 +115,8 @@ async fn main() -> Result<()> {
         ["probe", "dialogs", needle] => probe_dialogs(needle).await,
         ["probe", "saved", offset] => probe_saved(offset.parse().context("message id")?).await,
         ["probe", "peer-dialog", id] => probe_peer_dialog(id.parse().context("user id")?).await,
+        ["probe", "keep", id] => probe_keep(id.parse().context("user id")?, true).await,
+        ["probe", "relist", id] => probe_keep(id.parse().context("user id")?, false).await,
         ["logout"] => logout().await,
         ["selftest", "reconnect"] => selftest_reconnect().await,
         ["selftest", "unknown-key"] => selftest_unknown_key().await,
@@ -696,6 +698,36 @@ async fn probe_peer_dialog(id: i64) -> Result<()> {
         }
     }
     println!("{} dialogs, {} messages", r.dialogs.len(), r.messages.len());
+    Ok(())
+}
+
+/// The client's own steps for a chat outside the server's chat list, on the real
+/// cache: `keep` = start + the dialog entry a "go to original" asks for; `relist` = a
+/// later start + the whole chat list paged (its clean-ups). Prints whether the chat
+/// is still listed (ids and flags only).
+async fn probe_keep(id: i64, open: bool) -> Result<()> {
+    let peer = PeerKey::user(id);
+    let client = logged_in()?;
+    let mut sync = Sync::new(client.clone(), open_cache()?)?;
+    sync.start().await?;
+    if open {
+        let came = sync.request_dialog_entry(peer).await?;
+        println!("dialog entry requested: {came}");
+    } else {
+        let mut pages = 0;
+        while !sync.dialogs_complete() && pages < 50 {
+            sync.load_more_dialogs().await?;
+            pages += 1;
+        }
+        println!("chat list paged to its end ({pages} more pages)");
+    }
+    save_session(&client)?;
+    let listed = sync
+        .store()
+        .dialogs(0, usize::MAX >> 1)?
+        .iter()
+        .position(|d| d.dialog.peer == peer);
+    println!("listed at: {listed:?}");
     Ok(())
 }
 

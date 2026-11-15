@@ -24,7 +24,7 @@ pub use rusqlite::Error;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Schema version (`PRAGMA user_version`); bump with a migration in [`migrate`].
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 
 /// Message ids above this are made by the client (tdesktop's `ServerMaxMsgId`), e.g.
 /// service notifications that the server sends as updates rather than messages.
@@ -204,6 +204,11 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         // "The start of the chat is loaded" was set on any short page, which the
         // server also returns in the middle of a history: check again.
         tx.execute_batch("UPDATE dialogs SET history_complete = 0;")?;
+    }
+    if version < 7 {
+        // Chats the server's chat list leaves out (`messages.getPeerDialogs` still has
+        // them), kept once opened: list clean-ups leave them alone.
+        tx.execute_batch("ALTER TABLE dialogs ADD COLUMN kept INTEGER NOT NULL DEFAULT 0;")?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()
@@ -855,6 +860,23 @@ impl Writer<'_> {
         Ok(())
     }
 
+    /// Marks a chat the server's chat list does not have (kept through clean-ups), or
+    /// one it lists after all.
+    pub fn set_kept(&self, peer: PeerKey, kept: bool) -> Result<()> {
+        self.tx
+            .prepare_cached("UPDATE dialogs SET kept = ?3 WHERE kind = ?1 AND id = ?2")?
+            .execute(params![peer.kind as i64, peer.id, kept])?;
+        Ok(())
+    }
+
+    /// The chat is gone (its dialog no longer exists on the server).
+    pub fn delete_dialog(&self, peer: PeerKey) -> Result<()> {
+        self.tx
+            .prepare_cached("DELETE FROM dialogs WHERE kind = ?1 AND id = ?2")?
+            .execute(params![peer.kind as i64, peer.id])?;
+        Ok(())
+    }
+
     /// The pinned chats of a folder, in this order; every other chat there is unpinned.
     pub fn set_pinned_order(&self, folder_id: i32, order: &[PeerKey]) -> Result<()> {
         self.tx
@@ -909,7 +931,7 @@ impl Writer<'_> {
                 // A client-made top message (a service notification) is newer than
                 // anything the server lists for that chat: such chats stay.
                 "SELECT kind, id, top_date FROM dialogs
-                 WHERE folder_id = ?1 AND pinned = 0 AND top_message <= ?2",
+                 WHERE folder_id = ?1 AND pinned = 0 AND top_message <= ?2 AND kept = 0",
             )?;
             let rows = stmt.query_map(params![folder_id, SERVER_MAX_MESSAGE_ID], |r| {
                 Ok((
@@ -1330,6 +1352,11 @@ mod tests {
             .unwrap();
         assert_eq!(removed, 1);
         assert_eq!(ids(&s), [2, 1, 5, 3]);
+        // A chat the server's list leaves out, kept once opened, survives clean-ups.
+        s.write(|w| w.set_kept(PeerKey::user(3), true)).unwrap();
+        let removed = s.write(|w| w.prune_dialogs(0, None, None, &[])).unwrap();
+        assert_eq!(removed, 1); // chat 5 only
+        assert_eq!(ids(&s), [2, 1, 3]);
     }
 
     #[test]
