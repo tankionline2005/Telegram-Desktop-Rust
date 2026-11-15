@@ -14,7 +14,7 @@ use gpui::{
     AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight, ListAlignment, ListOffset,
     ListState, MouseButton, PathBuilder, Pixels, RenderImage, Rgba, SharedString, TextRun,
     UniformListScrollHandle, Window, WindowControlArea, canvas, div, font, img, linear_color_stop,
-    linear_gradient, list, point, prelude::*, px, rgba, uniform_list,
+    linear_gradient, list, point, prelude::*, rgba, uniform_list,
 };
 use tdr_data::describe::PeerKind as ChatKind;
 use tdr_data::tdr_storage::PeerKey;
@@ -22,11 +22,12 @@ use tdr_theme::{Color, Palette};
 use tokio::sync::mpsc;
 
 use crate::bridge::{Command, DialogItem, MessageItem, Update};
-use crate::icons::{Icon, icon};
+use crate::icons::{Icon, icon, icon_width};
 use crate::one_line::one_line;
 use crate::placement::{COLUMN_MIN_LEFT, Columns};
 use crate::present;
-use crate::text_input::{LINE_HEIGHT, Submit, TextInput};
+use crate::scale::{self, dpx, lg, px};
+use crate::text_input::{Submit, TextInput};
 
 gpui::actions!(main_view, [Escape]);
 
@@ -79,11 +80,16 @@ const SERVICE_MAX_WIDTH: f32 = 320.;
 // historyUnreadBarHeight, historyUnreadBarMargin
 const UNREAD_BAR_HEIGHT: f32 = 32.;
 const UNREAD_BAR_MARGIN: f32 = 8.;
-/// Room after the time for the ✓ / ✓✓ of outgoing messages (`historySendStateSpace`
-/// minus the gap already there).
-const SEND_STATE_SPACE: f32 = 18.;
-/// `bubble_tail` width.
-const TAIL_WIDTH: f32 = 6.;
+// chat.style: msgDateSpace, msgDateDelta, historySendStateSpace,
+// historySendStatePosition, msgShadow
+const MSG_DATE_SPACE: f32 = 12.;
+const MSG_DATE_DELTA_X: f32 = 2.;
+const MSG_DATE_DELTA_Y: f32 = 5.;
+const SEND_STATE_SPACE: f32 = 24.;
+const SEND_STATE_X: f32 = -17.;
+const SEND_STATE_Y: f32 = -19.;
+const MSG_SHADOW: f32 = 2.;
+const MSG_MARGIN_BOTTOM: f32 = 2.;
 /// Messages of one author closer than this are drawn as a group
 /// (tdesktop: `kAttachMessageToPreviousSecondsDelta`).
 const ATTACH_SECONDS: i32 = 900;
@@ -104,7 +110,17 @@ const SCROLL_MIN_BAR: f32 = 20.;
 const SCROLL_HIDE_AFTER: Duration = Duration::from_millis(1000);
 // basic.style: fsize
 const FONT_SIZE: f32 = 13.;
-const DATE_FONT_SIZE: f32 = 12.;
+/// `msgDateFont` and `dialogsDateFont`: font(13px).
+const DATE_FONT_SIZE: f32 = 13.;
+/// `dialogsUnreadFont`: font(12px bold).
+const UNREAD_FONT_SIZE: f32 = 12.;
+// dialogs.style: defaultDialogRow nameLeft / nameTop / textTop, dialogsDateSkip,
+// dialogsSendStateSkip, dialogsUnreadPadding
+const DIALOG_NAME_LEFT: f32 = 68.;
+const DIALOG_NAME_TOP: f32 = 10.;
+const DIALOG_TEXT_TOP: f32 = 34.;
+const DIALOG_DATE_SKIP: f32 = 5.;
+const DIALOG_SEND_STATE_SKIP: f32 = 20.;
 const FONT_FAMILY: &str = "Open Sans";
 /// Ask for older messages when the top of the list is this close (in items).
 const LOAD_OLDER_THRESHOLD: usize = 3;
@@ -136,6 +152,60 @@ fn text_width(window: &Window, text: &str, size: f32, weight: FontWeight) -> f32
             )
         })
         .fold(0., f32::max)
+}
+
+/// The widths of the lines `text` wraps into at `wrap` (GPUI's own wrapping, the one
+/// that paints it), paragraph by paragraph.
+fn wrapped_line_widths(
+    window: &Window,
+    text: &str,
+    size: f32,
+    weight: FontWeight,
+    wrap: f32,
+) -> Vec<f32> {
+    let mut f = font(FONT_FAMILY);
+    f.weight = weight;
+    let mut out = Vec::new();
+    for paragraph in text.split('\n') {
+        if paragraph.is_empty() {
+            out.push(0.);
+            continue;
+        }
+        let run = TextRun {
+            len: paragraph.len(),
+            font: f.clone(),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped = window.text_system().shape_text(
+            SharedString::from(paragraph.to_string()),
+            px(size),
+            &[run],
+            Some(gpui::px(wrap)),
+            None,
+        );
+        let Ok(lines) = shaped else {
+            out.push(text_width(window, paragraph, size, weight));
+            continue;
+        };
+        for line in lines {
+            let layout = &line.unwrapped_layout;
+            let mut start = 0.;
+            for b in line.wrap_boundaries() {
+                let x = layout
+                    .runs
+                    .get(b.run_ix)
+                    .and_then(|r| r.glyphs.get(b.glyph_ix))
+                    .map_or(start, |g| f32::from(g.position.x));
+                out.push(x - start);
+                start = x;
+            }
+            out.push(f32::from(layout.width) - start);
+        }
+    }
+    out
 }
 
 /// tdesktop's two-color userpic gradients, by color index
@@ -205,30 +275,55 @@ fn empty_userpic(p: &Palette, size: f32, initials: &str, color: u8, saved: bool)
     }
 }
 
-/// The bookmark from tdesktop's `PaintSavedMessagesInner`, same proportions.
+/// The bookmark of tdesktop's `PaintSavedMessagesInner`, computed like there in device
+/// pixels of the userpic's size: a round-joined top half and a miter-joined bottom half
+/// with the notch, flat caps.
 fn paint_bookmark(bounds: gpui::Bounds<Pixels>, size: f32, fg: Color, window: &mut Window) {
-    let s = size.round();
+    use gpui::{PathStyle, StrokeOptions};
+    use lyon::tessellation::{LineCap, LineJoin};
+    let scale = window.scale_factor();
+    let s = scale::device(size);
     let thickness = (s * 0.055).round();
     let increment = (thickness as i32 % 2 + s as i32 % 2) as f32;
     let width = (s * 0.15).round() * 2. + increment;
     let height = (s * 0.19).round() * 2. + increment;
     let add = (s * 0.064).round();
-    let left = (s - width) / 2.;
-    let top = (s - height) / 2.;
+    let left = ((s - width) / 2.).floor();
+    let top = ((s - height) / 2.).floor();
     let (right, bottom) = (left + width, top + height);
-    let middle = (left + right) / 2.;
-    let half = (top + bottom) / 2.;
-    let at = |x: f32, y: f32| point(bounds.left() + px(x), bounds.top() + px(y));
-    let mut b = PathBuilder::stroke(px(thickness));
-    b.move_to(at(right, half));
-    b.line_to(at(right, top));
-    b.line_to(at(left, top));
-    b.line_to(at(left, bottom));
-    b.line_to(at(middle, bottom - add));
-    b.line_to(at(right, bottom));
-    b.line_to(at(right, half));
-    if let Ok(path) = b.build() {
-        window.paint_path(path, c(fg));
+    let middle = ((left + right) / 2.).floor();
+    let half = ((top + bottom) / 2.).floor();
+    let at = |x: f32, y: f32| {
+        point(
+            bounds.left() + gpui::px(x / scale),
+            bounds.top() + gpui::px(y / scale),
+        )
+    };
+    let stroke = |join: LineJoin| {
+        PathStyle::Stroke(
+            StrokeOptions::default()
+                .with_line_width(thickness / scale)
+                .with_line_cap(LineCap::Butt)
+                .with_line_join(join),
+        )
+    };
+    let mut upper =
+        PathBuilder::stroke(gpui::px(thickness / scale)).with_style(stroke(LineJoin::Round));
+    upper.move_to(at(left, half));
+    upper.line_to(at(left, top));
+    upper.line_to(at(right, top));
+    upper.line_to(at(right, half));
+    let mut lower =
+        PathBuilder::stroke(gpui::px(thickness / scale)).with_style(stroke(LineJoin::Miter));
+    lower.move_to(at(left, half));
+    lower.line_to(at(left, bottom));
+    lower.line_to(at(middle, bottom - add));
+    lower.line_to(at(right, bottom));
+    lower.line_to(at(right, half));
+    for path in [upper, lower] {
+        if let Ok(path) = path.build() {
+            window.paint_path(path, c(fg));
+        }
     }
 }
 
@@ -1478,6 +1573,18 @@ impl MainView {
         let has_draft = draft.is_some();
         // Unread badge: grey for muted chats (`UnreadBadgeStyle::muted`), the number as
         // `FormatUnreadCounter` writes it.
+        let text_font = scale::font(FONT_SIZE);
+        let unread_font = scale::font(UNREAD_FONT_SIZE);
+        let badge_text = if narrow && item.unread > 999_999 {
+            "99999+".to_string()
+        } else {
+            item.unread.to_string()
+        };
+        // `PaintUnreadBadge`: at least as wide as it is high, the number centered.
+        let badge_width = (text_width(window, &badge_text, UNREAD_FONT_SIZE, FontWeight::BOLD)
+            .ceil()
+            + 2. * lg(UNREAD_PADDING))
+        .max(lg(UNREAD_HEIGHT));
         let badge = (item.unread > 0).then(|| {
             let badge_bg = match (active, item.muted) {
                 (true, true) => p.dialogs_unread_bg_muted_active,
@@ -1491,23 +1598,18 @@ impl MainView {
                 p.dialogs_unread_fg
             };
             div()
-                .flex_none()
-                .min_w(px(UNREAD_HEIGHT))
+                .w(dpx((badge_width * scale::get()).round()))
                 .h(px(UNREAD_HEIGHT))
-                .px(px(UNREAD_PADDING))
                 .rounded(px(UNREAD_HEIGHT / 2.))
                 .bg(c(badge_bg))
                 .text_color(c(badge_fg))
-                .text_size(px(12.))
+                .text_size(unread_font.size)
+                .line_height(unread_font.line_height())
                 .font_weight(FontWeight::BOLD)
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(if narrow && item.unread > 999_999 {
-                    "99999+".to_string()
-                } else {
-                    item.unread.to_string()
-                })
+                .child(badge_text)
         });
         let row = div()
             .id(SharedString::from(format!(
@@ -1517,7 +1619,7 @@ impl MainView {
             .h(px(DIALOG_ROW_HEIGHT))
             .w_full()
             .relative()
-            .top(px(shift))
+            .top(gpui::px(shift))
             .bg(c(bg))
             .when(!active && self.pin_drag.is_none(), |d| {
                 d.hover(|s| s.bg(c(p.dialogs_bg_over)))
@@ -1539,39 +1641,98 @@ impl MainView {
                 if !std::mem::take(&mut this.suppress_open) {
                     this.open(peer, window, cx);
                 }
-            }));
-        let userpic = self.userpic(
-            DIALOG_PHOTO,
-            Some(peer),
-            item.photo,
-            &item.initials,
-            item.color,
-            item.is_saved,
-        );
+            }))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(DIALOG_PADDING_X))
+                    .top(px(DIALOG_PADDING_Y))
+                    .child(self.userpic(
+                        DIALOG_PHOTO,
+                        Some(peer),
+                        item.photo,
+                        &item.initials,
+                        item.color,
+                        item.is_saved,
+                    )),
+            );
+        // The unread top of the badge, aligned to the text line's baseline
+        // (`PaintWideCounter` / `PaintNarrowCounter`).
+        let badge_top = |text_top: f32| {
+            let top = scale::device(text_top) + text_font.ascent * scale::get()
+                - unread_font.ascent * scale::get()
+                - ((scale::device(UNREAD_HEIGHT) - unread_font.height * scale::get()) / 2.).floor();
+            dpx(top.round())
+        };
         if narrow {
             // Userpics only; the counter sits on the userpic's bottom right corner
             // (`PaintNarrowCounter`), hidden while there is a draft.
             return row
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(DIALOG_PADDING_X))
-                        .top(px(DIALOG_PADDING_Y))
-                        .child(userpic),
-                )
                 .children(badge.filter(|_| !has_draft).map(|b| {
                     div()
                         .absolute()
                         .top(px(DIALOG_PADDING_Y + DIALOG_PHOTO - UNREAD_HEIGHT))
-                        .right(px(DIALOG_PADDING_X))
+                        .left(dpx(scale::device(DIALOG_PADDING_X)
+                            + scale::device(DIALOG_PHOTO)
+                            - (badge_width * scale::get()).round()))
                         .child(b)
                 }))
                 .into_any_element();
         }
+        // Right of the name: the date at the padding, the send state in
+        // `dialogsSendStateSkip` before it (`PaintRowTopRight`, `sendStateIcon`).
+        let date_width = text_width(window, &item.time, DATE_FONT_SIZE, FontWeight::NORMAL).ceil();
+        let date_right = lg(DIALOG_PADDING_X);
+        let mut name_right = date_right + date_width + lg(DIALOG_DATE_SKIP);
+        let send_state = item.last_read.filter(|_| !has_draft).map(|read| {
+            // dialogsSentIcon / dialogsReceivedIcon: offsets (10, 4) and (5, 4).
+            let (kind, offset_x) = if read {
+                (Icon::DialogsReceived, 5.)
+            } else {
+                (Icon::DialogsSent, 10.)
+            };
+            name_right += lg(DIALOG_SEND_STATE_SKIP);
+            let left_from_right = name_right - lg(offset_x);
+            let icon = icon(kind, sent_fg, window);
+            div()
+                .absolute()
+                .top(gpui::px(lg(DIALOG_NAME_TOP) + lg(4.)))
+                .right(gpui::px(left_from_right - icon_width(kind, window)))
+                .child(icon)
+        });
+        // Group / channel / bot icon at the name's left (`ChatTypeIcon`, offsets
+        // (1, 4) and (3, 4)); the name follows after `dialogsChatTypeSkip`.
+        let type_icon = match item.kind {
+            ChatKind::Group => Some((Icon::ChatGroup, 1.)),
+            ChatKind::Channel => Some((Icon::ChatChannel, 3.)),
+            ChatKind::Bot => Some((Icon::ChatBot, 1.)),
+            ChatKind::User => None,
+        }
+        .filter(|_| !item.is_saved);
+        let name_left = lg(DIALOG_NAME_LEFT)
+            + type_icon.map_or(0., |(kind, offset)| {
+                lg(offset) + icon_width(kind, window) + lg(CHAT_TYPE_SKIP)
+            });
+        let type_icon = type_icon.map(|(kind, offset)| {
+            div()
+                .absolute()
+                .left(gpui::px(lg(DIALOG_NAME_LEFT) + lg(offset)))
+                .top(gpui::px(lg(DIALOG_NAME_TOP) + lg(4.)))
+                .child(icon(kind, icon_fg, window))
+        });
+        // The text line ends before the badge or the pin.
+        let pinned = item.unread == 0 && item.pinned;
+        let text_right = lg(DIALOG_PADDING_X)
+            + if badge.is_some() {
+                badge_width + lg(UNREAD_PADDING)
+            } else if pinned {
+                icon_width(Icon::DialogsPinned, window) + lg(UNREAD_PADDING)
+            } else {
+                0.
+            };
         let last_line = match draft {
             Some(d) => div()
                 .flex()
-                .min_w(px(0.))
                 .child(div().flex_none().text_color(c(draft_fg)).child("Draft: "))
                 .child(
                     div()
@@ -1596,7 +1757,6 @@ impl MainView {
                 };
                 div()
                     .flex()
-                    .min_w(px(0.))
                     .children(last.prefix.as_ref().map(|name| {
                         // A short first name: plain text (one_line needs a sized parent).
                         div()
@@ -1607,92 +1767,58 @@ impl MainView {
                     .child(rest)
             }
         };
-        // Group / channel / bot icon before the name (`ChatTypeIcon`).
-        let type_icon = match item.kind {
-            ChatKind::Group => Some((Icon::ChatGroup, 1.)),
-            ChatKind::Channel => Some((Icon::ChatChannel, 3.)),
-            ChatKind::Bot => Some((Icon::ChatBot, 1.)),
-            ChatKind::User => None,
-        }
-        .filter(|_| !item.is_saved)
-        .map(|(kind, left)| {
-            div()
-                .flex_none()
-                .pl(px(left))
-                .pr(px(CHAT_TYPE_SKIP))
-                .child(icon(kind, icon_fg, window))
-        });
-        // ✓ / ✓✓ of our last message, left of the time.
-        let send_state = item.last_read.filter(|_| !has_draft).map(|read| {
-            let kind = if read {
-                Icon::DialogsReceived
-            } else {
-                Icon::DialogsSent
-            };
-            div().flex_none().child(icon(kind, sent_fg, window))
-        });
-        row.flex()
-            .items_center()
-            .px(px(DIALOG_PADDING_X))
-            .py(px(DIALOG_PADDING_Y))
-            .gap(px(12.))
-            .child(userpic)
+        let pin_fg = if active {
+            p.dialogs_unread_bg_muted_active
+        } else {
+            p.dialogs_unread_bg_muted
+        };
+        row.children(type_icon)
             .child(
                 div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(5.))
-                            // The name starts right after the type icon and
-                            // `dialogsChatTypeSkip`, without the row's gap.
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .flex()
-                                    .items_center()
-                                    .children(type_icon)
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(c(name_fg))
-                                            .child(one_line(item.name.clone())),
-                                    ),
-                            )
-                            .children(send_state)
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(DATE_FONT_SIZE))
-                                    .text_color(c(date_fg))
-                                    .child(item.time.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .child(div().flex_1().min_w(px(0.)).child(last_line))
-                            .children(badge)
-                            .when(item.unread == 0 && item.pinned, |d| {
-                                let pin_fg = if active {
-                                    p.dialogs_unread_bg_muted_active
-                                } else {
-                                    p.dialogs_unread_bg_muted
-                                };
-                                d.child(icon(Icon::DialogsPinned, pin_fg, window))
-                            }),
-                    ),
+                    .absolute()
+                    .left(gpui::px(name_left))
+                    .right(gpui::px(name_right))
+                    .top(px(DIALOG_NAME_TOP))
+                    .h(text_font.line_height())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(c(name_fg))
+                    .child(one_line(item.name.clone())),
             )
+            .children(send_state)
+            .child(
+                div()
+                    .absolute()
+                    .right(gpui::px(date_right))
+                    .top(px(DIALOG_NAME_TOP))
+                    .text_size(scale::font(DATE_FONT_SIZE).size)
+                    .text_color(c(date_fg))
+                    .child(item.time.clone()),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(DIALOG_NAME_LEFT))
+                    .right(gpui::px(text_right))
+                    .top(px(DIALOG_TEXT_TOP))
+                    .h(text_font.line_height())
+                    .child(last_line),
+            )
+            .children(badge.map(|b| {
+                div()
+                    .absolute()
+                    .right(px(DIALOG_PADDING_X))
+                    .top(badge_top(DIALOG_TEXT_TOP))
+                    .child(b)
+            }))
+            .when(pinned, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .right(px(DIALOG_PADDING_X))
+                        .top(px(DIALOG_TEXT_TOP))
+                        .child(icon(Icon::DialogsPinned, pin_fg, window)),
+                )
+            })
             .into_any_element()
     }
 
@@ -1815,7 +1941,11 @@ impl MainView {
             (p.msg_in_bg, p.history_text_in_fg, p.msg_in_date_fg)
         };
         let reserved = MSG_SIDE + MSG_MARGIN_FAR + if with_userpic { MSG_PHOTO_SKIP } else { 0. };
-        let max_inner = MSG_MAX_WIDTH.min(chat_width - reserved).max(120.) - 2. * MSG_PADDING_X;
+        let (pad_x, pad_y) = (lg(MSG_PADDING_X), lg(MSG_PADDING_Y));
+        let max_text =
+            (lg(MSG_MAX_WIDTH).min(chat_width - lg(reserved)) - 2. * pad_x).max(lg(120.));
+        let text_font = scale::font(FONT_SIZE);
+        let date_font = scale::font(DATE_FONT_SIZE);
         let sender = item.sender.as_ref().filter(|_| !prev_attached);
         // Media is not drawn yet: its caption stands in ("Photo", "Voice message").
         let media = item.media.as_ref();
@@ -1830,39 +1960,42 @@ impl MainView {
         } else {
             item.time.clone()
         };
-        let text_w = text_width(window, &text, FONT_SIZE, FontWeight::NORMAL);
-        let send_state_w = if item.read.is_some() {
-            SEND_STATE_SPACE
-        } else {
-            0.
-        };
-        let time_w =
-            text_width(window, &time_text, DATE_FONT_SIZE, FontWeight::NORMAL) + send_state_w;
+        // `BottomInfo`: the date, then `historySendStateSpace` for the checks. The text
+        // ends with a skip block that size (`skipBlockWidth/Height`): on its last line
+        // when it fits there, otherwise on a line of its own.
+        let date_w = text_width(window, &time_text, DATE_FONT_SIZE, FontWeight::NORMAL).ceil();
+        let info_w = date_w
+            + if item.read.is_some() {
+                lg(SEND_STATE_SPACE)
+            } else {
+                0.
+            };
+        let skip_w = lg(MSG_DATE_SPACE) + info_w - lg(MSG_DATE_DELTA_X);
+        let skip_h = date_font.height - lg(MSG_DATE_DELTA_Y);
+        let lines = wrapped_line_widths(window, &text, FONT_SIZE, FontWeight::NORMAL, max_text);
+        let last = lines.last().copied().unwrap_or(0.);
+        let skip_inline = last + skip_w <= max_text;
+        let text_w = lines
+            .iter()
+            .copied()
+            .fold(0., f32::max)
+            .max(if skip_inline { last + skip_w } else { skip_w });
+        let text_h = lines.len() as f32 * text_font.height + if skip_inline { 0. } else { skip_h };
         let name_w = sender.map_or(0., |(name, _)| {
             text_width(window, name, FONT_SIZE, FontWeight::SEMIBOLD)
         });
         let media_w =
             media_line.map_or(0., |m| text_width(window, m, FONT_SIZE, FontWeight::NORMAL));
-        // The time sits on the last line when it fits there (single-line text), as in
-        // tdesktop; otherwise on its own line.
-        let time_gap = 8.;
-        let inline_time = !text.contains('\n') && text_w + time_gap + time_w <= max_inner;
-        let natural = if inline_time {
-            text_w + time_gap + time_w
-        } else {
-            text_w.max(time_w)
-        }
-        .max(name_w)
-        .max(media_w);
         // +1 px: sub-pixel rounding must not push the last word to a new line.
-        let inner = (natural + 1.).min(max_inner).ceil();
+        let inner = ((text_w.max(name_w).max(media_w) + 1.).min(max_text + 1.) * scale::get())
+            .ceil()
+            / scale::get();
 
         let small = px(MSG_RADIUS_SMALL);
         let large = px(MSG_RADIUS_LARGE);
         // The group side is the one with the userpic (left) or, for outgoing messages in
-        // a narrow chat, the right side.
-        // The last message of a group has a tail on the group side, where its bottom
-        // corner is square (`countMessageRounding`, `Corner::Tail`).
+        // a narrow chat, the right side. The last message of a group has a tail there,
+        // where its bottom corner is square (`countMessageRounding`, `Corner::Tail`).
         let tail_corner = if next_attached { small } else { px(0.) };
         let (tl, tr, bl, br) = if right_side {
             (
@@ -1885,11 +2018,17 @@ impl MainView {
             p.msg_in_shadow
         };
 
-        let time = div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .text_size(px(DATE_FONT_SIZE))
+        // The info sits in the bubble's corner: `msgPadding - msgDateDelta` from its
+        // right and bottom edges; the checks at `historySendStatePosition` from the
+        // info's right end and the date line's bottom.
+        let info = div()
+            .absolute()
+            .right(gpui::px(pad_x - lg(MSG_DATE_DELTA_X)))
+            .bottom(gpui::px(pad_y - lg(MSG_DATE_DELTA_Y)))
+            .w(gpui::px(info_w))
+            .h(date_font.line_height())
+            .text_size(date_font.size)
+            .line_height(date_font.line_height())
             .text_color(c(date_fg))
             .child(time_text)
             .children(item.read.map(|read| {
@@ -1899,8 +2038,9 @@ impl MainView {
                     Icon::HistorySent
                 };
                 div()
-                    .flex_none()
-                    .pl(px(3.))
+                    .absolute()
+                    .left(gpui::px(info_w + lg(SEND_STATE_X)))
+                    .top(gpui::px(date_font.height + lg(SEND_STATE_Y)))
                     .child(icon(kind, p.history_out_icon_fg, window))
             }));
         // Captions stand in for media: in the date color when they are the whole text.
@@ -1909,34 +2049,19 @@ impl MainView {
         } else {
             fg
         };
-        let body = if inline_time {
-            div()
-                .w(px(inner))
-                .flex()
-                .items_end()
-                .justify_between()
-                .gap(px(time_gap))
-                .child(div().text_color(c(text_color)).child(text))
-                .child(time)
-        } else {
-            div()
-                .w(px(inner))
-                .flex()
-                .flex_col()
-                .child(div().w(px(inner)).text_color(c(text_color)).child(text))
-                .child(div().w(px(inner)).flex().justify_end().child(time))
-        };
         let bubble = div()
+            .relative()
             .flex_none()
-            // `msgShadow`: a 1 px line under the bubble (and its rounded corners).
+            // `msgShadow` under the bubble and its rounded corners.
             .shadow(vec![gpui::BoxShadow {
                 color: c(shadow).into(),
-                offset: point(px(0.), px(1.)),
-                blur_radius: px(0.),
-                spread_radius: px(0.),
+                offset: point(gpui::px(0.), px(MSG_SHADOW)),
+                blur_radius: gpui::px(0.),
+                spread_radius: gpui::px(0.),
             }])
-            .px(px(MSG_PADDING_X))
-            .py(px(MSG_PADDING_Y))
+            .w(gpui::px(inner + 2. * pad_x))
+            .px(gpui::px(pad_x))
+            .py(gpui::px(pad_y))
             .rounded_tl(tl)
             .rounded_tr(tr)
             .rounded_bl(bl)
@@ -1945,39 +2070,48 @@ impl MainView {
             .text_color(c(fg))
             .flex()
             .flex_col()
-            .gap(px(2.))
             .children(sender.map(|(name, color)| {
                 div()
-                    .w(px(inner))
+                    .w(gpui::px(inner))
+                    .h(text_font.line_height())
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(c(name_color(p, *color)))
                     .child(one_line(name.clone()))
             }))
             .children(media_line.map(|m| {
                 div()
-                    .w(px(inner))
+                    .w(gpui::px(inner))
+                    .h(text_font.line_height())
                     .text_color(c(date_fg))
                     .child(one_line(m.clone()))
             }))
-            .child(body);
-        // The tail (`bubble_tail`) hangs outside the square corner, its shadow line
-        // continuing the bubble's.
+            .child(
+                div()
+                    .w(gpui::px(inner))
+                    .h(gpui::px(text_h))
+                    .text_color(c(text_color))
+                    .child(text),
+            )
+            .child(info);
+        // The tail (`bubble_tail`) hangs outside the square corner; the shadow line
+        // continues under it (`PaintBubbleGeneric`).
         let tail = (!next_attached).then(|| {
             let kind = if right_side {
                 Icon::BubbleTailRight
             } else {
                 Icon::BubbleTail
             };
+            let tail_w = icon_width(kind, window);
             div()
                 .absolute()
-                .bottom(px(-1.))
-                .when(right_side, |d| d.right(px(-TAIL_WIDTH)))
-                .when(!right_side, |d| d.left(px(-TAIL_WIDTH)))
-                .w(px(TAIL_WIDTH))
+                .bottom(-px(MSG_SHADOW))
+                .when(right_side, |d| d.right(gpui::px(-tail_w)))
+                .when(!right_side, |d| d.left(gpui::px(-tail_w)))
+                .w(gpui::px(tail_w))
                 .flex()
                 .flex_col()
                 .child(icon(kind, bg, window))
-                .child(div().w_full().h(px(1.)).bg(c(shadow)))
+                .child(div().w_full().h(px(MSG_SHADOW)).bg(c(shadow)))
         });
         let bubble = div().relative().flex_none().child(bubble).children(tail);
 
@@ -2004,10 +2138,11 @@ impl MainView {
             .flex()
             .items_end()
             .pt(px(if prev_attached {
-                MSG_MARGIN_TOP_ATTACHED + 2.
+                MSG_MARGIN_TOP_ATTACHED
             } else {
                 MSG_MARGIN_TOP
             }))
+            .pb(px(MSG_MARGIN_BOTTOM))
             .px(px(MSG_SIDE))
             .when(right_side, |d| d.justify_end())
             .children(avatar_slot)
@@ -2349,6 +2484,8 @@ impl Focusable for MainView {
 
 impl Render for MainView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Every size below is converted for this scale as tdesktop does.
+        scale::set(window.scale_factor());
         if !self.first_list_frame_logged && !self.dialogs.is_empty() {
             self.first_list_frame_logged = true;
             tracing::info!(
@@ -2595,7 +2732,7 @@ impl Render for MainView {
                             .id("composer-field")
                             .flex_1()
                             .min_w(px(0.))
-                            .py(px((46. - LINE_HEIGHT) / 2.))
+                            .py(gpui::px((lg(46.) - scale::font(FONT_SIZE).height) / 2.))
                             .cursor(gpui::CursorStyle::IBeam)
                             // The whole field area focuses the input, not just its text line.
                             .on_mouse_down(
@@ -2641,7 +2778,8 @@ impl Render for MainView {
             .flex()
             .flex_col()
             .font_family(FONT_FAMILY)
-            .text_size(px(FONT_SIZE))
+            .text_size(scale::font(FONT_SIZE).size)
+            .line_height(scale::font(FONT_SIZE).line_height())
             .bg(c(p.window_bg))
             .text_color(c(p.window_fg))
             // On the root: with nothing focused, GPUI dispatches keys to the root only.

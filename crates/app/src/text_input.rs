@@ -48,8 +48,6 @@ actions!(
 pub struct Submit(pub String);
 
 const CONTEXT: &str = "TextInput";
-/// Line height of the 13 px message font.
-pub const LINE_HEIGHT: f32 = 17.;
 /// chat_helpers.style: historyComposeFieldMaxHeight (224 px, ~13 lines).
 const MAX_LINES: f32 = 13.;
 
@@ -104,8 +102,10 @@ pub struct TextInput {
 
 impl EventEmitter<Submit> for TextInput {}
 
-fn line_height() -> Pixels {
-    px(LINE_HEIGHT)
+/// The line height of the field's font (`historyComposeField`: the 13 px font, Qt's
+/// rounded metrics at the current scale).
+pub fn line_height() -> Pixels {
+    crate::scale::font(13.).line_height()
 }
 
 impl TextInput {

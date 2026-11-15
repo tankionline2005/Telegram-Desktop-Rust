@@ -11,6 +11,7 @@ mod icons;
 mod one_line;
 mod placement;
 mod present;
+mod scale;
 mod text_input;
 #[cfg(windows)]
 mod tray;

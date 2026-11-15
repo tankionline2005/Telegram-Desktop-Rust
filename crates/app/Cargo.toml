@@ -24,6 +24,8 @@ unicode-segmentation = "1.13.3"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 smallvec = "1"
+# Already built for GPUI: stroke joins and caps for drawn icons.
+lyon = "1.0"
 raw-window-handle = "0.6.2"
 # Already built for GPUI; renders tdesktop's SVGs (tray icon, wallpaper pattern).
 resvg = { version = "0.45.1", default-features = false }

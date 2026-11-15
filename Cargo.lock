@@ -5658,6 +5658,7 @@ dependencies = [
  "embed-resource",
  "gpui",
  "image",
+ "lyon",
  "raw-window-handle",
  "resvg",
  "smallvec",

@@ -70,20 +70,19 @@ impl Icon {
 
 struct Tinted {
     image: Arc<RenderImage>,
-    /// Size in logical pixels (the @1x size).
+    /// Device pixels of the icon itself (tdesktop's `ConvertScale` of the @1x size).
     width: f32,
     height: f32,
-    /// `PAD` in logical pixels: drawn outside the icon's box.
-    pad: f32,
 }
 
-/// (icon, color, scale index) -> tinted image.
-type Cache = HashMap<(Icon, u32, usize), Arc<Tinted>>;
+/// (icon, color, scale factor bits) -> tinted image.
+type Cache = HashMap<(Icon, u32, u32), Arc<Tinted>>;
 
 static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Default::default);
+static BASE_SIZES: LazyLock<Mutex<HashMap<Icon, (u32, u32)>>> = LazyLock::new(Default::default);
 
-/// The smallest mask at least as large as the device pixels (125 % uses @2x shrunk,
-/// not @1x blown up).
+/// The mask to scale from: the smallest at least as large as the device pixels
+/// (tdesktop takes @2x for 125 % and scales it down).
 fn scale_index(scale_factor: f32) -> usize {
     if scale_factor > 2. {
         2
@@ -94,25 +93,51 @@ fn scale_index(scale_factor: f32) -> usize {
     }
 }
 
-/// Transparent border around every tinted mask, in mask pixels. GPUI keeps images in a
-/// texture atlas and samples them with linear filtering: scaled to a fractional display
-/// scale, an icon touching its edge picks up a line of its atlas neighbour (a stripe
-/// above the "scroll down" button at 125 %).
+/// Transparent border around every tinted mask, in device pixels. GPUI keeps images in
+/// a texture atlas and samples them with linear filtering: an icon touching its edge
+/// can pick up a line of its atlas neighbour.
 const PAD: u32 = 2;
 
-fn tinted(icon: Icon, color: Color, scale: usize) -> Arc<Tinted> {
-    let key = (icon, color.rgba(), scale);
+fn decode(bytes: &[u8]) -> image::RgbaImage {
+    image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+        .expect("bundled icon")
+        .to_rgba8()
+}
+
+/// The @1x size (tdesktop's style size of the icon).
+fn base_size(icon: Icon) -> (u32, u32) {
+    if let Some(size) = BASE_SIZES.lock().unwrap().get(&icon) {
+        return *size;
+    }
+    let base = decode(icon.files()[0]);
+    let size = (base.width(), base.height());
+    BASE_SIZES.lock().unwrap().insert(icon, size);
+    size
+}
+
+/// The icon's width in logical pixels at the current scale.
+pub fn icon_width(icon: Icon, _window: &Window) -> f32 {
+    crate::scale::lg(base_size(icon).0 as f32)
+}
+
+fn tinted(icon: Icon, color: Color, scale_factor: f32) -> Arc<Tinted> {
+    let key = (icon, color.rgba(), scale_factor.to_bits());
     if let Some(t) = CACHE.lock().unwrap().get(&key) {
         return t.clone();
     }
-    let files = icon.files();
-    let decode = |bytes: &[u8]| {
-        image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
-            .expect("bundled icon")
-            .to_rgba8()
-    };
-    let base = decode(files[0]);
-    let mut mask = decode(files[scale]);
+    let (base_w, base_h) = base_size(icon);
+    // Exactly the device pixels tdesktop gives the icon, drawn 1:1.
+    let width = crate::scale::device(base_w as f32).max(1.);
+    let height = crate::scale::device(base_h as f32).max(1.);
+    let mut mask = decode(icon.files()[scale_index(scale_factor)]);
+    if mask.width() != width as u32 || mask.height() != height as u32 {
+        mask = image::imageops::resize(
+            &mask,
+            width as u32,
+            height as u32,
+            image::imageops::FilterType::Triangle,
+        );
+    }
     match icon {
         Icon::UpArrow => image::imageops::flip_vertical_in_place(&mut mask),
         Icon::BubbleTailRight => image::imageops::flip_horizontal_in_place(&mut mask),
@@ -132,25 +157,26 @@ fn tinted(icon: Icon, color: Color, scale: usize) -> Arc<Tinted> {
         let alpha = (px[2] as u16 * a as u16 / 255) as u8;
         padded.put_pixel(x + PAD, y + PAD, image::Rgba([b, g, r, alpha]));
     }
-    let pad = PAD as f32 * base.width() as f32 / mask.width() as f32;
     let frame = image::Frame::new(padded);
     let tinted = Arc::new(Tinted {
         image: Arc::new(RenderImage::new(smallvec::smallvec![frame])),
-        width: base.width() as f32,
-        height: base.height() as f32,
-        pad,
+        width,
+        height,
     });
     CACHE.lock().unwrap().insert(key, tinted.clone());
     tinted
 }
 
-/// The icon tinted with `color`, at its natural (tdesktop @1x) size. The transparent
-/// border hangs outside that box (negative margins), so layout sees the bare icon.
+/// The icon tinted with `color`, at tdesktop's size for the current scale. The
+/// transparent border hangs outside that box (negative margins), so layout sees the
+/// bare icon.
 pub fn icon(icon: Icon, color: Color, window: &Window) -> Img {
-    let t = tinted(icon, color, scale_index(window.scale_factor()));
+    let scale = window.scale_factor();
+    let t = tinted(icon, color, scale);
+    let pad = PAD as f32 / scale;
     img(t.image.clone())
-        .w(px(t.width + 2. * t.pad))
-        .h(px(t.height + 2. * t.pad))
-        .m(px(-t.pad))
+        .w(px(t.width / scale + 2. * pad))
+        .h(px(t.height / scale + 2. * pad))
+        .m(px(-pad))
         .flex_none()
 }
