@@ -55,6 +55,7 @@ pub enum Icon {
     MenuPayment,
     MenuEdited,
     MenuForwarded,
+    MenuNotifications,
 }
 
 macro_rules! icon_bytes {
@@ -101,6 +102,7 @@ impl Icon {
             Icon::MenuPayment => icon_bytes!("payments__payment_card"),
             Icon::MenuEdited => icon_bytes!("menu__edited_status"),
             Icon::MenuForwarded => icon_bytes!("menu__forwarded_status"),
+            Icon::MenuNotifications => icon_bytes!("menu__info_notifications"),
         }
     }
 }

@@ -36,8 +36,11 @@ use windows::core::{PCWSTR, w};
 /// What the user did with the tray icon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayEvent {
-    /// Click, or the first menu item: show the window, or hide it when it is active.
+    /// Click: show the window, or hide it when it is active.
     Toggle,
+    /// The menu's "Open Telegram" / "Minimize to Tray".
+    Show,
+    Hide,
     Quit,
     /// The right button: our menu at the cursor (device pixels), inside the work
     /// area of its screen (left, top, right, bottom).
@@ -164,6 +167,14 @@ impl Tray {
                 let _ = SetForegroundWindow(main);
             }
         }
+    }
+
+    /// The main window is on screen (not in the tray, not minimized).
+    pub fn window_is_shown() -> bool {
+        let Some(main) = main_hwnd() else {
+            return false;
+        };
+        unsafe { IsWindowVisible(main).as_bool() && !IsIconic(main).as_bool() }
     }
 
     /// The main window is visible and was active a moment ago.

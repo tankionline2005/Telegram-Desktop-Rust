@@ -473,6 +473,14 @@ impl Client {
             let home = self.home_dc();
             match self.invoke_in_raw(home, body).await {
                 Err(Error::Rpc(e)) if e.code == 303 && migrations < 3 => {
+                    // `FILE_MIGRATE_X`: this request is served by DC X (files, and some
+                    // others, as `payments.getBankCardData`); the home DC stays.
+                    if e.is("FILE_MIGRATE")
+                        && let Some(dc) = e.value()
+                    {
+                        info!(from = home, to = dc, "{}", e.message);
+                        return self.invoke_in_raw(dc, body).await;
+                    }
                     let Some(target) = migrate_target(&e) else {
                         return Err(Error::Rpc(e));
                     };

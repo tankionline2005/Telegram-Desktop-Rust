@@ -556,3 +556,30 @@ sha256 = "f09d40105bdb383721a7fac2cd7222dad3fbc02725070b8a5716a745a4d61390"
 path = "assets/tdesktop-icons/payments__payment_card@3x.png"
 upstream = "Telegram/Resources/icons/payments/payment_card@3x.png"
 sha256 = "981792580b511daa266fed5f46aa4097c35b2b89bffa52476c4fb7b77dfa3bf4"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__info_notifications.png"
+upstream = "Telegram/Resources/icons/menu/info_notifications.png"
+sha256 = "b435ccaa71c34d4f0818484a788746798dbfb4e37a6461bdca65eb3b2f470098"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__info_notifications@2x.png"
+upstream = "Telegram/Resources/icons/menu/info_notifications@2x.png"
+sha256 = "95db73a08fcb58545d704864db783c0fbad1da8addc5d0d10272c87e167ddca7"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__info_notifications@3x.png"
+upstream = "Telegram/Resources/icons/menu/info_notifications@3x.png"
+sha256 = "7003eefd9f0ee8e8389b026e0cf17ce899e42191b693aaa5ce412380071f7e27"
+
+[[vendored]]
+path = "assets/libprisma/grammars.dat"
+upstream = "libprisma/grammars.dat"
+submodule = "Telegram/ThirdParty/libprisma"
+sha256 = "a49d8280da86f5cd462052b0a6f5ff55fe8f67085495e91f151ac21a0638f583"
+
+[[vendored]]
+path = "assets/libprisma/LICENSE"
+upstream = "LICENSE"
+submodule = "Telegram/ThirdParty/libprisma"
+sha256 = "06c72c0dd56ae23738676814f482d78cb57dec4cb8b912fcd9e2e3b6b35e29cc"

@@ -14,6 +14,7 @@ members = [
     "crates/data",
     "crates/cli",
     "crates/theme",
+    "crates/prism",
     "crates/app",
     "xtask",
 ]
@@ -35,6 +36,7 @@ tdr-updates = { path = "crates/updates" }
 tdr-storage = { path = "crates/storage" }
 tdr-data = { path = "crates/data" }
 tdr-theme = { path = "crates/theme" }
+tdr-prism = { path = "crates/prism" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

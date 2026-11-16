@@ -118,6 +118,7 @@ async fn main() -> Result<()> {
         ["probe", "keep", id] => probe_keep(id.parse().context("user id")?, true).await,
         ["probe", "relist", id] => probe_keep(id.parse().context("user id")?, false).await,
         ["probe", "entities"] => probe_entities(),
+        ["probe", "bank-card", number] => probe_bank_card(number).await,
         ["logout"] => logout().await,
         ["selftest", "reconnect"] => selftest_reconnect().await,
         ["selftest", "unknown-key"] => selftest_unknown_key().await,
@@ -666,6 +667,24 @@ async fn probe_saved(offset: i32) -> Result<()> {
             ids.first(),
             ids.last()
         );
+    }
+    Ok(())
+}
+
+/// `payments.getBankCardData` for a card number (use a public test number): the
+/// answer or the error.
+async fn probe_bank_card(number: &str) -> Result<()> {
+    let client = logged_in()?;
+    for n in [number.to_string(), number.replace(' ', "")] {
+        let r = client
+            .invoke(&functions::payments::GetBankCardData { number: n.clone() })
+            .await;
+        match r {
+            Ok(enums::payments::BankCardData::BankCardData(d)) => {
+                println!("{n:?}: title {:?}, {} links", d.title, d.open_urls.len())
+            }
+            Err(e) => println!("{n:?}: error {e}"),
+        }
     }
     Ok(())
 }

@@ -149,8 +149,10 @@ fn setup_tray(window: gpui::WindowHandle<ui::MainView>, placement_path: PathBuf,
                         tray::Tray::show_window();
                     }
                 }
+                tray::TrayEvent::Show => tray::Tray::show_window(),
+                tray::TrayEvent::Hide => tray::Tray::hide_window(),
                 tray::TrayEvent::Menu { cursor, work } => {
-                    let active = tray::Tray::window_is_active();
+                    let active = tray::Tray::window_is_shown();
                     let events = menu_events.clone();
                     let _ = cx.update(|cx| tray_menu::open(cursor, work, active, events, cx));
                 }

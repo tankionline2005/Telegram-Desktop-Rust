@@ -250,6 +250,12 @@ impl MainView {
                 Icon::MenuCalendar,
                 MenuAction::AddToCalendar,
             ),
+            // Forwards the message to Saved Messages, scheduled at the date.
+            Entry::action(
+                "Set a Reminder",
+                Icon::MenuNotifications,
+                MenuAction::SetReminder,
+            ),
         ];
         self.open_menu(entries, at, MenuTag::Other);
     }
@@ -397,8 +403,10 @@ impl MainView {
             | MenuAction::AddToCalendar
             | MenuAction::ViewProfile(_)
             | MenuAction::ToggleNotifications
-            | MenuAction::TrayToggle
-            | MenuAction::TrayQuit => {}
+            | MenuAction::TrayShow
+            | MenuAction::TrayHide
+            | MenuAction::TrayQuit
+            | MenuAction::SetReminder => {}
         }
     }
 
@@ -410,6 +418,15 @@ impl MainView {
         origin: Point<Pixels>,
     ) -> bool {
         let now = Instant::now();
+        // Just copied: no hint on that line until the mouse leaves it.
+        if let Some((k, r)) = self.text_ui.code_suppressed
+            && k == key
+        {
+            if code == Some(r) {
+                return false;
+            }
+            self.text_ui.code_suppressed = None;
+        }
         match code {
             Some(rect) => match &mut self.text_ui.code_hint {
                 Some(h) if h.key == key => {
@@ -461,6 +478,16 @@ impl MainView {
                 }
                 _ => false,
             },
+        }
+    }
+
+    /// Code was copied: its highlight and hint fade out and stay away from that line.
+    pub(super) fn dismiss_code_hint(&mut self, key: TextKey) {
+        if let Some(h) = &mut self.text_ui.code_hint
+            && h.key == key
+        {
+            self.text_ui.code_suppressed = Some((key, h.to));
+            h.level.set(0.);
         }
     }
 

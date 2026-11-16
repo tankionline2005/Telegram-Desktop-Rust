@@ -64,7 +64,24 @@ pub(super) struct TextUi {
     pub(super) code_hint: Option<super::menus::CodeHint>,
     /// The chat the revealed spoilers belong to.
     revealed_peer: Option<PeerKey>,
+    /// The press reaction on a link or code.
+    ripple: Option<TextRipple>,
+    /// Code just copied: its hint stays away until the mouse leaves that line.
+    pub(super) code_suppressed: Option<(TextKey, gpui::Bounds<gpui::Pixels>)>,
 }
+
+struct TextRipple {
+    key: TextKey,
+    rects: Vec<gpui::Bounds<gpui::Pixels>>,
+    center: gpui::Point<gpui::Pixels>,
+    start: Instant,
+    released: Option<Instant>,
+    mono: bool,
+}
+
+/// `defaultRippleAnimation`: spreads in 650 ms, fades in 200 ms once released.
+const RIPPLE_SHOW_MS: f32 = 650.;
+const RIPPLE_HIDE_MS: f32 = 200.;
 
 fn ordered(a: usize, b: usize) -> Range<usize> {
     a.min(b)..a.max(b)
@@ -225,6 +242,17 @@ impl MainView {
             .as_ref()
             .and_then(|f| f.author.as_ref().map(|a| a.color))
             .unwrap_or(item.author.color);
+        // `SyntaxHighlightColors`.
+        let syntax = [
+            p.statistics_chart_line_lightblue,
+            p.statistics_chart_line_red,
+            p.statistics_chart_line_red,
+            p.statistics_chart_line_orange,
+            p.statistics_chart_line_red,
+            p.statistics_chart_line_blue,
+            p.statistics_chart_line_purple,
+            p.statistics_chart_line_green,
+        ];
         if item.out {
             TextColors {
                 fg: if caption_only {
@@ -242,6 +270,7 @@ impl MainView {
                 select_spoiler: p.msg_out_date_fg_selected,
                 quote: p.msg_out_reply_bar_color,
                 dark: self.dark,
+                syntax,
             }
         } else {
             TextColors {
@@ -260,6 +289,7 @@ impl MainView {
                 select_spoiler: p.msg_in_date_fg_selected,
                 quote: super::name_color(p, content_color),
                 dark: self.dark,
+                syntax,
             }
         }
     }
@@ -278,6 +308,19 @@ impl MainView {
                     .and_then(|p| p.hit.link),
                 revealed: t.revealed.get(&key).copied(),
                 code_highlight: self.code_highlight(key),
+                ripple: t.ripple.as_ref().filter(|r| r.key == key).map(|r| {
+                    let t = (r.start.elapsed().as_secs_f32() * 1000. / RIPPLE_SHOW_MS).min(1.) - 1.;
+                    crate::rich_text::PressRipple {
+                        rects: r.rects.clone(),
+                        center: r.center,
+                        // easeOutQuint
+                        shown: t * t * t * t * t + 1.,
+                        opacity: r.released.map_or(1., |at| {
+                            1. - (at.elapsed().as_secs_f32() * 1000. / RIPPLE_HIDE_MS).min(1.)
+                        }),
+                        mono: r.mono,
+                    }
+                }),
             },
             selection.is_some_and(|s| s.dragging),
         )
@@ -297,8 +340,31 @@ impl MainView {
                 hit,
                 click_count,
                 shift,
+                position,
             } => {
                 let hidden_spoiler = hit.spoiler && !revealed;
+                // The press reaction: links, code and a code block's header.
+                if !hidden_spoiler {
+                    let rich = layout.rich();
+                    let target = match (hit.pre_header, hit.link) {
+                        (Some(q), _) => layout.pre_header_rect(q).map(|r| (vec![r], true)),
+                        (None, Some(l)) => Some((
+                            layout.link_rects(l),
+                            matches!(rich.link(l), Some(Link::Code(_))),
+                        )),
+                        _ => None,
+                    };
+                    if let Some((rects, mono)) = target.filter(|(r, _)| !r.is_empty()) {
+                        self.text_ui.ripple = Some(TextRipple {
+                            key,
+                            rects,
+                            center: position,
+                            start: Instant::now(),
+                            released: None,
+                            mono,
+                        });
+                    }
+                }
                 if hidden_spoiler || hit.link.is_some() || hit.pre_header.is_some() {
                     self.text_ui.press = Some(TextPress { key, hit });
                     cx.notify();
@@ -359,6 +425,7 @@ impl MainView {
                 {
                     let from = press.hit.index;
                     self.text_ui.press = None;
+                    self.release_ripple();
                     self.text_ui.selection = Some(TextSelection {
                         key,
                         anchor: from..from,
@@ -393,6 +460,7 @@ impl MainView {
                 }
             }
             TextEvent::Up { hit, inside } => {
+                self.release_ripple();
                 if let Some(press) = self.text_ui.press.take()
                     && press.key == key
                     && inside
@@ -465,6 +533,23 @@ impl MainView {
         true
     }
 
+    fn release_ripple(&mut self) {
+        if let Some(r) = &mut self.text_ui.ripple {
+            r.released.get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// Drops a ripple that has faded; true while one animates.
+    pub(super) fn tick_ripple(&mut self) -> bool {
+        if self.text_ui.ripple.as_ref().is_some_and(|r| {
+            r.released
+                .is_some_and(|t| t.elapsed().as_secs_f32() * 1000. >= RIPPLE_HIDE_MS)
+        }) {
+            self.text_ui.ripple = None;
+        }
+        self.text_ui.ripple.is_some()
+    }
+
     /// The selected range of this message's text, if any.
     pub(super) fn text_selection_range(&self, key: TextKey) -> Option<Range<usize>> {
         self.text_ui
@@ -508,6 +593,8 @@ impl MainView {
             Link::Code(code) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(code));
                 self.show_toast("Text copied to clipboard.", Some(ToastIcon::Copy));
+                // Copied: the hint goes until the mouse leaves this line (ours).
+                self.dismiss_code_hint(key);
             }
             Link::Url(url) => self.open_url(&url, window, cx),
             // tdesktop opens the mail app; we show the menu the right button shows

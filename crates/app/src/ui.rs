@@ -3559,7 +3559,7 @@ impl Render for MainView {
         self.hide_spoilers_on_chat_change();
         #[cfg(windows)]
         crate::tray_menu::DARK.store(self.dark, std::sync::atomic::Ordering::Relaxed);
-        if self.tick_code_hint() {
+        if self.tick_code_hint() | self.tick_ripple() {
             window.request_animation_frame();
         }
         if self

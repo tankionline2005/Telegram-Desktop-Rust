@@ -32,7 +32,8 @@ impl TrayMenu {
         let area = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
         let geometry = self.menu.geometry(area, window);
         match self.menu.handle(event, &geometry) {
-            Some(MenuAction::TrayToggle) => self.chosen = Some(TrayEvent::Toggle),
+            Some(MenuAction::TrayShow) => self.chosen = Some(TrayEvent::Show),
+            Some(MenuAction::TrayHide) => self.chosen = Some(TrayEvent::Hide),
             Some(MenuAction::TrayQuit) => self.chosen = Some(TrayEvent::Quit),
             // Notifications come later.
             _ => {}
@@ -104,12 +105,29 @@ fn no_frame(window: &gpui::Window) {
     }
 }
 
+/// Exactly at `rect` (device pixels) and above everything, the taskbar's popups
+/// included (`Platform::ShowOverAll`).
+fn place_on_top(window: &gpui::Window, (x, y, w, h): (i32, i32, i32, i32)) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{HWND_TOPMOST, SWP_SHOWWINDOW, SetWindowPos};
+    let Ok(RawWindowHandle::Win32(handle)) =
+        HasWindowHandle::window_handle(window).map(|h| h.as_raw())
+    else {
+        return;
+    };
+    let hwnd = HWND(handle.hwnd.get() as *mut _);
+    unsafe {
+        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW);
+    }
+}
+
 /// Opens the menu at `cursor` (device pixels), inside `work` (the work area of
 /// that screen: left, top, right, bottom in device pixels).
 pub fn open(
     cursor: (i32, i32),
     work: (i32, i32, i32, i32),
-    window_active: bool,
+    window_shown: bool,
     events: UnboundedSender<TrayEvent>,
     cx: &mut App,
 ) {
@@ -121,14 +139,12 @@ pub fn open(
         action,
     };
     let entries = vec![
-        action(
-            if window_active {
-                "Minimize to Tray"
-            } else {
-                "Open Telegram"
-            },
-            MenuAction::TrayToggle,
-        ),
+        // The window on screen: it goes to the tray; in the tray: it comes back.
+        if window_shown {
+            action("Minimize to Tray", MenuAction::TrayHide)
+        } else {
+            action("Open Telegram", MenuAction::TrayShow)
+        },
         action("Disable notifications", MenuAction::ToggleNotifications),
         action("Quit Telegram", MenuAction::TrayQuit),
     ];
@@ -207,7 +223,9 @@ pub fn open(
         is_movable: false,
         is_resizable: false,
         is_minimizable: false,
-        window_background: WindowBackgroundAppearance::Transparent,
+        // Not `Transparent`: on Windows that adds a tinted backdrop (a light box around
+        // the menu). The frame is cleared to transparent anyway (DirectComposition).
+        window_background: WindowBackgroundAppearance::Opaque,
         app_id: Some("unofficial-telegram-desktop-rust".into()),
         ..Default::default()
     };
@@ -230,8 +248,11 @@ pub fn open(
     });
     match opened {
         Ok(handle) => {
+            let device = |v: f32| (v * scale).round() as i32;
+            let rect = (device(win_x), device(win_y), device(win_w), device(win_h));
             let _ = handle.update(cx, |_, window, _| {
                 no_frame(window);
+                place_on_top(window, rect);
                 window.activate_window();
             });
         }

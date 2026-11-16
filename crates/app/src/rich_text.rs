@@ -79,6 +79,8 @@ pub enum Kind {
     BankCard,
     /// A date the server marked (`messageEntityFormattedDate`).
     Date(i32),
+    /// A syntax color of code (1..=8, tdesktop's `Colorized` from libprisma).
+    Syntax(u8),
 }
 
 /// What a click on a span does (tdesktop's click handlers).
@@ -104,6 +106,8 @@ struct Span {
     range: Range<usize>,
     flags: u8,
     link: Option<u16>,
+    /// Syntax color of code (0: none).
+    color: u8,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -175,7 +179,12 @@ pub fn prepare(text: &str, entities: &[TextEntity]) -> Rich {
     let mut quotes_in: Vec<&TextEntity> = Vec::new();
     let mut links_in: Vec<(&TextEntity, Link)> = Vec::new();
     let mut styles: Vec<(&TextEntity, u8)> = Vec::new();
+    let mut colors: Vec<(&TextEntity, u8)> = Vec::new();
     for e in valid {
+        if let Kind::Syntax(c) = e.kind {
+            colors.push((e, c));
+            continue;
+        }
         if is_quote(&e.kind) {
             if quotes_in
                 .last()
@@ -217,18 +226,29 @@ pub fn prepare(text: &str, entities: &[TextEntity]) -> Rich {
     let mut next_quote = 0;
     let mut awaited = false;
 
-    fn push(out: &mut String, spans: &mut Vec<Span>, ch: char, flags: u8, link: Option<u16>) {
+    fn push(
+        out: &mut String,
+        spans: &mut Vec<Span>,
+        ch: char,
+        (flags, link, color): (u8, Option<u16>, u8),
+    ) {
         let start = out.len();
         out.push(ch);
         let end = out.len();
         match spans.last_mut() {
-            Some(last) if last.flags == flags && last.link == link && last.range.end == start => {
+            Some(last)
+                if last.flags == flags
+                    && last.link == link
+                    && last.color == color
+                    && last.range.end == start =>
+            {
                 last.range.end = end;
             }
             _ => spans.push(Span {
                 range: start..end,
                 flags,
                 link,
+                color,
             }),
         }
     }
@@ -261,7 +281,7 @@ pub fn prepare(text: &str, entities: &[TextEntity]) -> Rich {
             next_quote += 1;
             awaited = false;
             if !out.is_empty() && !out.ends_with('\n') {
-                push(&mut out, &mut spans, '\n', 0, None);
+                push(&mut out, &mut spans, '\n', (0, None, 0));
                 para_quotes.push(None);
             }
             let (pre, header) = match &q.kind {
@@ -280,7 +300,7 @@ pub fn prepare(text: &str, entities: &[TextEntity]) -> Rich {
         if awaited {
             awaited = false;
             if ch != '\n' {
-                push(&mut out, &mut spans, '\n', 0, None);
+                push(&mut out, &mut spans, '\n', (0, None, 0));
                 para_quotes.push(None);
             }
         }
@@ -306,10 +326,14 @@ pub fn prepare(text: &str, entities: &[TextEntity]) -> Rich {
             }
         }
         if ch == '\n' {
-            push(&mut out, &mut spans, '\n', 0, None);
+            push(&mut out, &mut spans, '\n', (0, None, 0));
             para_quotes.push(open.map(|(q, _, _)| q));
         } else {
-            push(&mut out, &mut spans, ch, flags, link);
+            let color = colors
+                .iter()
+                .find(|(e, _)| e.range.start <= i && i < e.range.end)
+                .map_or(0, |(_, c)| *c);
+            push(&mut out, &mut spans, ch, (flags, link, color));
         }
     }
 
@@ -859,6 +883,47 @@ pub struct Hit {
 }
 
 impl Layout {
+    /// The rectangles of a link on its lines, widened by `linkRipplePadding`.
+    pub fn link_rects(&self, link: u16) -> Vec<Bounds<Pixels>> {
+        let rich = self.rich();
+        let pad = scale::lg(3.);
+        let mut out: Vec<Bounds<Pixels>> = Vec::new();
+        for line in &self.lines {
+            let mut from: Option<usize> = None;
+            let mut till = 0;
+            for s in &rich.spans {
+                if s.link != Some(link) {
+                    continue;
+                }
+                let a = s.range.start.max(line.range.start);
+                let b = s.range.end.min(line.range.end);
+                if a < b {
+                    from = Some(from.map_or(a, |f| f.min(a)));
+                    till = till.max(b);
+                }
+            }
+            if let Some(a) = from {
+                out.push(Bounds::from_corners(
+                    point(px(line.x + self.line_x(line, a) - pad), px(line.y)),
+                    point(
+                        px(line.x + self.line_x(line, till) + pad),
+                        px(line.y + self.line_height),
+                    ),
+                ));
+            }
+        }
+        out
+    }
+
+    /// A code block's header (it copies the code).
+    pub fn pre_header_rect(&self, quote: usize) -> Option<Bounds<Pixels>> {
+        let b = self.boxes.iter().find(|b| b.quote == quote)?;
+        Some(Bounds::new(
+            b.bounds.origin,
+            size(b.bounds.size.width, px(scale::lg(PRE_HEADER))),
+        ))
+    }
+
     pub fn rich(&self) -> &Rich {
         &self.measured.rich
     }
@@ -952,6 +1017,8 @@ pub struct TextColors {
     pub quote: Color,
     /// Dark themes draw code blocks on black (`preBgOverride`).
     pub dark: bool,
+    /// `SyntaxHighlightColors`: the eight code colors.
+    pub syntax: [Color; 8],
 }
 
 fn hsla(color: Color) -> Hsla {
@@ -975,6 +1042,20 @@ pub struct TextState {
     /// The "click to copy" highlight under one-line code: where (relative to the
     /// text, it may be on its way from another line) and how much it is shown.
     pub code_highlight: Option<(Bounds<Pixels>, f32)>,
+    /// The press reaction on a link, code or a code block's header.
+    pub ripple: Option<PressRipple>,
+}
+
+/// `Message::_linkRipple`: a ripple from the press point, inside the pressed link's
+/// rectangles, in the link's color at a tenth (code: the code color).
+#[derive(Clone, Debug)]
+pub struct PressRipple {
+    pub rects: Vec<Bounds<Pixels>>,
+    pub center: Point<Pixels>,
+    /// How far it has spread (0..1) and how much is left of it.
+    pub shown: f32,
+    pub opacity: f32,
+    pub mono: bool,
 }
 
 /// The code highlight reaches this far beside the code, rounded like small buttons
@@ -991,6 +1072,8 @@ pub enum TextEvent {
         hit: Hit,
         click_count: usize,
         shift: bool,
+        /// Relative to the text.
+        position: Point<Pixels>,
     },
     /// The mouse moved over the text (or anywhere while it is being dragged).
     Move {
@@ -1148,6 +1231,41 @@ impl Element for RichText {
                     .corner_radii(Corners::all(px(scale::lg(CODE_HIGHLIGHT_RADIUS)))),
             );
         }
+        if let Some(r) = &self.state.ripple {
+            let base = if r.mono {
+                self.colors.mono
+            } else {
+                self.colors.link
+            };
+            let color = with_alpha(base, 0.1 * r.opacity);
+            let center = bounds.origin + r.center;
+            let reach = r
+                .rects
+                .iter()
+                .flat_map(|b| [b.origin, b.top_right(), b.bottom_left(), b.bottom_right()])
+                .map(|p| {
+                    let d = bounds.origin + p - center;
+                    (f32::from(d.x).powi(2) + f32::from(d.y).powi(2)).sqrt()
+                })
+                .fold(0., f32::max);
+            let radius = px(reach * r.shown);
+            for rect in &r.rects {
+                let clip = Bounds::new(bounds.origin + rect.origin, rect.size);
+                window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
+                    window.paint_quad(
+                        gpui::fill(
+                            Bounds::from_corners(
+                                point(center.x - radius, center.y - radius),
+                                point(center.x + radius, center.y + radius),
+                            ),
+                            color,
+                        )
+                        .corner_radii(Corners::all(radius)),
+                    );
+                });
+            }
+            window.request_animation_frame();
+        }
         self.paint_lines(bounds, window, cx);
 
         let handler = self.handler.clone();
@@ -1182,6 +1300,7 @@ impl Element for RichText {
                         hit,
                         click_count: e.click_count,
                         shift: e.modifiers.shift,
+                        position: e.position - origin,
                     },
                     window,
                     cx,
@@ -1431,7 +1550,9 @@ impl RichText {
                 let is_mono = flags & MONO != 0;
                 let in_quote_link =
                     link.is_some() && line.quote.is_some_and(|q| !rich.quotes[q].pre);
+                let syntax = span.map_or(0, |s| s.color);
                 let color = match (selected, is_mono, link.is_some()) {
+                    (_, true, _) if syntax > 0 => hsla(colors.syntax[usize::from(syntax - 1)]),
                     (false, true, _) => hsla(colors.mono),
                     (true, true, _) => hsla(colors.select_mono),
                     (_, false, true) if in_quote_link => hsla(colors.quote),

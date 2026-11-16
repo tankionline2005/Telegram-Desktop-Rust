@@ -349,7 +349,7 @@ fn message_text(text: &str, entities: &[describe::Entity]) -> (String, Vec<TextE
         }
         (i as isize + shift) as usize
     };
-    let converted = ranged
+    let mut converted: Vec<TextEntity> = ranged
         .iter()
         .map(|(r, kind)| {
             let kind = match kind {
@@ -379,7 +379,53 @@ fn message_text(text: &str, entities: &[describe::Entity]) -> (String, Vec<TextE
             }
         })
         .collect();
+    add_syntax(&out, &mut converted);
     (out, converted)
+}
+
+/// Code blocks with a language get their syntax colors.
+fn add_syntax(out: &str, converted: &mut Vec<TextEntity>) {
+    let blocks: Vec<(std::ops::Range<usize>, String)> = converted
+        .iter()
+        .filter_map(|e| match &e.kind {
+            TextKind::Pre(language) if !language.is_empty() => {
+                Some((e.range.clone(), language.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    for (range, language) in blocks {
+        if let Some(code) = out.get(range.clone()) {
+            for (r, color) in syntax_colors(code, &language) {
+                converted.push(TextEntity {
+                    range: range.start + r.start..range.start + r.end,
+                    kind: TextKind::Syntax(color),
+                });
+            }
+        }
+    }
+}
+
+/// tdesktop's syntax highlighting (libprisma), remembered: histories are sent
+/// again on every change, the code stays the same.
+fn syntax_colors(code: &str, language: &str) -> Vec<(std::ops::Range<usize>, u8)> {
+    use std::sync::{LazyLock, Mutex};
+    type Cache = HashMap<(String, String), Vec<(std::ops::Range<usize>, u8)>>;
+    static HIGHLIGHTER: LazyLock<tdr_prism::Highlighter> = LazyLock::new(|| {
+        tdr_prism::Highlighter::load(include_bytes!("../../../assets/libprisma/grammars.dat"))
+    });
+    static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Default::default);
+    let key = (language.to_string(), code.to_string());
+    if let Some(runs) = CACHE.lock().unwrap().get(&key) {
+        return runs.clone();
+    }
+    let runs = HIGHLIGHTER.highlight(code, language);
+    let mut cache = CACHE.lock().unwrap();
+    if cache.len() > 500 {
+        cache.clear();
+    }
+    cache.insert(key, runs.clone());
+    runs
 }
 
 fn row_text(m: &MessageRow) -> String {
@@ -1485,6 +1531,8 @@ fn demo_formatted(date: i32) -> Vec<(bool, String, Vec<TextEntity>)> {
         ("\n", &[]),
         ("another code line", &[K::Code]),
     ]);
+    let mut be = be;
+    add_syntax(&b, &mut be);
     vec![(false, a, ae), (true, b, be)]
 }
 

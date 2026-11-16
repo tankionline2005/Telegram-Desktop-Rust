@@ -85,6 +85,7 @@ pub enum MenuAction {
     Select,
     AddContact,
     AddToCalendar,
+    SetReminder,
     ViewProfile(PeerKey),
     ToggleNotifications,
     /// The message's whole text.
@@ -94,7 +95,8 @@ pub enum MenuAction {
     Copy(String, Option<&'static str>),
     OpenUrl(String),
     /// The tray menu's first item: show or hide the window.
-    TrayToggle,
+    TrayShow,
+    TrayHide,
     TrayQuit,
 }
 
@@ -169,7 +171,12 @@ pub struct PopupMenu {
 
 /// Mouse input over a menu.
 pub enum MenuEvent {
-    Hover(Option<usize>),
+    /// The mouse entered or left a row. Rows report on their own, in any order,
+    /// so leaving one never clears another that was just entered.
+    Hover {
+        row: usize,
+        over: bool,
+    },
     Press {
         row: usize,
         at: Point<Pixels>,
@@ -275,8 +282,14 @@ impl PopupMenu {
             return None;
         }
         match event {
-            MenuEvent::Hover(row) => {
-                self.hovered = row.filter(|r| self.entries[*r].clickable());
+            MenuEvent::Hover { row, over } => {
+                if over {
+                    if self.entries[row].clickable() {
+                        self.hovered = Some(row);
+                    }
+                } else if self.hovered == Some(row) {
+                    self.hovered = None;
+                }
                 None
             }
             MenuEvent::Press { row, at } => {
@@ -501,7 +514,14 @@ pub fn render(
             let h5 = handler.clone();
             row = row
                 .on_hover(move |over, window, cx| {
-                    h_(MenuEvent::Hover(over.then_some(i)), window, cx);
+                    h_(
+                        MenuEvent::Hover {
+                            row: i,
+                            over: *over,
+                        },
+                        window,
+                        cx,
+                    );
                 })
                 .on_mouse_down(MouseButton::Left, move |e, window, cx| {
                     cx.stop_propagation();

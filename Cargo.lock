@@ -1738,6 +1738,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
+name = "fancy-regex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e24cb5a94bcae1e5408b0effca5cd7172ea3c5755049c5f3af4cd283a165298"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "fastrand"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5666,6 +5677,7 @@ dependencies = [
  "smallvec",
  "tdr-api",
  "tdr-data",
+ "tdr-prism",
  "tdr-theme",
  "tokio",
  "tracing",
@@ -5729,6 +5741,13 @@ dependencies = [
  "tdr-tl",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "tdr-prism"
+version = "0.1.0"
+dependencies = [
+ "fancy-regex",
 ]
 
 [[package]]

@@ -1,0 +1,15 @@
+[package]
+name = "tdr-prism"
+version = "0.1.0"
+description = "Syntax highlighting of code blocks: libprisma (Prism.js grammars) ported from tdesktop"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Prism's grammars are JavaScript regular expressions: lookaround and backreferences.
+fancy-regex = "0.14"
+
+[lints]
+workspace = true
