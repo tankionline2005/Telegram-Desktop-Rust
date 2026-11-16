@@ -50,6 +50,9 @@ const JOIN_AS_PADDING: [f32; 4] = [12., 8., 12., 7.];
 pub const JOIN_AS_PHOTO: f32 = 30.;
 const JOIN_AS_TEXT_TOP: f32 = 4.;
 const JOIN_AS_NAME_TOP: f32 = 23.;
+// widgets.style: defaultMenu itemRightSkip; the submenu arrow icon's size.
+const ITEM_RIGHT_SKIP: f32 = 6.;
+const ARROW_SIZE: f32 = 24.;
 /// chat.style: historyBankCardMenuMultilinePosition.
 const TITLE_POSITION: (f32, f32) = (18., 4.);
 
@@ -76,6 +79,20 @@ const PLAIN: Style = Style {
 /// listed in docs/ARCHITECTURE.md).
 #[derive(Clone, Debug, PartialEq)]
 pub enum MenuAction {
+    /// A submenu's row: opens the submenu.
+    None,
+    // The message field's menu.
+    FieldUndo,
+    FieldRedo,
+    FieldCut,
+    FieldCopy,
+    FieldPaste,
+    FieldDelete,
+    FieldSelectAll,
+    FieldFormat(crate::text_input::Tag),
+    FieldClearFormat,
+    FieldLink,
+    FieldDate,
     Reply,
     QuoteReply,
     Edit,
@@ -115,6 +132,17 @@ pub enum Entry {
         icon: Option<Icon>,
         action: MenuAction,
     },
+    /// A plain item (`defaultMenu`): its shortcut on the right, greyed out when
+    /// disabled, or a submenu (an arrow on the right, opens on hover).
+    Item {
+        label: SharedString,
+        shortcut: Option<SharedString>,
+        enabled: bool,
+        action: MenuAction,
+        submenu: Option<Vec<Entry>>,
+    },
+    /// `defaultMenuSeparator`: a thin line.
+    Separator,
     /// `expandedMenuSeparator`: a wide band.
     WideSeparator,
     /// "today at 20:29" with the forwarded / edited icon (`WhenAction`).
@@ -141,11 +169,45 @@ impl Entry {
         }
     }
 
+    pub fn item(label: &str, shortcut: Option<&str>, enabled: bool, action: MenuAction) -> Self {
+        Entry::Item {
+            label: label.to_string().into(),
+            shortcut: shortcut.map(|s| s.to_string().into()),
+            enabled,
+            action,
+            submenu: None,
+        }
+    }
+
+    pub fn submenu(label: &str, enabled: bool, entries: Vec<Entry>) -> Self {
+        Entry::Item {
+            label: label.to_string().into(),
+            shortcut: None,
+            enabled,
+            action: MenuAction::None,
+            submenu: Some(entries),
+        }
+    }
+
     fn clickable(&self) -> bool {
-        matches!(
-            self,
-            Entry::Action { .. } | Entry::Title { .. } | Entry::Phone(PhoneRow::Found { .. })
-        )
+        match self {
+            Entry::Item { enabled, .. } => *enabled,
+            Entry::Action { .. } | Entry::Title { .. } | Entry::Phone(PhoneRow::Found { .. }) => {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn submenu_entries(&self) -> Option<&Vec<Entry>> {
+        match self {
+            Entry::Item {
+                submenu: Some(s),
+                enabled: true,
+                ..
+            } => Some(s),
+            _ => None,
+        }
     }
 }
 
@@ -167,6 +229,11 @@ pub struct PopupMenu {
     hovered: Option<usize>,
     pressed: Option<usize>,
     ripple: Option<Ripple>,
+    /// The open submenu and the row it belongs to.
+    child: Option<(usize, Box<PopupMenu>)>,
+    /// A submenu: the parent's left edge and width (it goes left of the parent
+    /// when it does not fit on the right).
+    parent: Option<(f32, f32)>,
 }
 
 /// Mouse input over a menu.
@@ -186,6 +253,8 @@ pub enum MenuEvent {
     },
     /// A click outside: the menu goes.
     Dismiss,
+    /// An event of the open submenu.
+    Child(Box<MenuEvent>),
 }
 
 pub struct Geometry {
@@ -244,6 +313,8 @@ impl PopupMenu {
             hovered: None,
             pressed: None,
             ripple: None,
+            child: None,
+            parent: None,
         }
     }
 
@@ -254,6 +325,9 @@ impl PopupMenu {
     pub fn hide(&mut self) {
         if self.hiding.is_none() {
             self.hiding = Some(Instant::now());
+        }
+        if let Some((_, child)) = &mut self.child {
+            child.hide();
         }
     }
 
@@ -268,7 +342,8 @@ impl PopupMenu {
     }
 
     pub fn animating(&self) -> bool {
-        self.shown.elapsed().as_secs_f32() * 1000. < SHOW_MS
+        self.child.as_ref().is_some_and(|(_, c)| c.animating())
+            || self.shown.elapsed().as_secs_f32() * 1000. < SHOW_MS
             || self.hiding.is_some()
             || self.ripple.as_ref().is_some_and(|r| {
                 r.released
@@ -277,17 +352,49 @@ impl PopupMenu {
     }
 
     /// Applies an event; returns the chosen action (the menu then fades out).
-    pub fn handle(&mut self, event: MenuEvent, geometry: &Geometry) -> Option<MenuAction> {
+    pub fn handle(
+        &mut self,
+        event: MenuEvent,
+        area: Bounds<Pixels>,
+        window: &Window,
+    ) -> Option<MenuAction> {
         if self.hiding.is_some() {
             return None;
         }
+        let geometry = self.geometry(area, window);
+        let geometry = &geometry;
         match event {
+            MenuEvent::Child(event) => {
+                let (_, child) = self.child.as_mut()?;
+                let action = child.handle(*event, area, window);
+                if action.is_some() {
+                    self.hide();
+                }
+                action
+            }
             MenuEvent::Hover { row, over } => {
+                let has_child = self.child.as_ref().is_some_and(|(r, _)| *r == row);
                 if over {
                     if self.entries[row].clickable() {
                         self.hovered = Some(row);
                     }
-                } else if self.hovered == Some(row) {
+                    // A submenu opens on hover; another row closes it
+                    // (`PopupMenu::popupSubmenu`).
+                    if !has_child {
+                        self.child = None;
+                        if let Some(entries) = self.entries[row].submenu_entries() {
+                            let (top, _) = geometry.rows[row];
+                            let pad = lg(PLAIN.scroll_padding);
+                            let mut child = PopupMenu::new(
+                                entries.clone(),
+                                false,
+                                point(gpx(geometry.x + geometry.w), gpx(geometry.y + top - pad)),
+                            );
+                            child.parent = Some((geometry.x, geometry.w));
+                            self.child = Some((row, Box::new(child)));
+                        }
+                    }
+                } else if self.hovered == Some(row) && !has_child {
                     self.hovered = None;
                 }
                 None
@@ -313,11 +420,14 @@ impl PopupMenu {
                 if let Some(r) = &mut self.ripple {
                     r.released.get_or_insert_with(Instant::now);
                 }
-                if self.pressed.take() != Some(row) {
+                if self.pressed.take() != Some(row) || self.entries[row].submenu_entries().is_some()
+                {
                     return None;
                 }
                 let action = match &self.entries[row] {
-                    Entry::Action { action, .. } | Entry::Title { action, .. } => action.clone(),
+                    Entry::Action { action, .. }
+                    | Entry::Title { action, .. }
+                    | Entry::Item { action, .. } => action.clone(),
                     Entry::Phone(PhoneRow::Found { peer, .. }) => MenuAction::ViewProfile(*peer),
                     _ => return None,
                 };
@@ -344,6 +454,23 @@ impl PopupMenu {
         let mut y = lg(st.scroll_padding);
         for e in &self.entries {
             let (w, h) = match e {
+                Entry::Item {
+                    label,
+                    shortcut,
+                    submenu,
+                    ..
+                } => {
+                    let right = match (shortcut, submenu) {
+                        (_, Some(_)) => lg(ITEM_RIGHT_SKIP) + lg(ARROW_SIZE),
+                        (Some(s), None) => lg(ITEM_RIGHT_SKIP) + text_width(window, s, FONT_SIZE),
+                        _ => 0.,
+                    };
+                    (
+                        pl + text_width(window, label, FONT_SIZE) + right + pr,
+                        pt + font_h + pb,
+                    )
+                }
+                Entry::Separator => (0., lg(5.) + lg(1.) + lg(5.)),
                 Entry::Action { label, .. } => (
                     pl + text_width(window, label, FONT_SIZE) + pr,
                     pt + font_h + pb,
@@ -384,7 +511,13 @@ impl PopupMenu {
         );
         let from_right = ax + w > right;
         let from_bottom = ay + h > bottom;
-        let x = if from_right { ax - w } else { ax }.clamp(left, (right - w).max(left));
+        // A submenu that does not fit on the right goes left of its parent.
+        let flipped = match self.parent {
+            Some((parent_x, _)) if from_right => parent_x - w,
+            _ if from_right => ax - w,
+            _ => ax,
+        };
+        let x = flipped.clamp(left, (right - w).max(left));
         let y = if from_bottom { ay - h } else { ay }.clamp(top, (bottom - h).max(top));
         Geometry {
             x: x.round(),
@@ -407,6 +540,9 @@ pub struct MenuColors {
     pub fg_over: Color,
     /// `itemFgShortcut`: grey text.
     pub sub: Color,
+    pub sub_over: Color,
+    /// `itemFgDisabled`.
+    pub disabled: Color,
     pub icon: Color,
     pub separator: Color,
 }
@@ -421,6 +557,8 @@ impl MenuColors {
             fg: p.window_fg,
             fg_over: p.window_fg_over,
             sub: p.window_sub_text_fg,
+            sub_over: p.window_sub_text_fg_over,
+            disabled: p.menu_fg_disabled,
             icon: p.window_bold_fg,
             separator: p.menu_separator_fg,
         }
@@ -440,6 +578,59 @@ pub fn render(
     handler: impl Fn(MenuEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let handler: Handler = Rc::new(handler);
+    let parent = render_frame(menu, colors, area, window, userpic, handler.clone());
+    let child = menu.child.as_ref().map(|(_, child)| {
+        let h = handler.clone();
+        render_frame(
+            child,
+            colors,
+            area,
+            window,
+            None,
+            Rc::new(move |e, window, cx| h(MenuEvent::Child(Box::new(e)), window, cx)),
+        )
+    });
+    let outside = handler.clone();
+    let outside2 = handler;
+    div()
+        .absolute()
+        .left(area.origin.x)
+        .top(area.origin.y)
+        .w(area.size.width)
+        .h(area.size.height)
+        .child(
+            // Clicks elsewhere close the menu and go no further (the menu grabs input).
+            div()
+                .id("popup-menu-outside")
+                .absolute()
+                .left_0()
+                .top_0()
+                .w(area.size.width)
+                .h(area.size.height)
+                .occlude()
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    cx.stop_propagation();
+                    outside(MenuEvent::Dismiss, window, cx);
+                })
+                .on_mouse_down(MouseButton::Right, move |_, window, cx| {
+                    cx.stop_propagation();
+                    outside2(MenuEvent::Dismiss, window, cx);
+                }),
+        )
+        .child(parent)
+        .children(child)
+        .into_any_element()
+}
+
+/// One menu's panel (the main one or a submenu), positioned in the area's parent.
+fn render_frame(
+    menu: &PopupMenu,
+    colors: &MenuColors,
+    area: Bounds<Pixels>,
+    window: &mut Window,
+    userpic: Option<AnyElement>,
+    handler: Handler,
+) -> AnyElement {
     let g = menu.geometry(area, window);
     let st = menu.style();
     let now_ms = menu.shown.elapsed().as_secs_f32() * 1000.;
@@ -465,11 +656,12 @@ pub fn render(
     let [pl, pt, _, _] = st.item_padding.map(lg);
     let mut userpic = userpic;
 
+    let level = usize::from(menu.parent.is_some());
     let mut rows: Vec<AnyElement> = Vec::with_capacity(menu.entries.len());
     for (i, (entry, (top, h))) in menu.entries.iter().zip(g.rows.iter().copied()).enumerate() {
         let hovered = menu.hovered == Some(i);
         let mut row = div()
-            .id(("menu-row", i))
+            .id(("menu-row", level * 1000 + i))
             .absolute()
             .left_0()
             .top(gpx(top))
@@ -555,6 +747,61 @@ pub fn render(
         }
         let fg = if hovered { colors.fg_over } else { colors.fg };
         let row = match entry {
+            Entry::Item {
+                label,
+                shortcut,
+                enabled,
+                submenu,
+                ..
+            } => {
+                let (text, sub) = match (enabled, hovered) {
+                    (false, _) => (colors.disabled, colors.disabled),
+                    (true, true) => (colors.fg_over, colors.sub_over),
+                    (true, false) => (colors.fg, colors.sub),
+                };
+                let right = lg(st.item_padding[2]);
+                row.child(
+                    div()
+                        .absolute()
+                        .left(gpx(pl))
+                        .top(gpx(pt))
+                        .w(gpx(g.w - pl - right))
+                        .h(font_h.line_height())
+                        .text_color(hsla(text))
+                        .child(one_line(label.clone())),
+                )
+                .children(shortcut.clone().filter(|_| submenu.is_none()).map(|s| {
+                    div()
+                        .absolute()
+                        .right(gpx(right))
+                        .top(gpx(pt))
+                        .h(font_h.line_height())
+                        .whitespace_nowrap()
+                        .text_color(hsla(sub))
+                        .child(s)
+                }))
+                .children(submenu.as_ref().map(|_| {
+                    let arrow = if *enabled {
+                        colors.icon
+                    } else {
+                        colors.disabled
+                    };
+                    div()
+                        .absolute()
+                        .right(px(ITEM_RIGHT_SKIP))
+                        .top(gpx(((h - lg(ARROW_SIZE)) / 2.).round()))
+                        .child(icon(Icon::MenuSubmenuArrow, arrow, window))
+                }))
+            }
+            Entry::Separator => row.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(px(5.))
+                    .w(gpx(g.w))
+                    .h(px(1.))
+                    .bg(hsla(colors.separator)),
+            ),
             Entry::Action {
                 label, icon: kind, ..
             } => row
@@ -767,7 +1014,7 @@ pub fn render(
         )
     };
     let frame = div()
-        .id("popup-menu")
+        .id(("popup-menu", level))
         .absolute()
         .left(gpx(frame_x))
         .top(gpx(frame_y))
@@ -789,40 +1036,12 @@ pub fn render(
         .child(content)
         .children(band)
         .children(solid);
-    let outside = handler.clone();
-    let outside2 = handler;
+    // Frames are placed in the area's parent coordinates.
     div()
         .absolute()
-        .left(area.origin.x)
-        .top(area.origin.y)
-        .w(area.size.width)
-        .h(area.size.height)
-        .child(
-            // Clicks elsewhere close the menu and go no further (the menu grabs input).
-            div()
-                .id("popup-menu-outside")
-                .absolute()
-                .left_0()
-                .top_0()
-                .w(area.size.width)
-                .h(area.size.height)
-                .occlude()
-                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                    cx.stop_propagation();
-                    outside(MenuEvent::Dismiss, window, cx);
-                })
-                .on_mouse_down(MouseButton::Right, move |_, window, cx| {
-                    cx.stop_propagation();
-                    outside2(MenuEvent::Dismiss, window, cx);
-                }),
-        )
-        .child(
-            div()
-                .absolute()
-                .left(-area.origin.x)
-                .top(-area.origin.y)
-                .opacity(opacity)
-                .child(frame),
-        )
+        .left(-area.origin.x)
+        .top(-area.origin.y)
+        .opacity(opacity)
+        .child(frame)
         .into_any_element()
 }

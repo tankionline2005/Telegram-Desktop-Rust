@@ -27,7 +27,7 @@ use crate::one_line::one_line;
 use crate::placement::{COLUMN_MIN_LEFT, Columns};
 use crate::present;
 use crate::scale::{self, dpx, lg, px};
-use crate::text_input::{Submit, TextInput};
+use crate::text_input::{FieldMenu, Submit, TagSpan, TextInput};
 
 mod menus;
 mod message_text;
@@ -729,6 +729,9 @@ pub struct MainView {
     /// loaded (`None`: cleared). They win over the list's own `DialogItem::draft`,
     /// which may lag behind the data thread.
     drafts: HashMap<PeerKey, Option<String>>,
+    /// The formatting of a chat's unsent text, while that text stays the same (drafts
+    /// keep plain text for now).
+    draft_tags: HashMap<PeerKey, (String, Vec<TagSpan>)>,
     /// The text the input field had at the last check (to notice typing).
     input_text: String,
     /// Bumped on every edit: pending draft-save timers check it.
@@ -770,19 +773,31 @@ impl MainView {
         let input = cx.new(|cx| TextInput::new("Write a message…", palette, cx));
         cx.observe(&input, |this: &mut Self, _, cx| this.input_changed(cx))
             .detach();
-        cx.subscribe(&input, |this: &mut Self, _, Submit(text), cx| {
+        cx.subscribe(&input, |this: &mut Self, _, FieldMenu(at), cx| {
+            this.open_field_menu(*at, cx);
+        })
+        .detach();
+        cx.subscribe(&input, |this: &mut Self, _, Submit { text, tags }, cx| {
             if let Some(peer) = this.selected {
                 // Sending clears the draft (the data thread clears the stored one).
                 this.drafts.insert(peer, None);
+                this.draft_tags.remove(&peer);
                 this.input_text.clear();
                 this.draft_dirty_since = None;
                 this.draft_generation += 1;
                 this.stick_to_bottom = true;
                 // tdesktop drops the bar once you write.
                 this.unread_bar = None;
+                // Sending shows the end of the history (`HistoryWidget::send` scrolls
+                // to the bottom), so the new message is in view when it comes.
+                this.messages_state.scroll_to(ListOffset {
+                    item_ix: this.messages.len(),
+                    offset_in_item: px(0.),
+                });
                 let _ = this.commands.send(Command::Send {
                     peer,
                     text: text.clone(),
+                    entities: crate::text_input::out_entities(text, tags),
                 });
             }
             cx.notify();
@@ -866,6 +881,7 @@ impl MainView {
             userpics: HashMap::new(),
             userpic_requests: RefCell::new(HashSet::new()),
             drafts: HashMap::new(),
+            draft_tags: HashMap::new(),
             input_text: String::new(),
             draft_generation: 0,
             draft_dirty_since: None,
@@ -1036,8 +1052,7 @@ impl MainView {
                 start: Instant::now(),
             });
         }
-        let draft = self.draft_of(peer).unwrap_or_default();
-        self.set_input_text(draft, cx);
+        self.restore_draft(peer, cx);
         let read_till = self
             .dialogs
             .iter()
@@ -1082,8 +1097,7 @@ impl MainView {
                 start: Instant::now(),
             });
         }
-        let draft = self.draft_of(peer).unwrap_or_default();
-        self.set_input_text(draft, cx);
+        self.restore_draft(peer, cx);
         // The data side gives back the same history: the list keeps its position.
         let _ = self.commands.send(Command::Back);
         self.reveal_in_list(peer);
@@ -1563,7 +1577,9 @@ impl MainView {
                 if self.selected == Some(peer) {
                     self.draft_generation += 1;
                     self.draft_dirty_since = None;
-                    self.set_input_text(text.unwrap_or_default(), cx);
+                    let text = text.unwrap_or_default();
+                    let tags = self.tags_of(peer, &text);
+                    self.set_input_text_with_tags(text, tags, cx);
                 }
             }
             Update::ChatInfo(item) => {
@@ -1622,8 +1638,13 @@ impl MainView {
                 offset_in_item: px(0.),
             });
         } else if self.stick_to_bottom && !self.messages.is_empty() {
-            self.messages_state
-                .scroll_to_reveal_item(self.messages.len() - 1);
+            // Past the last item: the bottom-aligned list then follows its end, also
+            // while the new items get their real heights (revealing the last item
+            // would use its estimated height and cut it).
+            self.messages_state.scroll_to(ListOffset {
+                item_ix: self.messages.len(),
+                offset_in_item: px(0.),
+            });
             self.mark_read(self.messages.len());
         }
     }
@@ -1782,6 +1803,12 @@ impl MainView {
     fn save_draft(&mut self, cx: &mut Context<Self>) {
         let text = self.input.read(cx).text();
         if let Some(prev) = self.selected {
+            let tags = self.input.read(cx).tags();
+            if tags.is_empty() {
+                self.draft_tags.remove(&prev);
+            } else {
+                self.draft_tags.insert(prev, (text.clone(), tags));
+            }
             self.drafts
                 .insert(prev, (!text.trim().is_empty()).then(|| text.clone()));
             self.draft_dirty_since = None;
@@ -1796,8 +1823,41 @@ impl MainView {
 
     /// Replaces the field's text without treating it as typing.
     fn set_input_text(&mut self, text: String, cx: &mut Context<Self>) {
+        self.set_input_text_with_tags(text, Vec::new(), cx);
+    }
+
+    fn set_input_text_with_tags(
+        &mut self,
+        text: String,
+        tags: Vec<TagSpan>,
+        cx: &mut Context<Self>,
+    ) {
         self.input_text = text.clone();
-        self.input.update(cx, |input, cx| input.set_text(text, cx));
+        self.input
+            .update(cx, |input, cx| input.set_text_with_tags(text, tags, cx));
+    }
+
+    /// Quotes in the field have the user's own color (`coloredQuoteCache` of the
+    /// session user's color index): the color of our messages' author.
+    fn update_quote_color(&mut self, cx: &mut Context<Self>) {
+        if let Some(m) = self.messages.iter().find(|m| m.out && m.service.is_none()) {
+            let color = name_color(self.palette(), m.author.color);
+            self.input.update(cx, |i, cx| i.set_quote_color(color, cx));
+        }
+    }
+
+    /// The field gets the draft of `peer` (with its formatting).
+    fn restore_draft(&mut self, peer: PeerKey, cx: &mut Context<Self>) {
+        let text = self.draft_of(peer).unwrap_or_default();
+        let tags = self.tags_of(peer, &text);
+        self.set_input_text_with_tags(text, tags, cx);
+    }
+
+    fn tags_of(&self, peer: PeerKey, text: &str) -> Vec<TagSpan> {
+        match self.draft_tags.get(&peer) {
+            Some((saved, tags)) if saved == text => tags.clone(),
+            _ => Vec::new(),
+        }
     }
 
     /// The field may have changed: tdesktop's draft timers. The local draft is saved a
@@ -1898,8 +1958,7 @@ impl MainView {
         }
         // Keep the unsent text of the chat we leave; restore the one of the chat we open.
         self.save_draft(cx);
-        let draft = self.draft_of(peer).unwrap_or_default();
-        self.set_input_text(draft, cx);
+        self.restore_draft(peer, cx);
         self.leave_current(cx);
         // Opened again: where it was (`showHistory` prefers the saved scroll state to
         // the unread bar), else at the first unread message or the end.
@@ -3544,6 +3603,7 @@ impl Render for MainView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Every size below is converted for this scale as tdesktop does.
         scale::set(window.scale_factor());
+        self.update_quote_color(cx);
         if !self.first_list_frame_logged && !self.dialogs.is_empty() {
             self.first_list_frame_logged = true;
             tracing::info!(
@@ -3896,11 +3956,33 @@ impl Render for MainView {
                             .min_w(px(0.))
                             .py(gpui::px((lg(46.) - scale::font(FONT_SIZE).height) / 2.))
                             .cursor(gpui::CursorStyle::IBeam)
-                            // The whole field area focuses the input, not just its text line.
+                            // The whole field area takes presses, not just its text
+                            // lines (tdesktop's field fills the composer's height). The
+                            // default is prevented: the history's focus tracking would
+                            // take the focus back.
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    window.focus(&this.input.focus_handle(cx))
+                                cx.listener(|this, e: &gpui::MouseDownEvent, window, cx| {
+                                    window.prevent_default();
+                                    window.focus(&this.input.focus_handle(cx));
+                                    let (position, shift, count) =
+                                        (e.position, e.modifiers.shift, e.click_count);
+                                    this.input
+                                        .update(cx, |i, cx| i.press_at(position, shift, count, cx));
+                                }),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|this, e: &gpui::MouseDownEvent, window, cx| {
+                                    window.prevent_default();
+                                    window.focus(&this.input.focus_handle(cx));
+                                    this.open_field_menu(e.position, cx);
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.input.update(cx, |i, _| i.release());
                                 }),
                             )
                             .child(self.input.clone()),

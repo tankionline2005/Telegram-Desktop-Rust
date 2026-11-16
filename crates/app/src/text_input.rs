@@ -1,23 +1,36 @@
 //! The message field: multi-line, wrapping, growing up to tdesktop's maximum height and
-//! scrolling inside after that.
+//! scrolling inside after that, with formatting (`Ui::InputField`'s tags).
 //!
 //! Started from GPUI's `examples/input.rs` (Copyright Zed Industries, Apache-2.0):
 //! IME composition, clipboard, grapheme-aware movement. Added: wrapping and several
 //! paragraphs, Enter sends / Shift+Enter breaks the line (as in tdesktop), Up/Down by
 //! visual line, inner scrolling, drafts (`set_text`), tdesktop palette colors.
+//!
+//! The text is laid out and drawn by `rich_text`, as messages are: the same line
+//! breaks, block quotes and code blocks, spoilers under particles. Formatting is kept
+//! as tags over byte ranges (tdesktop's `TextWithTags`); block tags (quote, code
+//! block) always cover whole paragraphs. Shortcuts are tdesktop's
+//! (`InputField::MarkdownActions`), a second press on fully formatted text removes
+//! the format (`toggleSelectionMarkdown`).
 
+use std::cell::RefCell;
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui::{
     App, AvailableSpace, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Size, Style, TextAlign, TextRun,
-    UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, linear_color_stop,
-    linear_gradient, point, prelude::*, px, relative, rgba, size,
+    GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, Style, UTF16Selection, Window,
+    actions, div, fill, linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgba,
+    size,
 };
-use tdr_theme::Palette;
+use tdr_theme::{Color, Palette};
 use unicode_segmentation::*;
+
+use crate::rich_text::{
+    Kind, Layout as RichLayout, Measured, RichText, TextColors, TextEntity, TextState,
+};
 
 actions!(
     text_input,
@@ -35,14 +48,66 @@ actions!(
         SelectAll,
         Home,
         End,
+        SelectHome,
+        SelectEnd,
+        DocStart,
+        DocEnd,
+        SelectDocStart,
+        SelectDocEnd,
+        WordLeft,
+        WordRight,
+        SelectWordLeft,
+        SelectWordRight,
+        DeleteWordLeft,
+        DeleteWordRight,
         ShowCharacterPalette,
         Paste,
         Cut,
         Copy,
         Enter,
         Newline,
+        Undo,
+        Redo,
+        FormatBold,
+        FormatItalic,
+        FormatUnderline,
+        FormatStrike,
+        FormatBlockquote,
+        FormatMono,
+        FormatSpoiler,
+        FormatClear,
+        FormatLink,
+        FormatDate,
     ]
 );
+
+/// A format of the field's text (tdesktop's tags: `**`, `__`, `^^`, `~~`, `` ` ``,
+/// ` ``` `, `>`, `||`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Tag {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    /// One-line code; on whole lines it becomes a code block.
+    Code,
+    Pre,
+    Blockquote,
+    Spoiler,
+}
+
+impl Tag {
+    /// Covers whole paragraphs.
+    pub fn block(self) -> bool {
+        matches!(self, Tag::Pre | Tag::Blockquote)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TagSpan {
+    pub range: Range<usize>,
+    pub tag: Tag,
+}
 
 /// Half of the caret's blink period: Windows' `GetCaretBlinkTime` (Qt's
 /// `cursorFlashTime` is twice it); `None` when blinking is off.
@@ -59,8 +124,14 @@ fn caret_blink_time() -> Option<std::time::Duration> {
     }
 }
 
-/// Emitted on Enter with the text; the field is cleared.
-pub struct Submit(pub String);
+/// Emitted on Enter with the (trimmed) text and its formatting; the field is cleared.
+pub struct Submit {
+    pub text: String,
+    pub tags: Vec<TagSpan>,
+}
+
+/// The right button in the field: its menu at this window point.
+pub struct FieldMenu(pub Point<Pixels>);
 
 const CONTEXT: &str = "TextInput";
 /// chat_helpers.style: historyComposeFieldMaxHeight. Not a whole number of lines:
@@ -68,6 +139,8 @@ const CONTEXT: &str = "TextInput";
 const MAX_HEIGHT: f32 = 224.;
 /// historyComposeFieldFadeHeight: the fades over a scrolled field's edges.
 const FADE_HEIGHT: f32 = 6.;
+/// At most this many undo steps.
+const UNDO_LIMIT: usize = 200;
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -87,31 +160,78 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-x", Cut, Some(CONTEXT)),
         KeyBinding::new("home", Home, Some(CONTEXT)),
         KeyBinding::new("end", End, Some(CONTEXT)),
+        // Qt's standard keys of a text edit (`QKeySequence` on Windows).
+        KeyBinding::new("shift-home", SelectHome, Some(CONTEXT)),
+        KeyBinding::new("shift-end", SelectEnd, Some(CONTEXT)),
+        KeyBinding::new("secondary-home", DocStart, Some(CONTEXT)),
+        KeyBinding::new("secondary-end", DocEnd, Some(CONTEXT)),
+        KeyBinding::new("secondary-shift-home", SelectDocStart, Some(CONTEXT)),
+        KeyBinding::new("secondary-shift-end", SelectDocEnd, Some(CONTEXT)),
+        KeyBinding::new("secondary-left", WordLeft, Some(CONTEXT)),
+        KeyBinding::new("secondary-right", WordRight, Some(CONTEXT)),
+        KeyBinding::new("secondary-shift-left", SelectWordLeft, Some(CONTEXT)),
+        KeyBinding::new("secondary-shift-right", SelectWordRight, Some(CONTEXT)),
+        KeyBinding::new("secondary-backspace", DeleteWordLeft, Some(CONTEXT)),
+        KeyBinding::new("secondary-delete", DeleteWordRight, Some(CONTEXT)),
+        KeyBinding::new("shift-backspace", Backspace, Some(CONTEXT)),
+        KeyBinding::new("shift-insert", Paste, Some(CONTEXT)),
+        KeyBinding::new("secondary-insert", Copy, Some(CONTEXT)),
+        KeyBinding::new("shift-delete", Cut, Some(CONTEXT)),
         KeyBinding::new("enter", Enter, Some(CONTEXT)),
         KeyBinding::new("shift-enter", Newline, Some(CONTEXT)),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some(CONTEXT)),
+        KeyBinding::new("secondary-z", Undo, Some(CONTEXT)),
+        KeyBinding::new("secondary-y", Redo, Some(CONTEXT)),
+        KeyBinding::new("secondary-shift-z", Redo, Some(CONTEXT)),
+        // `InputField::MarkdownActions`.
+        KeyBinding::new("secondary-b", FormatBold, Some(CONTEXT)),
+        KeyBinding::new("secondary-i", FormatItalic, Some(CONTEXT)),
+        KeyBinding::new("secondary-u", FormatUnderline, Some(CONTEXT)),
+        KeyBinding::new("secondary-shift-x", FormatStrike, Some(CONTEXT)),
+        KeyBinding::new("secondary-shift-.", FormatBlockquote, Some(CONTEXT)),
+        KeyBinding::new("secondary-shift->", FormatBlockquote, Some(CONTEXT)),
+        KeyBinding::new("secondary->", FormatBlockquote, Some(CONTEXT)),
+        KeyBinding::new("secondary-shift-m", FormatMono, Some(CONTEXT)),
+        KeyBinding::new("secondary-shift-p", FormatSpoiler, Some(CONTEXT)),
+        KeyBinding::new("secondary-shift-n", FormatClear, Some(CONTEXT)),
+        KeyBinding::new("secondary-k", FormatLink, Some(CONTEXT)),
+        KeyBinding::new("secondary-shift-d", FormatDate, Some(CONTEXT)),
     ]);
 }
 
-/// The last layout: one wrapped line per paragraph (text between `\n`).
-#[derive(Default)]
-struct Layout {
-    lines: Vec<WrappedLine>,
-    /// Byte offset of each paragraph in the content.
-    starts: Vec<usize>,
-    /// Top of each paragraph, relative to the text's top (before scrolling).
-    tops: Vec<Pixels>,
-    bounds: Option<Bounds<Pixels>>,
+/// One undo step: the text, its formatting and the selection.
+#[derive(Clone)]
+struct Snapshot {
+    content: SharedString,
+    tags: Vec<TagSpan>,
+    selected: Range<usize>,
+    reversed: bool,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditKind {
+    /// Letters typed one after another: one undo step until a space, Enter,
+    /// a deletion or a move (Qt's edit blocks).
+    Typing,
+    Other,
+}
+
+/// The measured text, kept while the text, formatting, composition and scale stay.
+type MeasureKey = (SharedString, Vec<TagSpan>, Option<Range<usize>>, bool, u32);
+type MeasureCache = Rc<RefCell<Option<(MeasureKey, Rc<Measured>)>>>;
 
 pub struct TextInput {
     focus_handle: FocusHandle,
     content: SharedString,
+    tags: Vec<TagSpan>,
     placeholder: SharedString,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
-    layout: Layout,
+    /// The last layout and where it was painted.
+    layout: Option<Rc<RichLayout>>,
+    bounds: Option<Bounds<Pixels>>,
+    measured: MeasureCache,
     /// Scrolled-out height when the text is taller than the maximum.
     scroll_y: Pixels,
     is_selecting: bool,
@@ -120,14 +240,127 @@ pub struct TextInput {
     blink_since: std::time::Instant,
     blink_state: (SharedString, Range<usize>, bool),
     palette: &'static Palette,
+    /// The block quote's color (`coloredQuoteCache` of your own color).
+    quote_color: Color,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    last_edit: Option<EditKind>,
 }
 
 impl EventEmitter<Submit> for TextInput {}
+impl EventEmitter<FieldMenu> for TextInput {}
 
 /// The line height of the field's font (`historyComposeField`: the 13 px font, Qt's
 /// rounded metrics at the current scale).
 pub fn line_height() -> Pixels {
     crate::scale::font(13.).line_height()
+}
+
+/// The paragraph around `range`: from after the previous line feed to the next one.
+fn paragraphs_around(text: &str, range: Range<usize>) -> Range<usize> {
+    let start = text[..range.start.min(text.len())]
+        .rfind('\n')
+        .map_or(0, |i| i + 1);
+    let end = text[range.end.min(text.len())..]
+        .find('\n')
+        .map_or(text.len(), |i| range.end + i);
+    start..end.max(start)
+}
+
+/// Ctrl+Left: the start of the word at or before `offset`, spaces skipped (Qt's
+/// `PreviousWord`; punctuation is a word of its own).
+fn previous_word(text: &str, offset: usize) -> usize {
+    text[..offset.min(text.len())]
+        .split_word_bound_indices()
+        .rev()
+        .find(|(_, w)| !w.chars().all(char::is_whitespace))
+        .map_or(0, |(i, _)| i)
+}
+
+/// Ctrl+Right: the start of the next word, after the spaces (Qt's `NextWord`).
+fn next_word(text: &str, offset: usize) -> usize {
+    let mut passed = false;
+    for (i, w) in text.split_word_bound_indices() {
+        if i + w.len() <= offset {
+            continue;
+        }
+        let blank = w.chars().all(char::is_whitespace);
+        if i >= offset && passed && !blank {
+            return i;
+        }
+        if i >= offset || !blank {
+            passed = true;
+        }
+    }
+    text.len()
+}
+
+/// Keeps tags inside the text and on character boundaries, block tags over whole
+/// paragraphs, and joins touching spans of one tag.
+fn normalize(text: &str, tags: &mut Vec<TagSpan>) {
+    let clamp = |mut i: usize| {
+        i = i.min(text.len());
+        while !text.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    for t in tags.iter_mut() {
+        t.range = clamp(t.range.start)..clamp(t.range.end).max(clamp(t.range.start));
+        if t.tag.block() {
+            // A part left over that ends with a line feed ends before it (it does not
+            // take the next paragraph); one that starts after a line feed likewise.
+            while t.range.end > t.range.start && text[..t.range.end].ends_with('\n') {
+                t.range.end -= 1;
+            }
+            while t.range.start < t.range.end && text[t.range.start..].starts_with('\n') {
+                t.range.start += 1;
+            }
+            if !t.range.is_empty() {
+                t.range = paragraphs_around(text, t.range.clone());
+            }
+        }
+    }
+    tags.retain(|t| !t.range.is_empty());
+    tags.sort_by_key(|t| (t.tag, t.range.start));
+    let mut merged: Vec<TagSpan> = Vec::with_capacity(tags.len());
+    for t in tags.drain(..) {
+        match merged.last_mut() {
+            Some(last) if last.tag == t.tag && t.range.start <= last.range.end => {
+                last.range.end = last.range.end.max(t.range.end);
+            }
+            _ => merged.push(t),
+        }
+    }
+    *tags = merged;
+}
+
+/// Tags after replacing `range` with `inserted` bytes: text typed inside a span, or
+/// right after its end, takes its format (Qt's char format of the previous char).
+fn shift_tags(tags: &mut [TagSpan], range: Range<usize>, inserted: usize) {
+    let removed = range.end - range.start;
+    let map = |x: usize| {
+        if x <= range.start {
+            x
+        } else if x >= range.end {
+            x - removed
+        } else {
+            range.start
+        }
+    };
+    let s = range.start;
+    for t in tags.iter_mut() {
+        let (mut a, mut b) = (map(t.range.start), map(t.range.end));
+        if inserted > 0 {
+            if a < s && s <= b {
+                b += inserted;
+            } else if a >= s {
+                a += inserted;
+                b += inserted;
+            }
+        }
+        t.range = a..b;
+    }
 }
 
 impl TextInput {
@@ -158,16 +391,23 @@ impl TextInput {
         Self {
             focus_handle: cx.focus_handle(),
             content: "".into(),
+            tags: Vec::new(),
             placeholder: placeholder.into(),
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
-            layout: Layout::default(),
+            layout: None,
+            bounds: None,
+            measured: Rc::default(),
             scroll_y: px(0.),
             is_selecting: false,
             blink_since: std::time::Instant::now(),
             blink_state: (SharedString::default(), 0..0, false),
             palette,
+            quote_color: palette.history_peer1_name_fg,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            last_edit: None,
         }
     }
 
@@ -186,28 +426,239 @@ impl TextInput {
         cx.notify();
     }
 
+    pub fn set_quote_color(&mut self, color: Color, cx: &mut Context<Self>) {
+        if self.quote_color != color {
+            self.quote_color = color;
+            cx.notify();
+        }
+    }
+
     pub fn text(&self) -> String {
         self.content.to_string()
     }
 
+    pub fn tags(&self) -> Vec<TagSpan> {
+        self.tags.clone()
+    }
+
     /// Replaces the text (e.g. with the draft of another chat), cursor at the end.
     pub fn set_text(&mut self, text: String, cx: &mut Context<Self>) {
+        self.set_text_with_tags(text, Vec::new(), cx);
+    }
+
+    pub fn set_text_with_tags(&mut self, text: String, tags: Vec<TagSpan>, cx: &mut Context<Self>) {
         let end = text.len();
         self.content = text.into();
+        self.tags = tags;
+        normalize(&self.content, &mut self.tags);
         self.selected_range = end..end;
         self.selection_reversed = false;
         self.marked_range = None;
         self.scroll_y = px(0.);
+        self.undo.clear();
+        self.redo.clear();
+        self.last_edit = None;
+        cx.notify();
+    }
+
+    // The field's menu asks these.
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    pub fn has_selection(&self) -> bool {
+        !self.selected_range.is_empty()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.content.is_empty()
+    }
+
+    /// The selection has formatting to clear.
+    pub fn selection_has_tags(&self) -> bool {
+        let r = self.selected_range.clone();
+        !r.is_empty()
+            && self
+                .tags
+                .iter()
+                .any(|t| t.range.start < r.end && r.start < t.range.end)
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            content: self.content.clone(),
+            tags: self.tags.clone(),
+            selected: self.selected_range.clone(),
+            reversed: self.selection_reversed,
+        }
+    }
+
+    fn restore(&mut self, s: Snapshot) {
+        self.content = s.content;
+        self.tags = s.tags;
+        self.selected_range = self.valid(s.selected);
+        self.selection_reversed = s.reversed;
+        self.marked_range = None;
+    }
+
+    /// Remembers the state before an edit (one step for a run of typed letters).
+    fn before_edit(&mut self, kind: EditKind) {
+        if kind == EditKind::Other || self.last_edit != Some(EditKind::Typing) {
+            self.undo.push(self.snapshot());
+            if self.undo.len() > UNDO_LIMIT {
+                self.undo.remove(0);
+            }
+        }
+        self.redo.clear();
+        self.last_edit = Some(kind);
+    }
+
+    pub fn undo(&mut self, cx: &mut Context<Self>) {
+        if let Some(s) = self.undo.pop() {
+            self.redo.push(self.snapshot());
+            self.restore(s);
+            self.last_edit = None;
+            cx.notify();
+        }
+    }
+
+    pub fn redo(&mut self, cx: &mut Context<Self>) {
+        if let Some(s) = self.redo.pop() {
+            self.undo.push(self.snapshot());
+            self.restore(s);
+            self.last_edit = None;
+            cx.notify();
+        }
+    }
+
+    /// Replaces `range` with `text`, moving the formatting along.
+    fn edit(&mut self, range: Range<usize>, text: &str, kind: EditKind) {
+        let range = self.valid(range);
+        if range.is_empty() && text.is_empty() {
+            return;
+        }
+        self.before_edit(kind);
+        self.content =
+            (self.content[0..range.start].to_owned() + text + &self.content[range.end..]).into();
+        shift_tags(&mut self.tags, range, text.len());
+        normalize(&self.content, &mut self.tags);
+    }
+
+    /// The selection for a format: without a line feed at either end.
+    fn format_range(&self) -> Range<usize> {
+        let mut r = self.valid(self.selected_range.clone());
+        if self.content[r.clone()].starts_with('\n') {
+            r.start += 1;
+        }
+        if r.end > r.start && self.content[r.clone()].ends_with('\n') {
+            r.end -= 1;
+        }
+        r
+    }
+
+    fn covered(&self, tag: Tag, r: &Range<usize>) -> bool {
+        let mut at = r.start;
+        let mut spans: Vec<&TagSpan> = self.tags.iter().filter(|t| t.tag == tag).collect();
+        spans.sort_by_key(|t| t.range.start);
+        for t in spans {
+            if t.range.start <= at && t.range.end > at {
+                at = t.range.end;
+            }
+        }
+        at >= r.end
+    }
+
+    fn remove_tag(&mut self, tag: Option<Tag>, r: &Range<usize>) {
+        let mut out = Vec::with_capacity(self.tags.len());
+        for t in self.tags.drain(..) {
+            let hit = tag.is_none_or(|tag| t.tag == tag)
+                && t.range.start < r.end
+                && r.start < t.range.end;
+            if !hit {
+                out.push(t);
+                continue;
+            }
+            if t.range.start < r.start {
+                out.push(TagSpan {
+                    range: t.range.start..r.start,
+                    tag: t.tag,
+                });
+            }
+            if r.end < t.range.end {
+                out.push(TagSpan {
+                    range: r.end..t.range.end,
+                    tag: t.tag,
+                });
+            }
+        }
+        self.tags = out;
+    }
+
+    /// `InputField::toggleSelectionMarkdown`: the format is removed where the whole
+    /// selection has it, added otherwise. Code over whole lines is a code block.
+    pub fn toggle(&mut self, tag: Tag, cx: &mut Context<Self>) {
+        let mut r = self.format_range();
+        if r.is_empty() {
+            return;
+        }
+        let whole_lines = (r.start == 0 || self.content[..r.start].ends_with('\n'))
+            && (r.end == self.content.len() || self.content[r.end..].starts_with('\n'));
+        let tag = if tag == Tag::Code && whole_lines {
+            Tag::Pre
+        } else {
+            tag
+        };
+        if tag.block() {
+            r = paragraphs_around(&self.content, r);
+        }
+        self.before_edit(EditKind::Other);
+        if self.covered(tag, &r) {
+            self.remove_tag(Some(tag), &r);
+        } else {
+            if tag.block() {
+                self.remove_tag(Some(Tag::Pre), &r);
+                self.remove_tag(Some(Tag::Blockquote), &r);
+            }
+            self.tags.push(TagSpan {
+                range: r.clone(),
+                tag,
+            });
+        }
+        normalize(&self.content, &mut self.tags);
+        cx.notify();
+    }
+
+    /// `clearSelectionMarkdown`.
+    pub fn clear_format(&mut self, cx: &mut Context<Self>) {
+        let r = self.format_range();
+        if r.is_empty() {
+            return;
+        }
+        self.before_edit(EditKind::Other);
+        self.remove_tag(None, &r);
+        normalize(&self.content, &mut self.tags);
         cx.notify();
     }
 
     fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
-        let text = self.content.trim().to_string();
-        if text.is_empty() {
+        let trimmed = self.content.trim();
+        if trimmed.is_empty() {
             return;
         }
+        let lead = self.content.len() - self.content.trim_start().len();
+        let text = trimmed.to_string();
+        let mut tags = self.tags.clone();
+        for t in &mut tags {
+            t.range = t.range.start.saturating_sub(lead).min(text.len())
+                ..t.range.end.saturating_sub(lead).min(text.len());
+        }
+        tags.retain(|t| !t.range.is_empty());
         self.set_text(String::new(), cx);
-        cx.emit(Submit(text));
+        cx.emit(Submit { text, tags });
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
@@ -263,25 +714,99 @@ impl TextInput {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_all_text(cx);
+    }
+
+    pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
         self.move_to(0, cx);
         self.select_to(self.content.len(), cx)
     }
 
     /// Home/End: start and end of the current visual line.
+    fn line_start(&self) -> usize {
+        self.point_for_index(self.cursor_offset())
+            .map(|p| self.index_for_point(point(-1., p.y + 1.)))
+            .unwrap_or(0)
+    }
+
+    fn line_end(&self) -> usize {
+        self.point_for_index(self.cursor_offset())
+            .map(|p| self.index_for_point(point(100_000., p.y + 1.)))
+            .unwrap_or(self.content.len())
+    }
+
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        let target = self
-            .point_for_index(self.cursor_offset())
-            .and_then(|p| self.index_for_point(point(px(0.), p.y)))
-            .unwrap_or(0);
-        self.move_to(target, cx);
+        self.move_to(self.line_start(), cx);
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        let target = self
-            .point_for_index(self.cursor_offset())
-            .and_then(|p| self.index_for_point(point(px(100_000.), p.y)))
-            .unwrap_or(self.content.len());
-        self.move_to(target, cx);
+        self.move_to(self.line_end(), cx);
+    }
+
+    fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.line_start(), cx);
+    }
+
+    fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.line_end(), cx);
+    }
+
+    fn doc_start(&mut self, _: &DocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+    }
+
+    fn doc_end(&mut self, _: &DocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(self.content.len(), cx);
+    }
+
+    fn select_doc_start(&mut self, _: &SelectDocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(0, cx);
+    }
+
+    fn select_doc_end(&mut self, _: &SelectDocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.content.len(), cx);
+    }
+
+    fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(previous_word(&self.content, self.cursor_offset()), cx);
+    }
+
+    fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(next_word(&self.content, self.cursor_offset()), cx);
+    }
+
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(previous_word(&self.content, self.cursor_offset()), cx);
+    }
+
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(next_word(&self.content, self.cursor_offset()), cx);
+    }
+
+    /// Ctrl+Backspace / Ctrl+Delete: to the word's start / the next word's start
+    /// (Qt's `DeleteStartOfWord` / `DeleteEndOfWord`); a selection is deleted.
+    fn delete_word_left(
+        &mut self,
+        _: &DeleteWordLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            self.select_to(previous_word(&self.content, self.cursor_offset()), cx)
+        }
+        self.replace_text_in_range(None, "", window, cx)
+    }
+
+    fn delete_word_right(
+        &mut self,
+        _: &DeleteWordRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            self.select_to(next_word(&self.content, self.cursor_offset()), cx)
+        }
+        self.replace_text_in_range(None, "", window, cx)
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
@@ -298,6 +823,73 @@ impl TextInput {
         self.replace_text_in_range(None, "", window, cx)
     }
 
+    /// The field's menu: "Delete" removes the selection.
+    pub fn delete_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.selected_range.is_empty() {
+            let r = self.selected_range.clone();
+            self.edit(r.clone(), "", EditKind::Other);
+            self.selected_range = r.start..r.start;
+            cx.notify();
+        }
+    }
+
+    /// A press at a window point: the caret (or selection) goes there. The whole
+    /// field area takes presses, not only its text lines.
+    pub fn press_at(
+        &mut self,
+        position: Point<Pixels>,
+        shift: bool,
+        click_count: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.is_selecting = true;
+        self.last_edit = None;
+        let index = self.index_for_mouse_position(position);
+        if shift {
+            self.select_to(index, cx);
+        } else if click_count == 2 {
+            // A word (Qt: double click).
+            let mut start = 0;
+            for (i, word) in self.content.split_word_bound_indices() {
+                if index < i + word.len() || i + word.len() == self.content.len() {
+                    start = i;
+                    let end = i + word.len();
+                    self.selected_range = start..end;
+                    self.selection_reversed = false;
+                    break;
+                }
+            }
+            let _ = start;
+            cx.notify();
+        } else if click_count >= 3 {
+            self.selected_range = paragraphs_around(&self.content, index..index);
+            self.selection_reversed = false;
+            cx.notify();
+        } else {
+            self.move_to(index, cx)
+        }
+    }
+
+    /// Ctrl+Shift+. by the physical key: with another layout (Russian: "ю") no
+    /// binding matches it, Qt's shortcuts still take it.
+    fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(windows)]
+        {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{
+                GetKeyState, VK_OEM_PERIOD, VK_SHIFT,
+            };
+            let m = &event.keystroke.modifiers;
+            // SAFETY: reads the thread's key state.
+            let down = |vk: u16| unsafe { GetKeyState(i32::from(vk)) } < 0;
+            if m.control && !m.alt && down(VK_SHIFT.0) && down(VK_OEM_PERIOD.0) {
+                self.toggle(Tag::Blockquote, cx);
+                cx.stop_propagation();
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = (event, cx);
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -305,23 +897,37 @@ impl TextInput {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
-        self.is_selecting = true;
-        let index = self.index_for_mouse_position(event.position);
-        if event.modifiers.shift {
-            self.select_to(index, cx);
-        } else {
-            self.move_to(index, cx)
-        }
+        cx.stop_propagation();
+        self.press_at(event.position, event.modifiers.shift, event.click_count, cx);
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, _: &mut Context<Self>) {
+    fn on_right_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle);
+        cx.stop_propagation();
+        // A press outside the selection moves the caret there first (Qt).
+        let index = self.index_for_mouse_position(event.position);
+        if !(self.selected_range.start <= index && index <= self.selected_range.end) {
+            self.move_to(index, cx);
+        }
+        cx.emit(FieldMenu(event.position));
+    }
+
+    /// The mouse button is up: a selection by the mouse ends.
+    pub fn release(&mut self) {
         self.is_selecting = false;
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+    fn drag_to(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.is_selecting || event.pressed_button != Some(MouseButton::Left) {
+            self.is_selecting = false;
+            return;
         }
+        self.select_to(self.index_for_mouse_position(event.position), cx);
     }
 
     fn show_character_palette(
@@ -335,7 +941,21 @@ impl TextInput {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.last_edit = None;
             self.replace_text_in_range(None, &text.replace("\r\n", "\n"), window, cx);
+            self.last_edit = None;
+        }
+    }
+
+    pub fn paste_text(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            let r = self.selected_range.clone();
+            let text = text.replace("\r\n", "\n");
+            self.edit(r.clone(), &text, EditKind::Other);
+            let end = r.start + text.len();
+            self.selected_range = end..end;
+            self.last_edit = None;
+            cx.notify();
         }
     }
 
@@ -344,6 +964,10 @@ impl TextInput {
         if self.selected_range.is_empty() {
             cx.propagate();
         }
+        self.copy_selection(cx);
+    }
+
+    pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.valid(self.selected_range.clone())].to_string(),
@@ -351,13 +975,23 @@ impl TextInput {
         }
     }
 
-    fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+    fn cut(&mut self, _: &Cut, _window: &mut Window, cx: &mut Context<Self>) {
+        self.cut_selection(cx);
+    }
+
+    pub fn cut_selection(&mut self, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.valid(self.selected_range.clone())].to_string(),
-            ));
-            self.replace_text_in_range(None, "", window, cx)
+            self.copy_selection(cx);
+            self.delete_selection(cx);
         }
+    }
+
+    fn undo_action(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        self.undo(cx);
+    }
+
+    fn redo_action(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        self.redo(cx);
     }
 
     /// Clamps a byte offset into the text, onto a character boundary. Offsets come from
@@ -379,6 +1013,7 @@ impl TextInput {
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         let offset = self.clamp(offset);
         self.selected_range = offset..offset;
+        self.last_edit = None;
         cx.notify()
     }
 
@@ -390,68 +1025,43 @@ impl TextInput {
         }
     }
 
-    /// Paragraph containing a byte offset (the end of a paragraph belongs to it).
-    fn paragraph_of(&self, offset: usize) -> Option<usize> {
-        if self.layout.starts.is_empty() {
-            return None;
-        }
-        Some(
-            self.layout
-                .starts
-                .iter()
-                .rposition(|&s| s <= offset)
-                .unwrap_or(0),
-        )
-    }
-
     /// Position of a byte offset relative to the text's top-left (unscrolled).
-    fn point_for_index(&self, offset: usize) -> Option<Point<Pixels>> {
-        let p = self.paragraph_of(offset)?;
-        let line = self.layout.lines.get(p)?;
-        let local = (offset - self.layout.starts[p]).min(line.len());
-        let pos = line.position_for_index(local, line_height())?;
-        Some(point(pos.x, pos.y + self.layout.tops[p]))
+    fn point_for_index(&self, offset: usize) -> Option<Point<f32>> {
+        let layout = self.layout.as_ref()?;
+        if self.content.is_empty() {
+            return Some(point(0., 0.));
+        }
+        Some(layout.point_for_index(offset))
     }
 
     /// Byte offset closest to a point relative to the text's top-left (unscrolled).
-    fn index_for_point(&self, at: Point<Pixels>) -> Option<usize> {
-        if self.layout.lines.is_empty() {
-            return None;
+    fn index_for_point(&self, at: Point<f32>) -> usize {
+        match &self.layout {
+            Some(layout) if !self.content.is_empty() => layout.hit(at).index,
+            _ => 0,
         }
-        let p = self
-            .layout
-            .tops
-            .iter()
-            .rposition(|&top| top <= at.y)
-            .unwrap_or(0);
-        let line = &self.layout.lines[p];
-        let local_y = (at.y - self.layout.tops[p]).max(px(0.));
-        let height = line.size(line_height()).height;
-        let local = point(at.x.max(px(0.)), local_y.min(height - px(1.)).max(px(0.)));
-        let index = match line.closest_index_for_position(local, line_height()) {
-            Ok(i) | Err(i) => i,
-        };
-        Some(self.layout.starts[p] + index.min(line.len()))
     }
 
     fn vertical_target(&self, offset: usize, direction: f32) -> Option<usize> {
         if self.content.is_empty() {
             return None;
         }
+        let lh = f32::from(line_height());
         let pos = self.point_for_index(offset)?;
-        let y = pos.y + line_height() * direction + line_height() / 2.;
-        let total = self.total_height();
-        if y < px(0.) || y >= total {
+        let y = pos.y + lh * direction + lh / 2.;
+        if y < 0. || y >= f32::from(self.total_height()) {
             return None;
         }
-        self.index_for_point(point(pos.x, y))
-            .map(|i| i.min(self.content.len()))
+        Some(
+            self.index_for_point(point(pos.x, y))
+                .min(self.content.len()),
+        )
     }
 
     fn total_height(&self) -> Pixels {
-        match (self.layout.tops.last(), self.layout.lines.last()) {
-            (Some(&top), Some(line)) => top + line.size(line_height()).height,
-            _ => line_height(),
+        match &self.layout {
+            Some(l) => px(l.height).max(line_height()),
+            None => line_height(),
         }
     }
 
@@ -460,16 +1070,14 @@ impl TextInput {
         if self.content.is_empty() {
             return 0;
         }
-        let Some(bounds) = self.layout.bounds else {
+        let Some(bounds) = self.bounds else {
             return 0;
         };
         let local = point(
-            position.x - bounds.left(),
-            position.y - bounds.top() + self.scroll_y,
+            f32::from(position.x - bounds.left()),
+            f32::from(position.y - bounds.top() + self.scroll_y),
         );
-        self.index_for_point(local)
-            .unwrap_or(0)
-            .min(self.content.len())
+        self.index_for_point(local).min(self.content.len())
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -484,6 +1092,7 @@ impl TextInput {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.last_edit = None;
         cx.notify()
     }
 
@@ -535,6 +1144,92 @@ impl TextInput {
             .find_map(|(idx, _)| (idx > offset).then_some(idx))
             .unwrap_or(self.content.len())
     }
+
+    /// The text as `rich_text` lays it out: the tags as entities, the composition
+    /// underlined; the placeholder when empty.
+    fn display(&self) -> (SharedString, Vec<TextEntity>, bool) {
+        if self.content.is_empty() {
+            return (self.placeholder.clone(), Vec::new(), true);
+        }
+        let mut entities: Vec<TextEntity> = self
+            .tags
+            .iter()
+            .map(|t| TextEntity {
+                range: t.range.clone(),
+                kind: match t.tag {
+                    Tag::Bold => Kind::Bold,
+                    Tag::Italic => Kind::Italic,
+                    Tag::Underline => Kind::Underline,
+                    Tag::Strike => Kind::Strike,
+                    Tag::Code => Kind::Code,
+                    Tag::Pre => Kind::Pre(String::new()),
+                    Tag::Blockquote => Kind::Blockquote,
+                    Tag::Spoiler => Kind::Spoiler,
+                },
+            })
+            .collect();
+        if let Some(m) = &self.marked_range {
+            entities.push(TextEntity {
+                range: m.clone(),
+                kind: Kind::Underline,
+            });
+        }
+        (self.content.clone(), entities, false)
+    }
+
+    fn colors(&self, placeholder: bool) -> TextColors {
+        let p = self.palette;
+        let fg = if placeholder {
+            p.placeholder_fg
+        } else {
+            p.history_compose_area_fg
+        };
+        // Qt's selection under the field's text: the accent at a quarter.
+        let select_bg = Color((p.window_bg_active.rgba() & 0xffff_ff00) | 0x40);
+        TextColors {
+            fg,
+            link: p.window_active_text_fg,
+            mono: p.msg_in_mono_fg,
+            select_bg,
+            select_fg: fg,
+            select_link: p.window_active_text_fg,
+            select_mono: p.msg_in_mono_fg,
+            spoiler: p.msg_in_date_fg,
+            select_spoiler: p.msg_in_date_fg_selected,
+            quote: self.quote_color,
+            dark: std::ptr::eq(p, tdr_theme::palette(true)),
+            syntax: [fg; 8],
+            copy_hint: false,
+        }
+    }
+}
+
+/// Measures (or reuses) the field's text.
+fn measured(
+    cache: &MeasureCache,
+    text: SharedString,
+    entities: &[TextEntity],
+    key_tags: Vec<TagSpan>,
+    marked: Option<Range<usize>>,
+    placeholder: bool,
+    window: &Window,
+) -> Rc<Measured> {
+    let key: MeasureKey = (
+        text.clone(),
+        key_tags,
+        marked,
+        placeholder,
+        window.scale_factor().to_bits(),
+    );
+    if let Some((k, m)) = cache.borrow().as_ref()
+        && *k == key
+    {
+        return m.clone();
+    }
+    let rich = Rc::new(crate::rich_text::prepare(&text, entities));
+    let m = Rc::new(Measured::new(rich, window));
+    *cache.borrow_mut() = Some((key, m.clone()));
+    m
 }
 
 impl EntityInputHandler for TextInput {
@@ -589,9 +1284,20 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
         let range = self.valid(range);
-        self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
-                .into();
+        // A letter typed after letters joins their undo step; a space, a line feed,
+        // a deletion or a paste is a step of its own.
+        let typing = range.is_empty()
+            && new_text.graphemes(true).count() == 1
+            && !new_text.chars().any(char::is_whitespace);
+        self.edit(
+            range.clone(),
+            new_text,
+            if typing {
+                EditKind::Typing
+            } else {
+                EditKind::Other
+            },
+        );
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
         cx.notify();
@@ -611,9 +1317,7 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
         let range = self.valid(range);
-        self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
-                .into();
+        self.edit(range.clone(), new_text, EditKind::Typing);
         self.marked_range = if new_text.is_empty() {
             None
         } else {
@@ -649,8 +1353,8 @@ impl EntityInputHandler for TextInput {
         let range = self.range_from_utf16(&range_utf16);
         let start = self.point_for_index(range.start)?;
         let origin = point(
-            bounds.left() + start.x,
-            bounds.top() + start.y - self.scroll_y,
+            bounds.left() + px(start.x),
+            bounds.top() + px(start.y) - self.scroll_y,
         );
         Some(Bounds::new(origin, size(px(2.), line_height())))
     }
@@ -661,26 +1365,13 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        let bounds = self.layout.bounds?;
-        let local = point(
-            point_in_window.x - bounds.left(),
-            point_in_window.y - bounds.top() + self.scroll_y,
-        );
-        let index = self.index_for_point(local)?;
+        let index = self.index_for_mouse_position(point_in_window);
         Some(self.offset_to_utf16(index))
     }
 }
 
 struct TextElement {
     input: Entity<TextInput>,
-}
-
-struct PrepaintState {
-    lines: Vec<WrappedLine>,
-    tops: Vec<Pixels>,
-    starts: Vec<usize>,
-    cursor: Option<PaintQuad>,
-    selections: Vec<PaintQuad>,
 }
 
 impl IntoElement for TextElement {
@@ -691,100 +1382,9 @@ impl IntoElement for TextElement {
     }
 }
 
-/// Text runs for `text`, with the IME composition underlined.
-fn runs_for(text: &str, marked: Option<&Range<usize>>, run: TextRun) -> Vec<TextRun> {
-    match marked {
-        Some(m) if m.end <= text.len() => vec![
-            TextRun {
-                len: m.start,
-                ..run.clone()
-            },
-            TextRun {
-                len: m.end - m.start,
-                underline: Some(UnderlineStyle {
-                    color: Some(run.color),
-                    thickness: px(1.0),
-                    wavy: false,
-                }),
-                ..run.clone()
-            },
-            TextRun {
-                len: text.len() - m.end,
-                ..run
-            },
-        ]
-        .into_iter()
-        .filter(|r| r.len > 0)
-        .collect(),
-        _ => vec![TextRun {
-            len: text.len(),
-            ..run
-        }],
-    }
-}
-
-/// Shapes `text` paragraph by paragraph (each `\n` starts a new one).
-fn shape(
-    window: &Window,
-    text: &str,
-    runs: &[TextRun],
-    font_size: Pixels,
-    width: Pixels,
-) -> (Vec<WrappedLine>, Vec<usize>, Vec<Pixels>) {
-    let mut lines = Vec::new();
-    let mut starts = Vec::new();
-    let mut tops = Vec::new();
-    let mut top = px(0.);
-    let mut start = 0;
-    for paragraph in text.split('\n') {
-        let end = start + paragraph.len();
-        // Slice the runs to this paragraph.
-        let mut para_runs = Vec::new();
-        let mut run_start = 0;
-        for r in runs {
-            let run_end = run_start + r.len;
-            let s = run_start.max(start);
-            let e = run_end.min(end);
-            if s < e {
-                para_runs.push(TextRun {
-                    len: e - s,
-                    ..r.clone()
-                });
-            }
-            run_start = run_end;
-        }
-        if para_runs.is_empty()
-            && let Some(first) = runs.first()
-        {
-            para_runs.push(TextRun {
-                len: 0,
-                ..first.clone()
-            });
-        }
-        let shaped = window
-            .text_system()
-            .shape_text(
-                SharedString::from(paragraph.to_string()),
-                font_size,
-                &para_runs,
-                Some(width),
-                None,
-            )
-            .ok()
-            .and_then(|mut v| v.pop())
-            .unwrap_or_default();
-        starts.push(start);
-        tops.push(top);
-        top += shaped.size(line_height()).height.max(line_height());
-        lines.push(shaped);
-        start = end + 1;
-    }
-    (lines, starts, tops)
-}
-
 impl Element for TextElement {
     type RequestLayoutState = ();
-    type PrepaintState = PrepaintState;
+    type PrepaintState = Option<Rc<RichLayout>>;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -802,21 +1402,10 @@ impl Element for TextElement {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let input = self.input.read(cx);
-        let text = if input.content.is_empty() {
-            input.placeholder.to_string()
-        } else {
-            input.content.to_string()
-        };
-        let style = window.text_style();
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let run = TextRun {
-            len: 0,
-            font: style.font(),
-            color: style.color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
+        let (text, entities, placeholder) = input.display();
+        let tags = input.tags.clone();
+        let marked = input.marked_range.clone();
+        let cache = input.measured.clone();
         let mut layout_style = Style::default();
         layout_style.size.width = relative(1.).into();
         let id =
@@ -825,18 +1414,21 @@ impl Element for TextElement {
                     AvailableSpace::Definite(w) => w,
                     _ => px(10_000.),
                 });
-                let runs = vec![TextRun {
-                    len: text.len(),
-                    ..run.clone()
-                }];
-                let (lines, _, tops) = shape(window, &text, &runs, font_size, width);
-                let total = match (tops.last(), lines.last()) {
-                    (Some(&t), Some(l)) => t + l.size(line_height()).height.max(line_height()),
-                    _ => line_height(),
-                };
+                let m = measured(
+                    &cache,
+                    text.clone(),
+                    &entities,
+                    tags.clone(),
+                    marked.clone(),
+                    placeholder,
+                    window,
+                );
+                let layout = m.layout(f32::from(width), (0., 0.));
                 Size {
                     width,
-                    height: total.clamp(line_height(), crate::scale::px(MAX_HEIGHT)),
+                    height: px(layout.height)
+                        .max(line_height())
+                        .min(crate::scale::px(MAX_HEIGHT)),
                 }
             });
         (id, ())
@@ -861,104 +1453,41 @@ impl Element for TextElement {
             }
         });
         let input = self.input.read(cx);
-        let caret_on = input.caret_on();
-        let content = input.content.clone();
-        let palette = input.palette;
-        let style = window.text_style();
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let (display_text, color) = if content.is_empty() {
-            (
-                input.placeholder.clone(),
-                rgba(palette.placeholder_fg.rgba()).into(),
-            )
-        } else {
-            (content.clone(), style.color)
-        };
-        let base = TextRun {
-            len: 0,
-            font: style.font(),
-            color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let marked = if content.is_empty() {
-            None
-        } else {
-            input.marked_range.as_ref()
-        };
-        let runs = runs_for(&display_text, marked, base);
-        let (lines, starts, tops) =
-            shape(window, &display_text, &runs, font_size, bounds.size.width);
-
-        // Place the cursor and selection with the new layout, and scroll to the cursor.
-        let selected = input.selected_range.clone();
-        let cursor_offset = input.cursor_offset();
+        let (text, entities, placeholder) = input.display();
+        let m = measured(
+            &input.measured,
+            text,
+            &entities,
+            input.tags.clone(),
+            input.marked_range.clone(),
+            placeholder,
+            window,
+        );
+        let layout = Rc::new(m.layout(f32::from(bounds.size.width), (0., 0.)));
         let lh = line_height();
-        let pos = |offset: usize| -> Point<Pixels> {
-            let p = starts.iter().rposition(|&s| s <= offset).unwrap_or(0);
-            let line = &lines[p];
-            let local = (offset - starts[p]).min(line.len());
-            let at = line.position_for_index(local, lh).unwrap_or_default();
-            point(at.x, at.y + tops[p])
-        };
-        let cursor_pos = if content.is_empty() {
-            point(px(0.), px(0.))
+        let cursor = if input.content.is_empty() {
+            point(0., 0.)
         } else {
-            pos(cursor_offset)
+            layout.point_for_index(input.cursor_offset())
         };
+        // Scroll to the caret.
         let mut scroll_y = input.scroll_y;
         let visible = bounds.size.height;
-        if cursor_pos.y < scroll_y {
-            scroll_y = cursor_pos.y;
-        } else if cursor_pos.y + lh > scroll_y + visible {
-            scroll_y = cursor_pos.y + lh - visible;
+        let cy = px(cursor.y);
+        if cy < scroll_y {
+            scroll_y = cy;
+        } else if cy + lh > scroll_y + visible {
+            scroll_y = cy + lh - visible;
         }
-        let total = match (tops.last(), lines.last()) {
-            (Some(&t), Some(l)) => t + l.size(lh).height.max(lh),
-            _ => lh,
-        };
+        let total = px(layout.height).max(lh);
         scroll_y = scroll_y.min((total - visible).max(px(0.))).max(px(0.));
-        let origin = point(bounds.left(), bounds.top() - scroll_y);
-
-        // Qt's default caret: one device pixel wide.
-        let cursor = (selected.is_empty() && caret_on).then(|| {
-            fill(
-                Bounds::new(
-                    point(origin.x + cursor_pos.x, origin.y + cursor_pos.y),
-                    size(px(1. / window.scale_factor()), lh),
-                ),
-                rgba(palette.active_line_fg.rgba()),
-            )
+        let layout_for_input = layout.clone();
+        self.input.update(cx, |input, _| {
+            input.scroll_y = scroll_y;
+            input.layout = Some(layout_for_input);
+            input.bounds = Some(bounds);
         });
-        let mut selections = Vec::new();
-        if !selected.is_empty() && !content.is_empty() {
-            let color = rgba((palette.window_bg_active.rgba() & 0xffffff00) | 0x40);
-            let (a, b) = (pos(selected.start), pos(selected.end));
-            let mut y = a.y;
-            while y <= b.y {
-                let x0 = if y == a.y { a.x } else { px(0.) };
-                let x1 = if y == b.y { b.x } else { bounds.size.width };
-                if x1 > x0 {
-                    selections.push(fill(
-                        Bounds::from_corners(
-                            point(origin.x + x0, origin.y + y),
-                            point(origin.x + x1, origin.y + y + lh),
-                        ),
-                        color,
-                    ));
-                }
-                y += lh;
-            }
-        }
-        self.input.update(cx, |input, _| input.scroll_y = scroll_y);
-        PrepaintState {
-            lines,
-            tops,
-            starts,
-            cursor,
-            selections,
-        }
+        Some(layout)
     }
 
     fn paint(
@@ -967,47 +1496,74 @@ impl Element for TextElement {
         _inspector_id: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        prepaint: &mut Self::PrepaintState,
+        layout: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let focus_handle = self.input.read(cx).focus_handle.clone();
-        let scroll_y = self.input.read(cx).scroll_y;
+        let Some(layout) = layout.take() else {
+            return;
+        };
+        let input = self.input.read(cx);
+        // A selection by the mouse follows it outside the field too (window-level
+        // listeners: an element's own move events stop at its edge).
+        if input.is_selecting {
+            let entity = self.input.clone();
+            window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                if phase == gpui::DispatchPhase::Bubble {
+                    entity.update(cx, |i, cx| i.drag_to(e, cx));
+                }
+            });
+            let entity = self.input.clone();
+            window.on_mouse_event(move |e: &MouseUpEvent, phase, _, cx| {
+                if phase == gpui::DispatchPhase::Bubble && e.button == MouseButton::Left {
+                    entity.update(cx, |i, _| i.release());
+                }
+            });
+        }
+        let focus_handle = input.focus_handle.clone();
+        let scroll_y = input.scroll_y;
+        let placeholder = input.content.is_empty();
+        let colors = input.colors(placeholder);
+        let selected = input.selected_range.clone();
+        let caret_on = input.caret_on();
+        let cursor = if placeholder {
+            point(0., 0.)
+        } else {
+            layout.point_for_index(input.cursor_offset())
+        };
+        let caret_color = input.palette.active_line_fg;
+        let bg = input.palette.history_compose_area_bg.rgba();
         window.handle_input(
             &focus_handle,
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
+        let origin = point(bounds.left(), bounds.top() - scroll_y);
+        let text_bounds = Bounds::new(origin, size(bounds.size.width, px(layout.height)));
+        let lh = line_height();
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            for quad in prepaint.selections.drain(..) {
-                window.paint_quad(quad);
-            }
-            for (line, top) in prepaint.lines.iter().zip(&prepaint.tops) {
-                let origin = point(bounds.left(), bounds.top() + *top - scroll_y);
-                let _ = line.paint(
-                    origin,
-                    line_height(),
-                    TextAlign::Left,
-                    Some(bounds),
-                    window,
-                    cx,
-                );
-            }
-            if focus_handle.is_focused(window)
-                && let Some(cursor) = prepaint.cursor.take()
-            {
-                window.paint_quad(cursor);
+            let state = TextState {
+                selection: (!placeholder && !selected.is_empty()).then_some(selected.clone()),
+                shown_spoilers: (!placeholder).then_some(selected.clone()),
+                ..Default::default()
+            };
+            RichText::paint_at(layout.clone(), colors, state, text_bounds, window, cx);
+            // Qt's default caret: one device pixel wide.
+            if focus_handle.is_focused(window) && selected.is_empty() && caret_on {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(origin.x + px(cursor.x), origin.y + px(cursor.y)),
+                        size(px(1. / window.scale_factor()), lh),
+                    ),
+                    rgba(caret_color.rgba()),
+                ));
             }
             // `InitMessageFieldFade`: the background fading to transparent at 90 %
             // over the top while the field is scrolled down, and over the bottom
             // while there is more text below.
-            let total = match (prepaint.tops.last(), prepaint.lines.last()) {
-                (Some(&t), Some(l)) => t + l.size(line_height()).height.max(line_height()),
-                _ => line_height(),
-            };
+            let total = px(layout.height).max(lh);
             let scroll_max = (total - bounds.size.height).max(px(0.));
             let descent = px(crate::scale::font(13.).descent);
-            let bg = self.input.read(cx).palette.history_compose_area_bg.rgba();
             let (solid, clear) = (rgba(bg), rgba(bg & 0xffff_ff00));
             let fade = crate::scale::px(FADE_HEIGHT);
             if scroll_y > px(0.) {
@@ -1033,17 +1589,6 @@ impl Element for TextElement {
                     ),
                 ));
             }
-        });
-        let lines = std::mem::take(&mut prepaint.lines);
-        let tops = std::mem::take(&mut prepaint.tops);
-        let starts = std::mem::take(&mut prepaint.starts);
-        self.input.update(cx, |input, _cx| {
-            input.layout = Layout {
-                lines,
-                starts,
-                tops,
-                bounds: Some(bounds),
-            };
         });
     }
 }
@@ -1076,10 +1621,38 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::newline))
+            .on_action(cx.listener(Self::undo_action))
+            .on_action(cx.listener(Self::select_home))
+            .on_action(cx.listener(Self::select_end))
+            .on_action(cx.listener(Self::doc_start))
+            .on_action(cx.listener(Self::doc_end))
+            .on_action(cx.listener(Self::select_doc_start))
+            .on_action(cx.listener(Self::select_doc_end))
+            .on_action(cx.listener(Self::word_left))
+            .on_action(cx.listener(Self::word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::delete_word_left))
+            .on_action(cx.listener(Self::delete_word_right))
+            .on_action(cx.listener(Self::redo_action))
+            .on_action(cx.listener(|this, _: &FormatBold, _, cx| this.toggle(Tag::Bold, cx)))
+            .on_action(cx.listener(|this, _: &FormatItalic, _, cx| this.toggle(Tag::Italic, cx)))
+            .on_action(
+                cx.listener(|this, _: &FormatUnderline, _, cx| this.toggle(Tag::Underline, cx)),
+            )
+            .on_action(cx.listener(|this, _: &FormatStrike, _, cx| this.toggle(Tag::Strike, cx)))
+            .on_action(
+                cx.listener(|this, _: &FormatBlockquote, _, cx| this.toggle(Tag::Blockquote, cx)),
+            )
+            .on_action(cx.listener(|this, _: &FormatMono, _, cx| this.toggle(Tag::Code, cx)))
+            .on_action(cx.listener(|this, _: &FormatSpoiler, _, cx| this.toggle(Tag::Spoiler, cx)))
+            .on_action(cx.listener(|this, _: &FormatClear, _, cx| this.clear_format(cx)))
+            // Links and dates need their boxes (tdesktop's edit link / date boxes).
+            .on_action(cx.listener(|_, _: &FormatLink, _, _| {}))
+            .on_action(cx.listener(|_, _: &FormatDate, _, _| {}))
+            .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
             .child(TextElement { input: cx.entity() })
     }
 }
@@ -1087,5 +1660,113 @@ impl Render for TextInput {
 impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+/// The field's tags as the API's entities, in UTF-16 offsets
+/// (`ConvertTextTagsToEntities`).
+pub fn out_entities(text: &str, tags: &[TagSpan]) -> Vec<tdr_data::OutEntity> {
+    use tdr_data::OutKind;
+    let utf16 = |byte: usize| -> i32 {
+        text[..byte.min(text.len())]
+            .chars()
+            .map(char::len_utf16)
+            .sum::<usize>() as i32
+    };
+    let mut out: Vec<tdr_data::OutEntity> = tags
+        .iter()
+        .filter(|t| !t.range.is_empty())
+        .map(|t| {
+            let offset = utf16(t.range.start);
+            tdr_data::OutEntity {
+                offset,
+                length: utf16(t.range.end) - offset,
+                kind: match t.tag {
+                    Tag::Bold => OutKind::Bold,
+                    Tag::Italic => OutKind::Italic,
+                    Tag::Underline => OutKind::Underline,
+                    Tag::Strike => OutKind::Strike,
+                    Tag::Code => OutKind::Code,
+                    Tag::Pre => OutKind::Pre(String::new()),
+                    Tag::Blockquote => OutKind::Blockquote,
+                    Tag::Spoiler => OutKind::Spoiler,
+                },
+            }
+        })
+        .collect();
+    out.sort_by_key(|e| (e.offset, -e.length));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span(range: Range<usize>, tag: Tag) -> TagSpan {
+        TagSpan { range, tag }
+    }
+
+    #[test]
+    fn typing_after_a_format_continues_it() {
+        let mut tags = vec![span(0..4, Tag::Bold)];
+        // "bold" + "er" typed at its end.
+        shift_tags(&mut tags, 4..4, 2);
+        assert_eq!(tags[0].range, 0..6);
+        // Before its start: it moves.
+        shift_tags(&mut tags, 0..0, 1);
+        assert_eq!(tags[0].range, 1..7);
+        // A deletion across its start cuts it.
+        shift_tags(&mut tags, 0..3, 0);
+        assert_eq!(tags[0].range, 0..4);
+    }
+
+    #[test]
+    fn entities_are_in_utf16() {
+        // Cyrillic is 2 bytes and 1 unit, the emoji 4 bytes and 2.
+        let text = "Привет \u{1F600} bold";
+        let start = text.find("bold").unwrap();
+        let out = out_entities(text, &[span(start..text.len(), Tag::Bold)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].offset, out[0].length), (10, 4));
+        assert_eq!(out[0].kind, tdr_data::OutKind::Bold);
+    }
+
+    #[test]
+    fn word_moves_like_qt() {
+        let text = "one two,  three\nfour";
+        assert_eq!(next_word(text, 0), 4);
+        assert_eq!(next_word(text, 1), 4);
+        assert_eq!(next_word(text, 4), 7);
+        assert_eq!(next_word(text, 7), 10);
+        assert_eq!(next_word(text, 10), 16);
+        assert_eq!(next_word(text, 16), text.len());
+        assert_eq!(previous_word(text, text.len()), 16);
+        assert_eq!(previous_word(text, 16), 10);
+        assert_eq!(previous_word(text, 12), 10);
+        assert_eq!(previous_word(text, 10), 7);
+        assert_eq!(previous_word(text, 4), 0);
+    }
+
+    #[test]
+    fn a_split_block_keeps_to_its_paragraphs() {
+        let text = "a quoted line\n\nlet x = 1;";
+        // The quote's part left after a code block took the last line.
+        let mut tags = vec![span(0..15, Tag::Blockquote), span(15..25, Tag::Pre)];
+        normalize(text, &mut tags);
+        assert!(tags.contains(&span(0..13, Tag::Blockquote)));
+        assert!(tags.contains(&span(15..25, Tag::Pre)));
+    }
+
+    #[test]
+    fn block_tags_cover_paragraphs() {
+        let text = "one\ntwo three\nfour";
+        let mut tags = vec![
+            span(6..9, Tag::Blockquote),
+            span(1..2, Tag::Bold),
+            span(2..3, Tag::Bold),
+        ];
+        normalize(text, &mut tags);
+        assert!(tags.contains(&span(4..13, Tag::Blockquote)));
+        assert!(tags.contains(&span(1..3, Tag::Bold)));
     }
 }

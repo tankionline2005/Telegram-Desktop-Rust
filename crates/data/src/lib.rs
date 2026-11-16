@@ -21,6 +21,57 @@ use tracing::{debug, info, warn};
 
 pub use tdr_storage;
 
+/// Formatting of a message being sent, in UTF-16 offsets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutEntity {
+    pub offset: i32,
+    pub length: i32,
+    pub kind: OutKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutKind {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    Code,
+    Pre(String),
+    Blockquote,
+    Spoiler,
+    TextUrl(String),
+}
+
+fn out_entity(e: &OutEntity) -> enums::MessageEntity {
+    let (offset, length) = (e.offset, e.length);
+    match &e.kind {
+        OutKind::Bold => types::MessageEntityBold { offset, length }.into(),
+        OutKind::Italic => types::MessageEntityItalic { offset, length }.into(),
+        OutKind::Underline => types::MessageEntityUnderline { offset, length }.into(),
+        OutKind::Strike => types::MessageEntityStrike { offset, length }.into(),
+        OutKind::Code => types::MessageEntityCode { offset, length }.into(),
+        OutKind::Pre(language) => types::MessageEntityPre {
+            offset,
+            length,
+            language: language.clone(),
+        }
+        .into(),
+        OutKind::Blockquote => types::MessageEntityBlockquote {
+            collapsed: false,
+            offset,
+            length,
+        }
+        .into(),
+        OutKind::Spoiler => types::MessageEntitySpoiler { offset, length }.into(),
+        OutKind::TextUrl(url) => types::MessageEntityTextUrl {
+            offset,
+            length,
+            url: url.clone(),
+        }
+        .into(),
+    }
+}
+
 /// A bank card's data (`payments.bankCardData`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BankCard {
@@ -893,7 +944,12 @@ impl Sync {
     }
 
     /// Sends a text message and records it in the cache.
-    pub async fn send_text(&mut self, peer: PeerKey, text: &str) -> Result<Applied> {
+    pub async fn send_text(
+        &mut self,
+        peer: PeerKey,
+        text: &str,
+        entities: &[OutEntity],
+    ) -> Result<Applied> {
         // Sent with `clear_draft`: the server drops the cloud draft, we drop ours.
         self.drafts.message_sent(peer);
         self.store.write(|w| w.set_draft(peer, None))?;
@@ -918,7 +974,7 @@ impl Sync {
                 message: text.to_string(),
                 random_id,
                 reply_markup: None,
-                entities: None,
+                entities: (!entities.is_empty()).then(|| entities.iter().map(out_entity).collect()),
                 schedule_date: None,
                 schedule_repeat_period: None,
                 send_as: None,
@@ -946,10 +1002,43 @@ impl Sync {
                 w.put_message(&row)?;
                 w.message_arrived(&row)
             })?;
+            // The short answer has no message object: a formatted one is fetched, so
+            // it shows its formatting (the row keeps the TL object).
+            let mut row = row;
+            if sent.entities.as_ref().is_some_and(|e| !e.is_empty())
+                && let Ok(Some(full)) = self.fetch_message(peer, sent.id).await
+            {
+                row = full;
+            }
             applied.new_messages.push(row);
             return Ok(applied);
         }
         self.feed(updates).await
+    }
+
+    /// One message of a private chat or a basic group (`messages.getMessages`),
+    /// stored in the cache.
+    async fn fetch_message(&mut self, peer: PeerKey, id: i32) -> Result<Option<MessageRow>> {
+        if peer.kind == PeerKind::Channel {
+            return Ok(None);
+        }
+        let answer = self
+            .client
+            .invoke(&functions::messages::GetMessages {
+                id: vec![enums::InputMessage::ID(types::InputMessageID { id })],
+            })
+            .await?;
+        let messages = match answer {
+            enums::messages::Messages::Messages(m) => m.messages,
+            enums::messages::Messages::Slice(m) => m.messages,
+            enums::messages::Messages::ChannelMessages(m) => m.messages,
+            enums::messages::Messages::NotModified(_) => Vec::new(),
+        };
+        let Some(row) = messages.iter().filter_map(convert::message_row).next() else {
+            return Ok(None);
+        };
+        self.store.write(|w| w.put_message(&row))?;
+        Ok(Some(row))
     }
 
     /// Commits `out`, then performs its actions (and the ones they lead to).

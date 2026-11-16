@@ -56,6 +56,8 @@ pub enum Icon {
     MenuEdited,
     MenuForwarded,
     MenuNotifications,
+    /// A submenu's arrow (`defaultMenuArrow`).
+    MenuSubmenuArrow,
 }
 
 macro_rules! icon_bytes {
@@ -103,6 +105,7 @@ impl Icon {
             Icon::MenuEdited => icon_bytes!("menu__edited_status"),
             Icon::MenuForwarded => icon_bytes!("menu__forwarded_status"),
             Icon::MenuNotifications => icon_bytes!("menu__info_notifications"),
+            Icon::MenuSubmenuArrow => icon_bytes!("menu__submenu_arrow"),
         }
     }
 }

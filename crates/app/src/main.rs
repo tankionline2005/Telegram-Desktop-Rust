@@ -304,6 +304,9 @@ fn main() {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(1200))
                     .await;
+                // The main window goes to the tray, as when the menu is used for real:
+                // whatever is behind the menu is then the desktop.
+                tray::Tray::hide_window();
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 std::mem::forget(rx);
                 let _ =

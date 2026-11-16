@@ -5,8 +5,8 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, Bounds, ClipboardItem, Context, IntoElement, ParentElement, Pixels, Point, Styled,
-    Window, div, point,
+    AnyElement, Bounds, ClipboardItem, Context, Focusable, IntoElement, ParentElement, Pixels,
+    Point, Styled, Window, div, point,
 };
 use tdr_data::tdr_storage::PeerKey;
 
@@ -83,6 +83,86 @@ impl MainView {
             tag,
             phone_author: None,
         });
+    }
+
+    /// The message field's menu: Qt's standard menu of a text edit with lib_ui's
+    /// "Formatting" submenu (`InputField::contextMenuEventInner`,
+    /// `addMarkdownActions`). No "Spelling" yet: there is no spell checker.
+    pub(super) fn open_field_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        use crate::text_input::Tag;
+        let can_paste = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .is_some_and(|t| !t.is_empty());
+        let input = self.input.read(cx);
+        let selected = input.has_selection();
+        let tagged = input.selection_has_tags();
+        let format = |label: &str, shortcut: &str, tag: Tag| {
+            Entry::item(
+                label,
+                Some(shortcut),
+                selected,
+                MenuAction::FieldFormat(tag),
+            )
+        };
+        let formatting = vec![
+            format("Bold", "Ctrl+B", Tag::Bold),
+            format("Italic", "Ctrl+I", Tag::Italic),
+            format("Underline", "Ctrl+U", Tag::Underline),
+            format("Strikethrough", "Ctrl+Shift+X", Tag::Strike),
+            format("Quote", "Ctrl+Shift+.", Tag::Blockquote),
+            format("Monospace", "Ctrl+Shift+M", Tag::Code),
+            format("Spoiler", "Ctrl+Shift+P", Tag::Spoiler),
+            Entry::Separator,
+            Entry::item("Create link", Some("Ctrl+K"), true, MenuAction::FieldLink),
+            Entry::item(
+                "Date",
+                Some("Ctrl+Shift+D"),
+                selected,
+                MenuAction::FieldDate,
+            ),
+            Entry::Separator,
+            Entry::item(
+                "Clear formatting",
+                Some("Ctrl+Shift+N"),
+                selected && tagged,
+                MenuAction::FieldClearFormat,
+            ),
+        ];
+        let entries = vec![
+            Entry::item(
+                "Undo",
+                Some("Ctrl+Z"),
+                input.can_undo(),
+                MenuAction::FieldUndo,
+            ),
+            Entry::item(
+                "Redo",
+                Some("Ctrl+Y"),
+                input.can_redo(),
+                MenuAction::FieldRedo,
+            ),
+            Entry::Separator,
+            Entry::item("Cut", Some("Ctrl+X"), selected, MenuAction::FieldCut),
+            Entry::item("Copy", Some("Ctrl+C"), selected, MenuAction::FieldCopy),
+            Entry::item("Paste", Some("Ctrl+V"), can_paste, MenuAction::FieldPaste),
+            Entry::item("Delete", None, selected, MenuAction::FieldDelete),
+            Entry::Separator,
+            Entry::submenu("Formatting", true, formatting),
+            Entry::Separator,
+            Entry::item(
+                "Select All",
+                Some("Ctrl+A"),
+                !input.is_empty(),
+                MenuAction::FieldSelectAll,
+            ),
+        ];
+        self.text_ui.menu = Some(OpenMenu {
+            menu: PopupMenu::new(entries, false, at),
+            tag: MenuTag::Other,
+            phone_author: None,
+        });
+        cx.notify();
     }
 
     /// The menu of a message (`HistoryInner::showContextMenu`): over its text `hit`
@@ -365,15 +445,37 @@ impl MainView {
         let Some(open) = &mut self.text_ui.menu else {
             return;
         };
-        let geometry = open.menu.geometry(Self::menu_area(window), window);
-        if let Some(action) = open.menu.handle(event, &geometry) {
+        if let Some(action) = open.menu.handle(event, Self::menu_area(window), window) {
             self.menu_action(action, window, cx);
         }
         cx.notify();
     }
 
-    fn menu_action(&mut self, action: MenuAction, _window: &mut Window, cx: &mut Context<Self>) {
+    fn menu_action(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.input.clone();
+        let field = |window: &mut Window, cx: &mut Context<Self>| {
+            window.focus(&input.focus_handle(cx));
+            input.clone()
+        };
         match action {
+            MenuAction::None => {}
+            MenuAction::FieldUndo => field(window, cx).update(cx, |i, cx| i.undo(cx)),
+            MenuAction::FieldRedo => field(window, cx).update(cx, |i, cx| i.redo(cx)),
+            MenuAction::FieldCut => field(window, cx).update(cx, |i, cx| i.cut_selection(cx)),
+            MenuAction::FieldCopy => field(window, cx).update(cx, |i, cx| i.copy_selection(cx)),
+            MenuAction::FieldPaste => field(window, cx).update(cx, |i, cx| i.paste_text(cx)),
+            MenuAction::FieldDelete => field(window, cx).update(cx, |i, cx| i.delete_selection(cx)),
+            MenuAction::FieldSelectAll => {
+                field(window, cx).update(cx, |i, cx| i.select_all_text(cx))
+            }
+            MenuAction::FieldFormat(tag) => field(window, cx).update(cx, |i, cx| i.toggle(tag, cx)),
+            MenuAction::FieldClearFormat => {
+                field(window, cx).update(cx, |i, cx| i.clear_format(cx))
+            }
+            // Links and dates in the field come later (their boxes).
+            MenuAction::FieldLink | MenuAction::FieldDate => {
+                field(window, cx);
+            }
             MenuAction::CopyText(peer, id) => {
                 let text = self.message_text((peer, id));
                 if let Some(text) = text {

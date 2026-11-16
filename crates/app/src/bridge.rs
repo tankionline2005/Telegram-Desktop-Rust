@@ -58,6 +58,7 @@ pub enum Command {
     Send {
         peer: PeerKey,
         text: String,
+        entities: Vec<tdr_data::OutEntity>,
     },
     /// The user saw the open chat's messages up to `max_id`: mark them read.
     Read {
@@ -1409,8 +1410,12 @@ async fn run(
                         };
                         let _ = tx.send(Update::BankCard { number, data });
                     }
-                    Command::Send { peer, text } => {
-                        match sync.send_text(peer, &text).await {
+                    Command::Send {
+                        peer,
+                        text,
+                        entities,
+                    } => {
+                        match sync.send_text(peer, &text, &entities).await {
                             Ok(_) => {
                                 send_dialogs(sync.store(), shown_dialogs, &tx)?;
                                 if open == Some(peer) {
@@ -1886,9 +1891,34 @@ pub fn start_demo() -> (
                     history.splice(0..0, page);
                 }
                 Command::LoadOlder(_) => {}
-                Command::Send { text, .. } => {
+                Command::Send { text, entities, .. } => {
                     next_id += 1;
                     let date = Local::now().timestamp() as i32;
+                    let entities: Vec<describe::Entity> = entities
+                        .iter()
+                        .map(|e| {
+                            use describe::EntityKind as E;
+                            use tdr_data::OutKind as O;
+                            describe::Entity {
+                                offset: e.offset,
+                                length: e.length,
+                                kind: match &e.kind {
+                                    O::Bold => E::Bold,
+                                    O::Italic => E::Italic,
+                                    O::Underline => E::Underline,
+                                    O::Strike => E::Strike,
+                                    O::Code => E::Code,
+                                    O::Pre(language) => E::Pre {
+                                        language: language.clone(),
+                                    },
+                                    O::Blockquote => E::Blockquote { collapsed: false },
+                                    O::Spoiler => E::Spoiler,
+                                    O::TextUrl(url) => E::TextUrl(url.clone()),
+                                },
+                            }
+                        })
+                        .collect();
+                    let (text, entities) = message_text(&text, &entities);
                     history.push(MessageItem {
                         id: next_id,
                         out: true,
@@ -1903,7 +1933,7 @@ pub fn start_demo() -> (
                         author: demo_author(true),
                         forwarded: None,
                         original: None,
-                        entities: Vec::new(),
+                        entities,
                         forward_date: None,
                         edit_date: None,
                     });

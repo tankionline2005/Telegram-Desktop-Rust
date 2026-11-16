@@ -367,6 +367,32 @@ impl Rich {
         self.quotes.get(quote).map(|q| q.code.as_str())
     }
 
+    /// Whether the spoiler at `index` (its run of spoiler characters) touches
+    /// `shown`.
+    fn spoiler_shown(&self, index: usize, shown: Option<&Range<usize>>) -> bool {
+        let Some(shown) = shown else {
+            return false;
+        };
+        let k = self.spans.partition_point(|s| s.range.end <= index);
+        let is_spoiler = |k: usize| self.spans.get(k).is_some_and(|s| s.flags & SPOILER != 0);
+        if !is_spoiler(k) {
+            return false;
+        }
+        let (mut first, mut last) = (k, k);
+        while first > 0
+            && is_spoiler(first - 1)
+            && self.spans[first - 1].range.end == self.spans[first].range.start
+        {
+            first -= 1;
+        }
+        while is_spoiler(last + 1) && self.spans[last].range.end == self.spans[last + 1].range.start
+        {
+            last += 1;
+        }
+        let (start, end) = (self.spans[first].range.start, self.spans[last].range.end);
+        shown.start <= end && start <= shown.end
+    }
+
     fn span_at(&self, index: usize) -> Option<&Span> {
         let k = self.spans.partition_point(|s| s.range.end <= index);
         self.spans.get(k).filter(|s| s.range.start <= index)
@@ -516,6 +542,28 @@ pub struct Measured {
     quote_min: Vec<f32>,
 }
 
+/// GPUI 0.2.2's `layout_line` keeps the font of the previous run while color,
+/// underline and strikethrough stay the same (it checks the font only when the
+/// decoration changes): a bold word after regular text of the same color would be
+/// shaped regular. A run whose font differs gets an unnoticeably different alpha.
+pub fn separate_fonts(runs: &mut [TextRun]) {
+    for k in 1..runs.len() {
+        let (before, after) = runs.split_at_mut(k);
+        let (prev, run) = (&before[k - 1], &mut after[0]);
+        if prev.font != run.font
+            && prev.color == run.color
+            && prev.underline == run.underline
+            && prev.strikethrough == run.strikethrough
+        {
+            run.color.a = if run.color.a > 0.5 {
+                run.color.a - 1. / 512.
+            } else {
+                run.color.a + 1. / 512.
+            };
+        }
+    }
+}
+
 fn runs_for(rich: &Rich, range: Range<usize>, mono: &SharedString) -> Vec<TextRun> {
     let mut runs = Vec::new();
     let mut k = rich.spans.partition_point(|s| s.range.end <= range.start);
@@ -536,6 +584,7 @@ fn runs_for(rich: &Rich, range: Range<usize>, mono: &SharedString) -> Vec<TextRu
         at = end;
         k += 1;
     }
+    separate_fonts(&mut runs);
     runs
 }
 
@@ -817,7 +866,11 @@ pub struct Layout {
 impl Layout {
     /// Hidden text: one rectangle per line and selection state, relative to the
     /// text's top left (`pushSpoilerRange`, `fillRectsFromRanges`).
-    pub fn spoiler_rects(&self, selection: Option<&Range<usize>>) -> Vec<(Bounds<Pixels>, bool)> {
+    pub fn spoiler_rects(
+        &self,
+        selection: Option<&Range<usize>>,
+        shown: Option<&Range<usize>>,
+    ) -> Vec<(Bounds<Pixels>, bool)> {
         let rich = self.rich();
         let mut out: Vec<(Bounds<Pixels>, bool)> = Vec::new();
         for line in &self.lines {
@@ -840,7 +893,10 @@ impl Layout {
             cuts.dedup();
             for w in cuts.windows(2) {
                 let (a, b) = (w[0], w[1]);
-                if a >= b || rich.span_at(a).is_none_or(|s| s.flags & SPOILER == 0) {
+                if a >= b
+                    || rich.span_at(a).is_none_or(|s| s.flags & SPOILER == 0)
+                    || rich.spoiler_shown(a, shown)
+                {
                     continue;
                 }
                 let selected = selection.is_some_and(|s| s.start <= a && b <= s.end);
@@ -922,6 +978,33 @@ impl Layout {
             b.bounds.origin,
             size(b.bounds.size.width, px(scale::lg(PRE_HEADER))),
         ))
+    }
+
+    /// Where the caret goes before `index`, relative to the text's top left: on the
+    /// line that holds it (at a wrap, the start of the next line).
+    pub fn point_for_index(&self, index: usize) -> Point<f32> {
+        let rich = self.rich();
+        let mut found = None;
+        for line in &self.lines {
+            let pstart = rich.paragraphs[line.paragraph].range.start;
+            let pend = rich.paragraphs[line.paragraph].range.end;
+            if line.range.start <= index && pstart <= index && index <= pend {
+                found = Some(line);
+            }
+        }
+        match found {
+            Some(line) => {
+                let pstart = rich.paragraphs[line.paragraph].range.start;
+                let pend = rich.paragraphs[line.paragraph].range.end;
+                let shaped = &self.measured.paragraphs[line.paragraph];
+                let i = index.min(pend);
+                point(
+                    line.x + shaped.x(i - pstart) - shaped.x(line.range.start - pstart),
+                    line.y,
+                )
+            }
+            None => point(0., 0.),
+        }
     }
 
     pub fn rich(&self) -> &Rich {
@@ -1019,6 +1102,8 @@ pub struct TextColors {
     pub dark: bool,
     /// `SyntaxHighlightColors`: the eight code colors.
     pub syntax: [Color; 8],
+    /// Code blocks say "click to copy" (messages; not the message field).
+    pub copy_hint: bool,
 }
 
 fn hsla(color: Color) -> Hsla {
@@ -1044,6 +1129,9 @@ pub struct TextState {
     pub code_highlight: Option<(Bounds<Pixels>, f32)>,
     /// The press reaction on a link, code or a code block's header.
     pub ripple: Option<PressRipple>,
+    /// The message field: spoilers touching the caret or the selection are shown
+    /// (`refreshSpoilerShown`).
+    pub shown_spoilers: Option<Range<usize>>,
 }
 
 /// `Message::_linkRipple`: a ripple from the press point, inside the pressed link's
@@ -1110,6 +1198,45 @@ pub struct RichText {
 }
 
 impl RichText {
+    /// Paints a layout with no mouse handling (the message field's text).
+    pub fn paint_at(
+        layout: Rc<Layout>,
+        colors: TextColors,
+        state: TextState,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let text = Self {
+            id: ElementId::Name("field-text".into()),
+            layout: layout.clone(),
+            colors,
+            state,
+            dragging: false,
+            handler: Rc::new(|_, _, _| {}),
+        };
+        text.paint_quotes(bounds, window, cx);
+        text.paint_lines(bounds, window, cx);
+        // Spoilers stay hidden in the field, under their particles.
+        let rects = layout.spoiler_rects(
+            text.state.selection.as_ref(),
+            text.state.shown_spoilers.as_ref(),
+        );
+        if !rects.is_empty() {
+            let frame = crate::spoiler::current_frame();
+            for (r, selected) in rects {
+                let rect = Bounds::new(bounds.origin + r.origin, r.size);
+                let color = if selected {
+                    colors.select_spoiler
+                } else {
+                    colors.spoiler
+                };
+                crate::spoiler::fill(rect, bounds.origin, color, frame, window);
+            }
+            window.request_animation_frame();
+        }
+    }
+
     pub fn new(
         id: impl Into<ElementId>,
         layout: Rc<Layout>,
@@ -1443,7 +1570,7 @@ impl RichText {
                 let _ = window.paint_image(image_bounds, Corners::default(), image, 0, false);
             }
             // The header: the language (`fillParagraphBg`) and our copy hint.
-            if q.pre {
+            if q.pre && colors.copy_hint {
                 let mono = mono_family(window);
                 let font_size = scale::font(FONT_SIZE).size;
                 let hint_run = TextRun {
@@ -1561,7 +1688,9 @@ impl RichText {
                     (false, false, false) => hsla(colors.fg),
                     (true, false, false) => hsla(colors.select_fg),
                 };
-                let spoiler = flags & SPOILER != 0 && reveal < 1.;
+                let spoiler = flags & SPOILER != 0
+                    && reveal < 1.
+                    && !rich.spoiler_shown(a, self.state.shown_spoilers.as_ref());
                 let color = if spoiler {
                     let mut c = color;
                     c.a *= reveal;
@@ -1591,6 +1720,7 @@ impl RichText {
                     ),
                 });
             }
+            separate_fonts(&mut runs);
             let text: SharedString = rich.text[range.clone()].to_string().into();
             let shaped = if text.is_empty() {
                 None
@@ -1654,7 +1784,7 @@ pub fn view(
         (t.elapsed().as_secs_f32() * 1000. / SPOILER_REVEAL_MS).min(1.)
     });
     let spoilers = (layout.rich().has_spoilers && reveal < 1.)
-        .then(|| layout.spoiler_rects(state.selection.as_ref()))
+        .then(|| layout.spoiler_rects(state.selection.as_ref(), None))
         .filter(|r| !r.is_empty());
     let text = RichText::new(id, layout, colors, state, dragging, handler);
     let mut root = gpui::div()

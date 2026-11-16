@@ -30,8 +30,7 @@ pub struct TrayMenu {
 impl TrayMenu {
     fn on_event(&mut self, event: MenuEvent, window: &mut gpui::Window, cx: &mut Context<Self>) {
         let area = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
-        let geometry = self.menu.geometry(area, window);
-        match self.menu.handle(event, &geometry) {
+        match self.menu.handle(event, area, window) {
             Some(MenuAction::TrayShow) => self.chosen = Some(TrayEvent::Show),
             Some(MenuAction::TrayHide) => self.chosen = Some(TrayEvent::Hide),
             Some(MenuAction::TrayQuit) => self.chosen = Some(TrayEvent::Quit),
@@ -73,13 +72,14 @@ impl Render for TrayMenu {
     }
 }
 
-/// Windows 11 draws a border and rounds the corners of popup windows: the menu
-/// draws its own corners and shadow.
+/// Windows draws a frame (shadow, a line at the top, a border, round corners) around
+/// popup windows: the menu draws its own corners and shadow.
 fn no_frame(window: &gpui::Window) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Dwm::{
-        DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+        DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_NCRENDERING_POLICY,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DwmExtendFrameIntoClientArea,
         DwmSetWindowAttribute,
     };
     let Ok(RawWindowHandle::Win32(h)) = HasWindowHandle::window_handle(window).map(|h| h.as_raw())
@@ -90,6 +90,16 @@ fn no_frame(window: &gpui::Window) {
     // DWMWA_COLOR_NONE.
     let none: u32 = 0xFFFF_FFFE;
     unsafe {
+        // No frame of Windows' own: its shadow around the whole window and the line
+        // along its top (the menu draws its own shadow).
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_POLICY,
+            &DWMNCRP_DISABLED as *const _ as *const _,
+            size_of_val(&DWMNCRP_DISABLED) as u32,
+        );
+        let _ =
+            DwmExtendFrameIntoClientArea(hwnd, &windows::Win32::UI::Controls::MARGINS::default());
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE,

@@ -59,6 +59,15 @@
 - GPUI 0.2.2 never truncates `nowrap` text (stale measure cache), and its
   `text_ellipsis()` panics on multi-byte text (it shortens runs in place across measure
   passes): never use either; use `one_line::one_line` for cut single lines.
+- GPUI 0.2.2's `layout_line` keeps the previous run's font while color, underline
+  and strikethrough stay the same: give runs of another font a different color
+  (`rich_text::separate_fonts`, alpha off by 1/512) or bold after regular shapes regular.
+- The message field (`text_input`) keeps tags (tdesktop's `**`, `__`, ``` etc.) and
+  paints through `rich_text::RichText::paint_at`; its menu is `open_field_menu`
+  (`ui/menus.rs`). Synthetic Ctrl chords for demo checks need the modifier held
+  (`keybd_event` with pauses): `SendKeys "^b"` reaches GPUI as a plain "b". Bindings
+  of punctuation depend on the layout; Ctrl+Shift+. is also matched by its physical
+  key (`on_key_down`).
 - GPUI 0.2.2 samples atlas images with linear filtering: at a fractional scale an image
   touching its edge bleeds its atlas neighbour (a stripe). `icons` pads every mask.
 - Drags (scrollbars, the column edge) follow the mouse through window-level listeners

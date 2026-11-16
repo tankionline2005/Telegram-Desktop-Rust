@@ -271,6 +271,7 @@ impl MainView {
                 quote: p.msg_out_reply_bar_color,
                 dark: self.dark,
                 syntax,
+                copy_hint: true,
             }
         } else {
             TextColors {
@@ -290,6 +291,7 @@ impl MainView {
                 quote: super::name_color(p, content_color),
                 dark: self.dark,
                 syntax,
+                copy_hint: true,
             }
         }
     }
@@ -307,6 +309,7 @@ impl MainView {
                     .filter(|p| p.key == key)
                     .and_then(|p| p.hit.link),
                 revealed: t.revealed.get(&key).copied(),
+                shown_spoilers: None,
                 code_highlight: self.code_highlight(key),
                 ripple: t.ripple.as_ref().filter(|r| r.key == key).map(|r| {
                     let t = (r.start.elapsed().as_secs_f32() * 1000. / RIPPLE_SHOW_MS).min(1.) - 1.;
@@ -614,6 +617,7 @@ impl MainView {
                 let _ = self.commands.send(Command::Send {
                     peer: key.0,
                     text: command,
+                    entities: Vec::new(),
                 });
             }
             Link::Date(date) => self.open_date_menu(date, at),
