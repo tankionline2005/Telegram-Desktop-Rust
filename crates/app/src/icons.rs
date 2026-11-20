@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use gpui::{Div, RenderImage, Window, div, img, prelude::*, px};
+use tdr_data::filters::FilterIcon;
 use tdr_theme::Color;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,6 +59,36 @@ pub enum Icon {
     MenuNotifications,
     /// A submenu's arrow (`defaultMenuArrow`).
     MenuSubmenuArrow,
+    /// Folder icons (`Ui::FilterIcon`, `folders/folders_*`).
+    Folder(FilterIcon),
+    // The chat header (`topBarSearch`, `topBarCall`, `topBarInfo`, `menuToggleIcon`).
+    TopBarSearch,
+    TopBarCall,
+    TopBarProfile,
+    MenuDots,
+    // The message field (`historyAttach`, `historyAttachEmoji`, the record button).
+    InputAttach,
+    InputSmile,
+    InputRecord,
+    // `historyAiComposeButton` (three layers) and `historyExpandComposeButton`: SVGs.
+    AiLetters,
+    AiStar1,
+    AiStar2,
+    Expand,
+    // `Window::ConnectionState`: the box's round ends and their shadow (the body
+    // between them is drawn).
+    ConnectingLeft,
+    ConnectingRight,
+    ConnectingLeftShadow,
+    ConnectingRightShadow,
+}
+
+/// Where an icon's mask comes from.
+enum Source {
+    /// Grayscale masks @1x, @2x, @3x.
+    Png([&'static [u8]; 3]),
+    /// A vector icon drawn at this style size (`name-WxH` in tdesktop's styles).
+    Svg(&'static [u8], u32, u32),
 }
 
 macro_rules! icon_bytes {
@@ -70,7 +101,76 @@ macro_rules! icon_bytes {
     };
 }
 
+macro_rules! svg_bytes {
+    ($name:literal, $w:literal, $h:literal) => {
+        Source::Svg(
+            include_bytes!(concat!("../../../assets/tdesktop-icons/", $name, ".svg")).as_slice(),
+            $w,
+            $h,
+        )
+    };
+}
+
+fn folder_files(icon: FilterIcon) -> [&'static [u8]; 3] {
+    use FilterIcon as F;
+    match icon {
+        F::Cat => icon_bytes!("folders__folders_cat"),
+        F::Book => icon_bytes!("folders__folders_book"),
+        F::Money => icon_bytes!("folders__folders_money"),
+        F::Game => icon_bytes!("folders__folders_game"),
+        F::Light => icon_bytes!("folders__folders_light"),
+        F::Like => icon_bytes!("folders__folders_like"),
+        F::Note => icon_bytes!("folders__folders_note"),
+        F::Palette => icon_bytes!("folders__folders_palette"),
+        F::Travel => icon_bytes!("folders__folders_travel"),
+        F::Sport => icon_bytes!("folders__folders_sport"),
+        F::Favorite => icon_bytes!("folders__folders_favorite"),
+        F::Study => icon_bytes!("folders__folders_study"),
+        F::Airplane => icon_bytes!("folders__folders_airplane"),
+        F::Private => icon_bytes!("folders__folders_private"),
+        F::Groups => icon_bytes!("folders__folders_group"),
+        F::All => icon_bytes!("folders__folders_all"),
+        F::Unread => icon_bytes!("folders__folders_unread"),
+        F::Bots => icon_bytes!("folders__folders_bots"),
+        F::Crown => icon_bytes!("folders__folders_crown"),
+        F::Flower => icon_bytes!("folders__folders_flower"),
+        F::Home => icon_bytes!("folders__folders_home"),
+        F::Love => icon_bytes!("folders__folders_love"),
+        F::Mask => icon_bytes!("folders__folders_mask"),
+        F::Party => icon_bytes!("folders__folders_party"),
+        F::Trade => icon_bytes!("folders__folders_trade"),
+        F::Work => icon_bytes!("folders__folders_work"),
+        F::Unmuted => icon_bytes!("folders__folders_unmuted"),
+        F::Channels => icon_bytes!("folders__folders_channels"),
+        F::Custom => icon_bytes!("folders__folders_custom"),
+        F::Setup => icon_bytes!("folders__folders_setup"),
+        F::Edit => icon_bytes!("folders__folders_edit"),
+    }
+}
+
 impl Icon {
+    fn source(self) -> Source {
+        match self {
+            Icon::Folder(f) => Source::Png(folder_files(f)),
+            Icon::TopBarSearch => Source::Png(icon_bytes!("top_bar_search")),
+            Icon::TopBarCall => Source::Png(icon_bytes!("top_bar_call")),
+            Icon::TopBarProfile => Source::Png(icon_bytes!("top_bar_profile")),
+            Icon::MenuDots => Source::Png(icon_bytes!("title_menu_dots")),
+            Icon::InputAttach => Source::Png(icon_bytes!("chat__input_attach")),
+            Icon::InputSmile => Source::Png(icon_bytes!("chat__input_smile_face")),
+            Icon::InputRecord => Source::Png(icon_bytes!("chat__input_record")),
+            Icon::AiLetters => svg_bytes!("chat__ai_letters", 20, 20),
+            Icon::AiStar1 => svg_bytes!("chat__ai_star1", 20, 20),
+            Icon::AiStar2 => svg_bytes!("chat__ai_star2", 20, 20),
+            Icon::Expand => svg_bytes!("menu__rich__expand", 20, 20),
+            Icon::ConnectingLeft => Source::Png(icon_bytes!("connecting_left")),
+            Icon::ConnectingRight => Source::Png(icon_bytes!("connecting_right")),
+            Icon::ConnectingLeftShadow => Source::Png(icon_bytes!("connecting_left_shadow")),
+            Icon::ConnectingRightShadow => Source::Png(icon_bytes!("connecting_right_shadow")),
+            other => Source::Png(other.files()),
+        }
+    }
+
     fn files(self) -> [&'static [u8]; 3] {
         match self {
             Icon::DialogsMenu => icon_bytes!("dialogs__dialogs_menu"),
@@ -106,6 +206,7 @@ impl Icon {
             Icon::MenuForwarded => icon_bytes!("menu__forwarded_status"),
             Icon::MenuNotifications => icon_bytes!("menu__info_notifications"),
             Icon::MenuSubmenuArrow => icon_bytes!("menu__submenu_arrow"),
+            _ => unreachable!("icons with their own source"),
         }
     }
 }
@@ -146,15 +247,48 @@ fn decode(bytes: &[u8]) -> image::RgbaImage {
         .to_rgba8()
 }
 
+/// A vector icon as a mask like the PNG ones (coverage in every channel), drawn to
+/// `width` x `height` device pixels.
+fn render_svg(svg: &[u8], width: u32, height: u32) -> image::RgbaImage {
+    let mut out = image::RgbaImage::new(width.max(1), height.max(1));
+    let Ok(tree) = resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default()) else {
+        return out;
+    };
+    let Some(mut pixmap) = resvg::tiny_skia::Pixmap::new(width.max(1), height.max(1)) else {
+        return out;
+    };
+    let size = tree.size();
+    let transform = resvg::tiny_skia::Transform::from_scale(
+        width as f32 / size.width(),
+        height as f32 / size.height(),
+    );
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    for (px, src) in out.pixels_mut().zip(pixmap.pixels()) {
+        let a = src.alpha();
+        *px = image::Rgba([a, a, a, 255]);
+    }
+    out
+}
+
 /// The @1x size (tdesktop's style size of the icon).
 fn base_size(icon: Icon) -> (u32, u32) {
     if let Some(size) = BASE_SIZES.lock().unwrap().get(&icon) {
         return *size;
     }
-    let base = decode(icon.files()[0]);
-    let size = (base.width(), base.height());
+    let size = match icon.source() {
+        Source::Png(files) => {
+            let base = decode(files[0]);
+            (base.width(), base.height())
+        }
+        Source::Svg(_, w, h) => (w, h),
+    };
     BASE_SIZES.lock().unwrap().insert(icon, size);
     size
+}
+
+/// The icon's height in logical pixels at the current scale.
+pub fn icon_height(icon: Icon, _window: &Window) -> f32 {
+    crate::scale::lg(base_size(icon).1 as f32)
 }
 
 /// The icon's width in logical pixels at the current scale.
@@ -171,7 +305,10 @@ fn tinted(icon: Icon, color: Color, scale_factor: f32) -> Arc<Tinted> {
     // Exactly the device pixels tdesktop gives the icon, drawn 1:1.
     let width = crate::scale::device(base_w as f32).max(1.);
     let height = crate::scale::device(base_h as f32).max(1.);
-    let mut mask = decode(icon.files()[scale_index(scale_factor)]);
+    let mut mask = match icon.source() {
+        Source::Png(files) => decode(files[scale_index(scale_factor)]),
+        Source::Svg(svg, _, _) => render_svg(svg, width as u32, height as u32),
+    };
     if mask.width() != width as u32 || mask.height() != height as u32 {
         mask = image::imageops::resize(
             &mask,

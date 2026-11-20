@@ -132,6 +132,8 @@ struct Inner {
     slots: Mutex<HashMap<i32, Slot>>,
     events_tx: mpsc::UnboundedSender<Event>,
     events_rx: AsyncMutex<mpsc::UnboundedReceiver<Event>>,
+    /// Whether the home DC has a working connection (the "Connecting..." state).
+    connected: tokio::sync::watch::Sender<bool>,
 }
 
 /// Cheap-to-clone handle to the client.
@@ -151,8 +153,36 @@ impl Client {
                 slots: Mutex::new(HashMap::new()),
                 events_tx,
                 events_rx: AsyncMutex::new(events_rx),
+                connected: tokio::sync::watch::channel(false).0,
             }),
         }
+    }
+
+    /// Follows whether the home DC is connected.
+    pub fn connected(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.inner.connected.subscribe()
+    }
+
+    /// Asks for `help.getConfig` and keeps its DC addresses for later connections
+    /// (saved with the session).
+    pub async fn refresh_dc_options(&self) -> Result<(), Error> {
+        let enums::Config::Config(config) = self.invoke(&functions::help::GetConfig {}).await?;
+        let mut options: std::collections::BTreeMap<i32, Vec<String>> = Default::default();
+        for o in config.dc_options {
+            let enums::DcOption::DcOption(o) = o;
+            if o.ipv6 || o.media_only || o.cdn || o.tcpo_only || o.secret.is_some() {
+                continue;
+            }
+            let list = options.entry(o.id).or_default();
+            let addr = format!("{}:{}", o.ip_address, o.port);
+            if !list.contains(&addr) {
+                list.push(addr);
+            }
+        }
+        if !options.is_empty() {
+            self.inner.session.lock().unwrap().dc_options = options;
+        }
+        Ok(())
     }
 
     pub fn config(&self) -> &Config {
@@ -233,17 +263,31 @@ impl Client {
             .flatten()
     }
 
-    fn addr(&self, dc: i32) -> Result<&'static str, Error> {
+    /// Every known address of `dc`: the built-in ones and those from the config.
+    fn addrs(&self, dc: i32) -> Result<Vec<String>, Error> {
         let table = if self.inner.config.test {
             TEST_DCS
         } else {
             PRODUCTION_DCS
         };
-        table
+        let mut list: Vec<String> = table
             .iter()
-            .find(|(id, _)| *id == dc)
-            .map(|(_, a)| *a)
-            .ok_or(Error::Security("unknown DC"))
+            .filter(|(id, _)| *id == dc)
+            .map(|(_, a)| a.to_string())
+            .collect();
+        if !self.inner.config.test
+            && let Some(extra) = self.inner.session.lock().unwrap().dc_options.get(&dc)
+        {
+            for a in extra {
+                if !list.contains(a) {
+                    list.push(a.clone());
+                }
+            }
+        }
+        if list.is_empty() {
+            return Err(Error::Security("unknown DC"));
+        }
+        Ok(list)
     }
 
     fn slot(&self, dc: i32) -> Slot {
@@ -288,7 +332,23 @@ impl Client {
         {
             return Ok(c.clone());
         }
-        let conn = Arc::new(self.open(dc).await?);
+        // A network failure while setting up (a key exchange that got no answer) is
+        // tried again: requests wait for the connection, as in tdesktop.
+        let mut pause = Duration::from_millis(100);
+        let conn = loop {
+            match self.open(dc).await {
+                Ok(c) => break Arc::new(c),
+                Err(e) if e.is_network() => {
+                    debug!(dc, "connection setup failed: {e}; again in {pause:?}");
+                    tokio::time::sleep(pause).await;
+                    pause = (pause * 2).min(Duration::from_secs(8));
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        if dc == self.home_dc() {
+            self.inner.connected.send_replace(true);
+        }
 
         // Other DCs need the account's authorization copied from the home DC. The slot
         // stays locked until that is done: a request sent on the connection before the
@@ -341,7 +401,8 @@ impl Client {
 
     async fn open(&self, dc: i32) -> Result<DcConn, Error> {
         let cfg = &self.inner.config;
-        let addr = self.addr(dc)?;
+        let addrs = self.addrs(dc)?;
+        let addr = addrs.as_slice();
         let started = std::time::Instant::now();
         let (perm, temp, time_offset) = {
             let s = self.inner.session.lock().unwrap();
@@ -443,6 +504,17 @@ impl Client {
                 let is_home = session
                     .upgrade()
                     .is_some_and(|i| i.session.lock().unwrap().home_dc == dc);
+                if is_home && let Some(inner) = session.upgrade() {
+                    match e {
+                        Event::ConnectionLost => {
+                            inner.connected.send_replace(false);
+                        }
+                        Event::Reconnected => {
+                            inner.connected.send_replace(true);
+                        }
+                        _ => {}
+                    }
+                }
                 if is_home && tx.send(e).is_err() {
                     break;
                 }

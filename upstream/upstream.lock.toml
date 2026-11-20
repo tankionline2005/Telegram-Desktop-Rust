@@ -598,3 +598,656 @@ sha256 = "42eac190e86908f92b7ecff65eec0e6926b45de55c09945598c7817849b8f1f0"
 path = "assets/tdesktop-icons/menu__submenu_arrow@3x.png"
 upstream = "Telegram/Resources/icons/menu/submenu_arrow@3x.png"
 sha256 = "994ceea256c4c66049fec2124322d8402de9f72ea187a44c888399c79e5f0ed0"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_all.png"
+upstream = "Telegram/Resources/icons/folders/folders_all.png"
+sha256 = "cc708ee3d943d4969a4a94953b85e17fcb7b660b91c89462afedd2d1b99e71a6"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_all@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_all@2x.png"
+sha256 = "dc2e22742319f68b7cc1896d6b4c4368fea49b2f5a7084dc968be4fcf5bcec69"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_all@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_all@3x.png"
+sha256 = "c782587f02b6dd5eda2bde005fc0279cc6e64d27d4d105367dac3a59d2d9da33"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_cat.png"
+upstream = "Telegram/Resources/icons/folders/folders_cat.png"
+sha256 = "58e7aaa7eed545380ee6e66e0b4f17a0c7f9adf2edb26727c602d5fc69046491"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_cat@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_cat@2x.png"
+sha256 = "99e490dd584fc03dfe1bc528dec53719c4d94dcdee3e56b1e10a150a7f9bf8b0"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_cat@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_cat@3x.png"
+sha256 = "fcaac74642553bdebbd647bf0115a306f9ffab1f77a1f1f713a7d29264bb00ca"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_book.png"
+upstream = "Telegram/Resources/icons/folders/folders_book.png"
+sha256 = "3d5a344f21d0a5199245e61dff36aa2a9ba46bc6c68740b3845ca37d18a8b27a"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_book@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_book@2x.png"
+sha256 = "72f5ee1d4bdc320321db222bdca154a34895db139edaf1038e9504fd0b650b64"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_book@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_book@3x.png"
+sha256 = "f655adcdec20522e38a82bbd33edacf3213617e668737b9eaa15e6c06ca03756"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_money.png"
+upstream = "Telegram/Resources/icons/folders/folders_money.png"
+sha256 = "c33532c547febc7c8324f503ff31f1fcd9992cb6fd5f0b5cfe8ec4b6a8ef29ab"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_money@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_money@2x.png"
+sha256 = "039274168dbe62cab9add41f62b0616e441af866478353e407da415fa2206846"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_money@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_money@3x.png"
+sha256 = "5db3a03f890fca3f5e392b95489aba5a49da541a63196a682d94ed983c57f992"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_game.png"
+upstream = "Telegram/Resources/icons/folders/folders_game.png"
+sha256 = "5bf15448b4320db9c86b4cb36ea62554f6a3151ab4d8745d6a52d98ae185f3e2"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_game@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_game@2x.png"
+sha256 = "b05436843ac23b57ba47efb79bc39483e537d375878084bb69dc0e40e866064d"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_game@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_game@3x.png"
+sha256 = "3a86870f788786eafb192ca00fffa87f93df7c796cf806ea91f7544acdbeaa3b"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_light.png"
+upstream = "Telegram/Resources/icons/folders/folders_light.png"
+sha256 = "53bb33983918d0502f210c13792c6742ff74c2e09c030ccdfbb5623a711f2a9c"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_light@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_light@2x.png"
+sha256 = "660b858e42b8e815c5271da101b03db366306a9c1395789bd4db0529580b6f51"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_light@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_light@3x.png"
+sha256 = "41a5f36b741e5c0e6c1270934cc82002dd3d156b8613ee6adc90502bca667861"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_like.png"
+upstream = "Telegram/Resources/icons/folders/folders_like.png"
+sha256 = "22ea11b6ccdaf0523ba75a2b04944fe96431d90cc84a7febbb413071a0cd9b7f"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_like@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_like@2x.png"
+sha256 = "385eebd02c33c4be3ad866167a7ac9ebdb5a7511d3c29bb6b6bbb21be407bfe4"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_like@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_like@3x.png"
+sha256 = "903b53d2b9d16469007e38b46d6f92d20a02658effb81f309e6fbde8b7d4c08d"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_note.png"
+upstream = "Telegram/Resources/icons/folders/folders_note.png"
+sha256 = "f2b41b954a81829960f8a49cddbf6dc9b171254d0cfe8c908191a5b8c68045e7"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_note@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_note@2x.png"
+sha256 = "1dc862b054d92c3e7b80b4129dcb219678abac2f16753bfbda9460cb2ee47dca"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_note@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_note@3x.png"
+sha256 = "91d0ee4b5111167647e185791aa34cb23337d76325c0bfa01391e3ab0cfb6290"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_palette.png"
+upstream = "Telegram/Resources/icons/folders/folders_palette.png"
+sha256 = "db01752b4b5ea9bafd8bd9252269067d854f255564a3ebb93a14c9945baf8baf"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_palette@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_palette@2x.png"
+sha256 = "4ba677e6a0c0ae0aecd046ad042f386b96fb5dc623b8f9a41eb212992e5bbf4e"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_palette@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_palette@3x.png"
+sha256 = "4dac652db41e586f4f4e9935198ba8be7928b188d81b6350f558ec656ad78f84"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_travel.png"
+upstream = "Telegram/Resources/icons/folders/folders_travel.png"
+sha256 = "e0b772d6a28d3914c47e282db156f42b0aafefddae56354a88449af1e48440f7"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_travel@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_travel@2x.png"
+sha256 = "3debf4ea9420c26760cd0d1e90596ec91a599c120b6067a091baa9a7d02bffa4"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_travel@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_travel@3x.png"
+sha256 = "871ccd303fd52ccaf34eecc63a41927afa935b854592331c37e6c07a34af6f02"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_sport.png"
+upstream = "Telegram/Resources/icons/folders/folders_sport.png"
+sha256 = "86b8d7dc116562e7d2f72230f74793be990c307d850d621cae190517d08190c4"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_sport@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_sport@2x.png"
+sha256 = "28805232aba80bde4363b7d7a3f21d1b5582d317a66bf72c2637806739589e55"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_sport@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_sport@3x.png"
+sha256 = "6019bdbc97a5d1d7e85ddbd04ba71118444fb94cb2e8f3c7881eb65d2e4a6bc4"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_favorite.png"
+upstream = "Telegram/Resources/icons/folders/folders_favorite.png"
+sha256 = "72a23aa2b92bdb578bce3c35bc26a028d0748464eb3c5fba8bcf024bd059911a"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_favorite@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_favorite@2x.png"
+sha256 = "82650c39687e233409b792bcf2eb4c46cbb62d6a9d6aaf21101838108ab9de29"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_favorite@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_favorite@3x.png"
+sha256 = "066bb4c4c40f9f553428991d06243d1b20a73b66101ab1e0c200977bb9a14169"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_study.png"
+upstream = "Telegram/Resources/icons/folders/folders_study.png"
+sha256 = "16732161fd3ec30c9d65e32007d0292376f075bf2e174c5a465ed3d86f227f71"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_study@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_study@2x.png"
+sha256 = "ed265ef266cd86c11255975e428b02d287c23719cf255d8810be3223ac67970c"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_study@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_study@3x.png"
+sha256 = "46ffeb1b61a4966c7df2d663d6c3a450e68d91206ea6033bd1a2f559ff6bbd90"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_airplane.png"
+upstream = "Telegram/Resources/icons/folders/folders_airplane.png"
+sha256 = "f85ed1095fa63719a729647557b52a1f65532e37de4b014acff0740f4bf55659"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_airplane@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_airplane@2x.png"
+sha256 = "457abbbd28e88c2ab7dd0a16abaa24fc38b0d2cbf3c65efc6346c62f83c6598d"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_airplane@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_airplane@3x.png"
+sha256 = "8ee2243095bb090a3888ff71a76842b25b0020dd37865974bdf116c93cb44218"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_private.png"
+upstream = "Telegram/Resources/icons/folders/folders_private.png"
+sha256 = "8f87553c12601679d8a85927f58d3dbe805e374949663c0b9ab68e23706fc4ea"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_private@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_private@2x.png"
+sha256 = "0badaea65f530a27c2146cf9d259043d7a5ccff50d41f6312b2647954c606f19"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_private@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_private@3x.png"
+sha256 = "22c1301b6dec727c1bd5c11129d187dc474671167163427bfc365c023c77dcd4"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_group.png"
+upstream = "Telegram/Resources/icons/folders/folders_group.png"
+sha256 = "879ac3855f9d8ed5eb8b0738d483924ee520fa043a574bf5a070f99c14981cc5"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_group@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_group@2x.png"
+sha256 = "d1fcf2a83ee16d0de32d834733a5670988dfc368a9101e5c5a54fd266d38132a"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_group@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_group@3x.png"
+sha256 = "220e0c963157eceebbc2c7925298bd62b303d424c941433a2738d7b43d73902c"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_unread.png"
+upstream = "Telegram/Resources/icons/folders/folders_unread.png"
+sha256 = "241d8c049d79bab4914cc5eecb33abf43726ea3bca75caff55dd22c7afcf4887"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_unread@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_unread@2x.png"
+sha256 = "7e5cc4b0e7bb55ff9f0a07f888fc12f8c8545f875faa2e1dea3de5d09235f8dc"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_unread@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_unread@3x.png"
+sha256 = "1c4c3ae7a32d31457a52a32a18363935fc7217811cf029c6ad71175d4647ecee"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_bots.png"
+upstream = "Telegram/Resources/icons/folders/folders_bots.png"
+sha256 = "44e63f8eb5fdcf46584fded773fd36c4565febedc892cace404c4a502bd377fe"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_bots@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_bots@2x.png"
+sha256 = "b769baafbb4c5ed28ab72a4f46649410843722169687deaa4007ce188a08b964"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_bots@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_bots@3x.png"
+sha256 = "39de2a86c8bf6a2624a32a38eb129f6b9c8462301dc1e31b04667d6f3dd76e1b"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_crown.png"
+upstream = "Telegram/Resources/icons/folders/folders_crown.png"
+sha256 = "fb9f086578c0681602565e1f28f22c8c7893aa2c579b9702b040e08a9ae42586"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_crown@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_crown@2x.png"
+sha256 = "c8feaeff9b0570e2605a79b5929db3609ed29dafd47c5710da1532e450a6c4cd"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_crown@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_crown@3x.png"
+sha256 = "d0ab7974fab4aa7a22c9b780b9b3c891c3e30a439c91fe9385cea33592e52cf4"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_flower.png"
+upstream = "Telegram/Resources/icons/folders/folders_flower.png"
+sha256 = "6866bf676dbb200350fcb1ffcb0adf5d652debfdd9f45ff3b89b5e60b9059590"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_flower@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_flower@2x.png"
+sha256 = "b1dab170066e000fd4fafd1d657ec6e71cbe14bdbbb5fe3d36f27f0b283b4dc1"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_flower@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_flower@3x.png"
+sha256 = "619b0ddb430ca255a6cf8e85e8ee007a3edc10710029da6d1c97ef35781ffae8"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_home.png"
+upstream = "Telegram/Resources/icons/folders/folders_home.png"
+sha256 = "393a6cc7930711e7f064ac09dd8bf8d338fec4b266032529cd8404829c8b3175"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_home@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_home@2x.png"
+sha256 = "c5c8ab116e730c2cac90f29be516bc9ba3ed9f8ad38217fb8b5e614ed656edfb"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_home@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_home@3x.png"
+sha256 = "1dfb963b0dd2e9afaada96bdf003d965206d0014d3ecbd41925f994e6697d535"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_love.png"
+upstream = "Telegram/Resources/icons/folders/folders_love.png"
+sha256 = "39bae7671aad2235b3e247211f9337687188e7ee682a656ee4506a9d1b0e9dd0"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_love@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_love@2x.png"
+sha256 = "4e8d515d57ad703935103dfb0a278e4bf8bd210980035460e539ce40bacf00d3"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_love@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_love@3x.png"
+sha256 = "e28f69e469adfa02901b46b7eb1f94ca231b9f4be368e77083e2495c14d432aa"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_mask.png"
+upstream = "Telegram/Resources/icons/folders/folders_mask.png"
+sha256 = "8e8950aef7f5d7f82a7abc1a8e3fb37a0bea9a6412dbc45b01c1b96afe7e5ea0"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_mask@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_mask@2x.png"
+sha256 = "2b42f6fbe33b851532de8cea67f144d7b141295751c999743bc312ec21c60d29"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_mask@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_mask@3x.png"
+sha256 = "032f6224095fb84e4089f9bc3a59bf2bfbdf76857fada0f01388cd72889270d3"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_party.png"
+upstream = "Telegram/Resources/icons/folders/folders_party.png"
+sha256 = "1351cee2dcf1871a4f7b81cfe934fcb09830fd340f8bf4c904a9715759f99757"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_party@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_party@2x.png"
+sha256 = "2b95adf84afadb99fac0195a2da08f21da8e9be65fe9a051e4badfab99618a4e"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_party@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_party@3x.png"
+sha256 = "bb9b551dab87bc8b1322e3a79621c2bb3ae896f37dda4b72e45554db7d34f64c"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_trade.png"
+upstream = "Telegram/Resources/icons/folders/folders_trade.png"
+sha256 = "63182610c994efb9107442d34c56b70c946215ec957307797da256278991a833"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_trade@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_trade@2x.png"
+sha256 = "e06560637273de363d7918a4ccbafcd618b002a56f5212f15f6fad8162da3cec"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_trade@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_trade@3x.png"
+sha256 = "b0d12003c7d22aa45a6ac56424fe7000f775e1151f52ee7a71f238d12f935a57"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_work.png"
+upstream = "Telegram/Resources/icons/folders/folders_work.png"
+sha256 = "f921b3616a0f76aab832dfb85ed5486a268eef7d1afade11242dbc15aabb245b"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_work@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_work@2x.png"
+sha256 = "969c92f96376f6b01677c9f6c455af5e9ef28d76b1bc1228360dedc644d309f0"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_work@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_work@3x.png"
+sha256 = "5695a39b2754ff24ab6fca27ed8e21a05f61a6a4f008cdf450c9299cba3b0454"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_unmuted.png"
+upstream = "Telegram/Resources/icons/folders/folders_unmuted.png"
+sha256 = "b4da0140f941a3e699c4222f2feeb8f7db377e7f1e3ce140e81a9fa13aa87343"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_unmuted@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_unmuted@2x.png"
+sha256 = "9dd8812afe994f3db0d9773d85fb02985177f82193b86fbca2b2e23eb3d9ebeb"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_unmuted@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_unmuted@3x.png"
+sha256 = "4098887cd4ea519618a1b803347ab4099cd9c355b8bcba749f03fde2a43aafc0"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_channels.png"
+upstream = "Telegram/Resources/icons/folders/folders_channels.png"
+sha256 = "57c51c5f1a4e78d61f87068f766b19a64780f2528e4da6c055d4c347746e08b9"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_channels@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_channels@2x.png"
+sha256 = "36d8f7b8bd0a06c3e3da3855b8fc6428b99ae2f05ab3554f1b208bf80350f5c8"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_channels@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_channels@3x.png"
+sha256 = "6fcc48d7ad0747cb15ff55cb1c3a6895277e0856a4a87722fc6761173292fba8"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_custom.png"
+upstream = "Telegram/Resources/icons/folders/folders_custom.png"
+sha256 = "5efec7e5c124d0ea1a69c8f2f1be0369010b3358b150a8d3f3277d0b4c0ac3c1"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_custom@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_custom@2x.png"
+sha256 = "70d3babc75bedb5e8a9359750829cf1a1a0bf6fd61ae19c80584538b4b426eb6"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_custom@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_custom@3x.png"
+sha256 = "4f3262d5f81b8603a4510a296f7e923cf1afc0cdbf10a534905d92ff81431bc1"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_setup.png"
+upstream = "Telegram/Resources/icons/folders/folders_setup.png"
+sha256 = "3e3e978d9dafd297bb4f0c8aecfee88e06979b272a4957b2446c7d6fe20a7c25"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_setup@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_setup@2x.png"
+sha256 = "8bd93471f11e443f17f740eece36e3baab6a324c41b6e6ebf9b18951eb7616bd"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_setup@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_setup@3x.png"
+sha256 = "1ab01d5baac77a4bbdf30b322bfc2dff7993d5ae0866329273fe6852a969bbe0"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_edit.png"
+upstream = "Telegram/Resources/icons/folders/folders_edit.png"
+sha256 = "8a04a5a9951f47d03a17f97057d278636d5a7a6d7cdeb8ae737773a4f744c6b0"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_edit@2x.png"
+upstream = "Telegram/Resources/icons/folders/folders_edit@2x.png"
+sha256 = "5dbb8350b35243d8704a3cc76e5909cf6df5e8c9a77e8e6b2dbfc273a80df37b"
+
+[[vendored]]
+path = "assets/tdesktop-icons/folders__folders_edit@3x.png"
+upstream = "Telegram/Resources/icons/folders/folders_edit@3x.png"
+sha256 = "15a1866353b6f09bb36d7dfb1bcc3ae1f37e9ce26a3c2955a1e558e86ac0363c"
+
+[[vendored]]
+path = "assets/tdesktop-icons/top_bar_search.png"
+upstream = "Telegram/Resources/icons/top_bar_search.png"
+sha256 = "feb72e3dd86b59a61b2c85682913e9f7b32b12a269f814a389fc99da2517bf1c"
+
+[[vendored]]
+path = "assets/tdesktop-icons/top_bar_search@2x.png"
+upstream = "Telegram/Resources/icons/top_bar_search@2x.png"
+sha256 = "fba425f39dad1faabbc3ea09698a3d58758efcb244cb317dbfcc237994a65622"
+
+[[vendored]]
+path = "assets/tdesktop-icons/top_bar_search@3x.png"
+upstream = "Telegram/Resources/icons/top_bar_search@3x.png"
+sha256 = "219f92f1463c33d831b15b90c26e0e1ffe9cba301940a5b1f427504da4f964df"
+
+[[vendored]]
+path = "assets/tdesktop-icons/top_bar_call.png"
+upstream = "Telegram/Resources/icons/top_bar_call.png"
+sha256 = "f7cca6849f04ec3f72a71c105762cf1078df0fc311f041e8a27e5a483c20c508"
+
+[[vendored]]
+path = "assets/tdesktop-icons/top_bar_call@2x.png"
+upstream = "Telegram/Resources/icons/top_bar_call@2x.png"
+sha256 = "886f90ffdd22b7ae914570279a9208439cd47a7b9068d041ee2f40e2be50bf23"
+
+[[vendored]]
+path = "assets/tdesktop-icons/top_bar_call@3x.png"
+upstream = "Telegram/Resources/icons/top_bar_call@3x.png"
+sha256 = "485a3d71f33b1665314426b33775a5c2c9af1b6b050cf04c471d445928ff73c8"
+
+[[vendored]]
+path = "assets/tdesktop-icons/top_bar_profile.png"
+upstream = "Telegram/Resources/icons/top_bar_profile.png"
+sha256 = "15f6ac7ee9d51241c44e8817991228baa88cd1d5092f978be3fbccc335bd1d26"
+
+[[vendored]]
+path = "assets/tdesktop-icons/top_bar_profile@2x.png"
+upstream = "Telegram/Resources/icons/top_bar_profile@2x.png"
+sha256 = "ad27b7a6e6edc80f14793105e98888d66714f20f13b688e002780e652ed88237"
+
+[[vendored]]
+path = "assets/tdesktop-icons/top_bar_profile@3x.png"
+upstream = "Telegram/Resources/icons/top_bar_profile@3x.png"
+sha256 = "7f7f856ac0b6af13fd9ae8da30b7400fc9e59e88e0f8ed8066b9e146f586ae5a"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__input_attach.png"
+upstream = "Telegram/Resources/icons/chat/input_attach.png"
+sha256 = "c9f8689d935b9bf25497c4e5271938b108e697aa49b60985d3ca5a8df7c713ef"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__input_attach@2x.png"
+upstream = "Telegram/Resources/icons/chat/input_attach@2x.png"
+sha256 = "623d6ea68884071d81487999b2b791fc237100f4dd1e9faacc557083bdcf688f"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__input_attach@3x.png"
+upstream = "Telegram/Resources/icons/chat/input_attach@3x.png"
+sha256 = "00fdf258eb8872f4c3479d0145bf03a80d067f3ebefbf4e0f92993badb6e75b9"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__input_smile_face.png"
+upstream = "Telegram/Resources/icons/chat/input_smile_face.png"
+sha256 = "1477a9060e31d21a87fd41806f4b32122d9193330be0bea8fdbd771f153f3c7a"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__input_smile_face@2x.png"
+upstream = "Telegram/Resources/icons/chat/input_smile_face@2x.png"
+sha256 = "1cac2385cfc1f5f210162ef2cfcc6ec4ecdd563aefed05b80637c556c8a0923f"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__input_smile_face@3x.png"
+upstream = "Telegram/Resources/icons/chat/input_smile_face@3x.png"
+sha256 = "eabc5da3040679ab360d982ad9725805a932d99602770c2bbb7761760bc85f02"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__input_record.png"
+upstream = "Telegram/Resources/icons/chat/input_record.png"
+sha256 = "2c9e11a698442cbc4d8b9efa6bce6f66fb6fd74f3615b290e6dbf40f0786f483"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__input_record@2x.png"
+upstream = "Telegram/Resources/icons/chat/input_record@2x.png"
+sha256 = "cfc384230ea554bca8830cee01a4e4c0c929a73092d51dcde3ff83cb6f547b85"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__input_record@3x.png"
+upstream = "Telegram/Resources/icons/chat/input_record@3x.png"
+sha256 = "fb560ad21a6377a16c3b5a5bc9029720867c81d64d981a56355a02495307eca0"
+
+[[vendored]]
+path = "assets/tdesktop-icons/connecting_left.png"
+upstream = "Telegram/Resources/icons/connecting_left.png"
+sha256 = "0e1acf5cfc58ba8b76e6331ffd71647fcf0141ec17668a817d2a94c6ee05258b"
+
+[[vendored]]
+path = "assets/tdesktop-icons/connecting_left@2x.png"
+upstream = "Telegram/Resources/icons/connecting_left@2x.png"
+sha256 = "6e2c68f81a187804d715634616d93d8ee242562614aeb97ac9ab548bc1c85149"
+
+[[vendored]]
+path = "assets/tdesktop-icons/connecting_left@3x.png"
+upstream = "Telegram/Resources/icons/connecting_left@3x.png"
+sha256 = "f537f0f2f4ed4dcd6a3d6da1a80dfc56e76dc8bdc405c0ce84d9af81f32c0026"
+
+[[vendored]]
+path = "assets/tdesktop-icons/connecting_right.png"
+upstream = "Telegram/Resources/icons/connecting_right.png"
+sha256 = "be8535db57ce79455cb756eb03bbaaf1b8a8d9d89fa2716378fa75f995ac2699"
+
+[[vendored]]
+path = "assets/tdesktop-icons/connecting_right@2x.png"
+upstream = "Telegram/Resources/icons/connecting_right@2x.png"
+sha256 = "2a00f3df61691a552cf6009f2bfa8f86a9e81365526995d9efddfa8ec4ca413c"
+
+[[vendored]]
+path = "assets/tdesktop-icons/connecting_right@3x.png"
+upstream = "Telegram/Resources/icons/connecting_right@3x.png"
+sha256 = "63174cbd5c1b9bf793f90362d7e1af20a28f44b5371223e1b0f2080eaa280371"
+
+[[vendored]]
+path = "assets/tdesktop-icons/connecting_left_shadow.png"
+upstream = "Telegram/Resources/icons/connecting_left_shadow.png"
+sha256 = "878e8b888c03261617aa14d16930bfb6c201f4e5a4d93622730667eabb092669"
+
+[[vendored]]
+path = "assets/tdesktop-icons/connecting_left_shadow@2x.png"
+upstream = "Telegram/Resources/icons/connecting_left_shadow@2x.png"
+sha256 = "074ce7ac2a1c303aaa548ec6891699de0c43aace76a1ffa62e7a2157384d6b8a"
+
+[[vendored]]
+path = "assets/tdesktop-icons/connecting_left_shadow@3x.png"
+upstream = "Telegram/Resources/icons/connecting_left_shadow@3x.png"
+sha256 = "82915d5f8b4bbb6cfbf8f120a4fef359c0a024a3b074644519c12d6ac3dc00fa"
+
+[[vendored]]
+path = "assets/tdesktop-icons/connecting_right_shadow.png"
+upstream = "Telegram/Resources/icons/connecting_right_shadow.png"
+sha256 = "b3899f128f28d779d9d814c5b6ea6c39fbd73bc68e2084a0ea5467a3e173b6ad"
+
+[[vendored]]
+path = "assets/tdesktop-icons/connecting_right_shadow@2x.png"
+upstream = "Telegram/Resources/icons/connecting_right_shadow@2x.png"
+sha256 = "ccde4363179ff7fecf1c438219ba37feb2898f6322b05dfab88cfdda977d095f"
+
+[[vendored]]
+path = "assets/tdesktop-icons/connecting_right_shadow@3x.png"
+upstream = "Telegram/Resources/icons/connecting_right_shadow@3x.png"
+sha256 = "0b689cf556e3ac991262109bc4d3a9a7f1bba675fa4698b6c66df4e046a25592"
+
+[[vendored]]
+path = "assets/tdesktop-icons/title_menu_dots.png"
+upstream = "icons/title_menu_dots.png"
+submodule = "Telegram/lib_ui"
+sha256 = "094309420146162301b804384978367bbb2b6cd95f6183e741a36782d2e22325"
+
+[[vendored]]
+path = "assets/tdesktop-icons/title_menu_dots@2x.png"
+upstream = "icons/title_menu_dots@2x.png"
+submodule = "Telegram/lib_ui"
+sha256 = "eae4f09150f705b7bb126da8cfd6da53155638227343df1a3a23113503aca090"
+
+[[vendored]]
+path = "assets/tdesktop-icons/title_menu_dots@3x.png"
+upstream = "icons/title_menu_dots@3x.png"
+submodule = "Telegram/lib_ui"
+sha256 = "b73198311efb0e71ef18faee05ee9459b78d58e2fbe2a96d96912d61fbebf8b6"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__ai_letters.svg"
+upstream = "Telegram/Resources/icons/chat/ai_letters.svg"
+sha256 = "6b1aa39ac9a810ae0e1be12cb302e56cbbea2e0ef9399378edf63cfd0f66edbe"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__ai_star1.svg"
+upstream = "Telegram/Resources/icons/chat/ai_star1.svg"
+sha256 = "aa7b0958c1c246a7949f0191ba4bfd0bc8113f074dfbd3b2e9451471b0916c4e"
+
+[[vendored]]
+path = "assets/tdesktop-icons/chat__ai_star2.svg"
+upstream = "Telegram/Resources/icons/chat/ai_star2.svg"
+sha256 = "3c2eff29d22af2413807425aabcecb9ab70520232477dcb484c0f385f67efff9"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__rich__expand.svg"
+upstream = "Telegram/Resources/icons/menu/rich/expand.svg"
+sha256 = "5d18bfd097460764260c1666a2bb8cc954fc6ecec18a631dafd2a1d98d5bd3c6"

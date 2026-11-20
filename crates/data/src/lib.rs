@@ -9,6 +9,7 @@
 pub mod convert;
 pub mod describe;
 pub mod drafts;
+pub mod filters;
 
 use std::time::{Duration, Instant};
 
@@ -133,6 +134,8 @@ pub struct Applied {
     pub marks_changed: bool,
     /// Chats were pinned, unpinned or reordered.
     pub pinned_changed: bool,
+    /// The folders changed (`updateDialogFilter*`): ask for them again.
+    pub filters_changed: bool,
     /// Users went online or offline.
     pub statuses_changed: bool,
     /// Local drafts changed by the server (another device): the input field of an
@@ -741,7 +744,7 @@ impl Sync {
                 }
             },
             Some(Event::NewSession | Event::Reconnected) => self.engine.connection_restored(),
-            None => self.engine.poll(Instant::now()),
+            Some(Event::ConnectionLost) | None => self.engine.poll(Instant::now()),
         };
         self.run(out).await
     }
@@ -1016,6 +1019,55 @@ impl Sync {
         self.feed(updates).await
     }
 
+    /// The folders (`messages.getDialogFilters`), "All chats" where it stands; kept
+    /// in the cache (the TL object with its layer) for the next start.
+    pub async fn dialog_filters(&mut self) -> Result<Vec<filters::FilterEntry>> {
+        let answer = self
+            .client
+            .invoke(&functions::messages::GetDialogFilters {})
+            .await?;
+        let mut blob = tdr_tl::LAYER.to_le_bytes().to_vec();
+        blob.extend_from_slice(&tdr_tl::Serializable::to_bytes(&answer));
+        self.store.write(|w| w.set_meta(FILTERS_META, &blob))?;
+        Ok(filter_entries(&answer))
+    }
+}
+
+const FILTERS_META: &str = "dialog_filters";
+
+/// The folders kept in the cache by [`Sync::dialog_filters`] (`None`: never loaded, or
+/// cached by another layer).
+pub fn cached_dialog_filters(store: &Storage) -> Option<Vec<filters::FilterEntry>> {
+    let blob = store.meta(FILTERS_META).ok().flatten()?;
+    let layer = i32::from_le_bytes(blob.get(..4)?.try_into().ok()?);
+    if layer != tdr_tl::LAYER {
+        return None;
+    }
+    let answer =
+        enums::messages::DialogFilters::from_bytes(&tdr_tl::Bytes::copy_from_slice(&blob[4..]))
+            .ok()?;
+    Some(filter_entries(&answer))
+}
+
+fn filter_entries(answer: &enums::messages::DialogFilters) -> Vec<filters::FilterEntry> {
+    let enums::messages::DialogFilters::DialogFilters(answer) = answer;
+    {
+        let mut list: Vec<filters::FilterEntry> = answer
+            .filters
+            .iter()
+            .map(|f| match filters::ChatFilter::from_tl(f) {
+                Some(f) => filters::FilterEntry::Folder(f),
+                None => filters::FilterEntry::All,
+            })
+            .collect();
+        if !list.contains(&filters::FilterEntry::All) {
+            list.insert(0, filters::FilterEntry::All);
+        }
+        list
+    }
+}
+
+impl Sync {
     /// One message of a private chat or a basic group (`messages.getMessages`),
     /// stored in the cache.
     async fn fetch_message(&mut self, peer: PeerKey, id: i32) -> Result<Option<MessageRow>> {
@@ -1403,6 +1455,9 @@ fn apply_update(
                 w.set_pinned_order(0, &peers)?;
                 applied.pinned_changed = true;
             }
+        }
+        U::DialogFilter(_) | U::DialogFilterOrder(_) | U::DialogFilters => {
+            applied.filters_changed = true;
         }
         // Statuses, typing, reactions, ... are not cached yet.
         _ => {}

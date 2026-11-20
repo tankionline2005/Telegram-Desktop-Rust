@@ -15,10 +15,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub use sender::{Connected, Event, KeySpec, Sender, Update};
 pub use transport::TransportError;
 
-/// Production DC addresses built into tdesktop (`mtproto_dc_options.cpp`).
+/// Production DC addresses built into tdesktop (`kBuiltInDcs` in
+/// `mtproto_dc_options.cpp`; DC 2 has two). `help.getConfig` adds more.
 pub const PRODUCTION_DCS: &[(i32, &str)] = &[
     (1, "149.154.175.50:443"),
     (2, "149.154.167.51:443"),
+    (2, "95.161.76.100:443"),
     (3, "149.154.175.100:443"),
     (4, "149.154.167.91:443"),
     (5, "149.154.171.5:443"),
@@ -45,6 +47,14 @@ pub enum Error {
     /// The server does not know the auth key (a temporary key expired or was destroyed,
     /// or the permanent key was revoked). The key must be recreated.
     AuthKeyUnknown,
+}
+
+impl Error {
+    /// A network problem (worth trying again on a new connection), not a protocol or
+    /// server answer.
+    pub fn is_network(&self) -> bool {
+        matches!(self, Self::Io(_) | Self::Disconnected)
+    }
 }
 
 impl std::fmt::Display for Error {

@@ -18,11 +18,23 @@ const ELLIPSIS: &str = "…";
 
 pub struct OneLine {
     text: SharedString,
+    centered: bool,
 }
 
 /// One line of `text` in the current text style, as wide as its parent, cut with "…".
 pub fn one_line(text: impl Into<SharedString>) -> OneLine {
-    OneLine { text: text.into() }
+    OneLine {
+        text: text.into(),
+        centered: false,
+    }
+}
+
+impl OneLine {
+    /// Centered in its width (`style::al_top` labels).
+    pub fn centered(mut self) -> Self {
+        self.centered = true;
+        self
+    }
 }
 
 impl IntoElement for OneLine {
@@ -120,10 +132,16 @@ impl Element for OneLine {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let mut origin = bounds.origin;
+        if self.centered {
+            origin.x += ((bounds.size.width - prepaint.line.width) / 2.)
+                .max(px(0.))
+                .floor();
+        }
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
             let _ = prepaint
                 .line
-                .paint(bounds.origin, prepaint.line_height, window, cx);
+                .paint(origin, prepaint.line_height, window, cx);
         });
     }
 }

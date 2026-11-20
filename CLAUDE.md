@@ -68,6 +68,11 @@
   (`keybd_event` with pauses): `SendKeys "^b"` reaches GPUI as a plain "b". Bindings
   of punctuation depend on the layout; Ctrl+Shift+. is also matched by its physical
   key (`on_key_down`).
+- Window controls (folder column, chat search field, "Connecting..." box, chat header
+  and message field buttons) live in `ui/chrome.rs`; folders come from
+  `tdr_data::filters` (rules and icons ported) through `bridge` (`Update::Folders`,
+  `Command::SelectFolder`). Demo flags: `--folders`, `--connecting`.
+  `tdr probe folders` prints folder rule sizes and counts (no titles).
 - GPUI 0.2.2 samples atlas images with linear filtering: at a fractional scale an image
   touching its edge bleeds its atlas neighbour (a stripe). `icons` pads every mask.
 - Drags (scrollbars, the column edge) follow the mouse through window-level listeners

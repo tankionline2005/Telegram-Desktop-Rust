@@ -481,6 +481,8 @@ pub struct PeerInfo {
     pub photo: Option<(i64, i32)>,
     pub verified: bool,
     pub first_name: Option<String>,
+    /// A user in the contacts.
+    pub contact: bool,
     /// A basic group upgraded to a supergroup (`migrated_to`): tdesktop leaves it out
     /// of the chat list (`History::shouldBeInChatList`), the supergroup goes on.
     pub migrated: bool,
@@ -517,6 +519,7 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
                 },
                 verified: u.verified,
                 first_name: u.first_name.clone(),
+                contact: u.contact,
                 migrated: false,
             },
             _ => PeerInfo::default(),

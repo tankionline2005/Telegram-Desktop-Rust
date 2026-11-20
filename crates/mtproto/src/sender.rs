@@ -32,6 +32,8 @@ pub enum Event {
     Update(Bytes),
     /// The server started a new session: updates may have been missed.
     NewSession,
+    /// The connection dropped; a new one is being made.
+    ConnectionLost,
     /// The connection dropped and was re-established.
     Reconnected,
 }
@@ -98,11 +100,21 @@ pub struct Connected {
 }
 
 const PING_INTERVAL: Duration = Duration::from_secs(30);
+// tdesktop's `session_private.cpp`: a connection round may take `kMinConnectedTimeout`,
+// doubled after each timeout up to `kMaxConnectedTimeout`; a sent request must get
+// something back within `kMinReceiveTimeout`, doubled after each such failure up to
+// `kMaxReceiveTimeout` (and brought down again by fast answers).
+const MIN_CONNECTED: Duration = Duration::from_secs(1);
+const MAX_CONNECTED: Duration = Duration::from_secs(8);
+const MIN_RECEIVE: Duration = Duration::from_secs(4);
+const MAX_RECEIVE: Duration = Duration::from_secs(64);
 /// The server closes the connection if it hears nothing for this long.
 const PING_DISCONNECT_DELAY: i32 = 75;
 /// No frame for this long (pings are answered) means the socket is dead.
 const READ_TIMEOUT: Duration = Duration::from_secs(45);
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// A round where every address failed at once is retried after 1, 2, 3 ms, then 1 s
+/// doubling (`retryByTimer`) up to this (tdesktop: 64 s).
+const MAX_RETRY: Duration = Duration::from_secs(8);
 
 fn unix_now() -> i64 {
     SystemTime::now()
@@ -112,8 +124,104 @@ fn unix_now() -> i64 {
 }
 
 struct Endpoint {
-    addr: String,
+    /// Every known address of the DC: all are tried at once.
+    addrs: Vec<String>,
     transport_dc: i16,
+}
+
+/// The adaptive waits of one sender, kept across its reconnects.
+struct Timing {
+    connect: Duration,
+    receive: Duration,
+}
+
+impl Timing {
+    fn new() -> Self {
+        Self {
+            connect: MIN_CONNECTED,
+            receive: MIN_RECEIVE,
+        }
+    }
+}
+
+fn timed_out(e: &Error) -> bool {
+    matches!(e, Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut)
+}
+
+/// Connects to the first of `addrs` that answers a fake `req_pq_multi`: all of them at
+/// once, like tdesktop's test connections (`SessionPrivate::connectToServer`).
+async fn connect_fastest(
+    addrs: &[String],
+    dc: i16,
+    wait: Duration,
+) -> Result<(transport::Reader, transport::Writer), Error> {
+    let mut set = tokio::task::JoinSet::new();
+    for addr in addrs {
+        let addr = addr.clone();
+        set.spawn(async move {
+            let started = std::time::Instant::now();
+            let (mut r, mut w) = transport::connect(&addr, dc).await?;
+            handshake::probe(&mut r, &mut w).await?;
+            debug!(addr, elapsed = ?started.elapsed(), "connected");
+            Ok::<_, Error>((r, w))
+        });
+    }
+    let race = async {
+        let mut last = None;
+        while let Some(done) = set.join_next().await {
+            match done {
+                Ok(Ok(c)) => return Ok(c),
+                Ok(Err(e)) => last = Some(e),
+                Err(_) => {}
+            }
+        }
+        Err(last.unwrap_or(Error::Disconnected))
+    };
+    // The losers are aborted when `set` is dropped.
+    match tokio::time::timeout(wait, race).await {
+        Ok(result) => result,
+        Err(_) => Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("no address answered in {wait:?}"),
+        ))),
+    }
+}
+
+/// Connects, trying again until it works or `stop` says to give up: a round that timed
+/// out is retried at once with a longer wait (`waitConnectedFailed`), one where every
+/// address failed after a growing pause (`retryByTimer`).
+async fn establish(
+    endpoint: &Endpoint,
+    timing: &mut Timing,
+    stop: impl Fn() -> bool,
+) -> Option<(transport::Reader, transport::Writer)> {
+    let mut retry = Duration::ZERO;
+    loop {
+        if stop() {
+            return None;
+        }
+        match connect_fastest(&endpoint.addrs, endpoint.transport_dc, timing.connect).await {
+            Ok(c) => {
+                timing.connect = MIN_CONNECTED;
+                return Some(c);
+            }
+            Err(e) if timed_out(&e) => {
+                debug!("connect: {e}");
+                timing.connect = (timing.connect * 2).min(MAX_CONNECTED);
+            }
+            Err(e) => {
+                retry = if retry < Duration::from_millis(3) {
+                    retry + Duration::from_millis(1)
+                } else if retry < Duration::from_secs(1) {
+                    Duration::from_secs(1)
+                } else {
+                    (retry * 2).min(MAX_RETRY)
+                };
+                debug!("connect failed: {e}; retry in {retry:?}");
+                tokio::time::sleep(retry).await;
+            }
+        }
+    }
 }
 
 struct Connection {
@@ -141,7 +249,7 @@ impl Sender {
     /// `dc_id` is the plain DC number (negative for media-only DCs); the test
     /// environment offset is applied here.
     pub async fn connect(
-        addr: &str,
+        addrs: &[String],
         dc_id: i32,
         key: KeySpec,
         test: bool,
@@ -152,10 +260,13 @@ impl Sender {
             dc_id
         };
         let endpoint = Endpoint {
-            addr: addr.to_string(),
+            addrs: addrs.to_vec(),
             transport_dc: full_dc as i16,
         };
-        let (mut reader, mut writer) = transport::connect(addr, endpoint.transport_dc).await?;
+        let mut timing = Timing::new();
+        let (mut reader, mut writer) = establish(&endpoint, &mut timing, || false)
+            .await
+            .ok_or(Error::Disconnected)?;
 
         let (auth_key, time_offset, salt, bind) = match key {
             KeySpec::Existing {
@@ -199,6 +310,7 @@ impl Sender {
         tokio::spawn(run(
             session,
             endpoint,
+            timing,
             conn,
             rx,
             events_tx,
@@ -287,6 +399,7 @@ enum Ended {
 async fn run(
     mut session: Session,
     endpoint: Endpoint,
+    mut timing: Timing,
     mut conn: Connection,
     mut requests: mpsc::UnboundedReceiver<Request>,
     events: mpsc::UnboundedSender<Event>,
@@ -300,6 +413,7 @@ async fn run(
     loop {
         let ended = serve(
             &mut session,
+            &mut timing,
             &mut conn,
             &mut requests,
             &events,
@@ -319,6 +433,7 @@ async fn run(
             }
             Ended::Broken(why) => {
                 info!("connection lost: {why}; reconnecting");
+                let _ = events.send(Event::ConnectionLost);
                 // Unanswered requests go first, keeping their ids while still valid.
                 let mut resend: Vec<Request> = pending.drain().map(|(_, r)| r).collect();
                 resend.sort_by_key(|r| r.sent.map(|s| s.0));
@@ -332,24 +447,13 @@ async fn run(
                 resend.append(&mut queue);
                 queue = resend;
 
-                let mut backoff = Duration::from_millis(250);
-                conn = loop {
-                    if requests.is_closed() && queue.iter().all(|r| r.reply.is_none()) {
-                        return;
-                    }
-                    match transport::connect(&endpoint.addr, endpoint.transport_dc).await {
-                        Ok((reader, writer)) => {
-                            break Connection {
-                                writer,
-                                frames: spawn_reader(reader),
-                            };
-                        }
-                        Err(e) => {
-                            debug!("reconnect failed: {e}; retry in {backoff:?}");
-                            tokio::time::sleep(backoff).await;
-                            backoff = (backoff * 2).min(MAX_BACKOFF);
-                        }
-                    }
+                let stop = || requests.is_closed() && queue.iter().all(|r| r.reply.is_none());
+                let Some((reader, writer)) = establish(&endpoint, &mut timing, stop).await else {
+                    return;
+                };
+                conn = Connection {
+                    writer,
+                    frames: spawn_reader(reader),
                 };
                 let _ = events.send(Event::Reconnected);
             }
@@ -358,8 +462,10 @@ async fn run(
 }
 
 /// Serves one connection until it ends.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     session: &mut Session,
+    timing: &mut Timing,
     conn: &mut Connection,
     requests: &mut mpsc::UnboundedReceiver<Request>,
     events: &mpsc::UnboundedSender<Event>,
@@ -370,12 +476,27 @@ async fn serve(
     let mut ping = tokio::time::interval(PING_INTERVAL);
     let mut ping_id = 0i64;
     let mut deadline = Instant::now() + READ_TIMEOUT;
+    // Something sent waits for an answer until then (`onSentSome`); when the first of
+    // them went out.
+    let mut answer_by: Option<Instant> = None;
+    let mut first_sent: Option<Instant> = None;
 
     loop {
         // Flush the queue (and acks) in as few frames as possible.
-        if let Err(e) = flush(session, conn, pending, queue).await {
-            return Ended::Broken(e.to_string());
+        match flush(session, conn, pending, queue).await {
+            Ok(0) => {}
+            Ok(size) => {
+                let now = Instant::now();
+                if answer_by.is_none() {
+                    // 8 KB/s: a big request may take longer.
+                    let by_size = timing.receive.mul_f64(size as f64 / 8192.);
+                    answer_by = Some(now + by_size.clamp(timing.receive, MAX_RECEIVE));
+                }
+                first_sent.get_or_insert(now);
+            }
+            Err(e) => return Ended::Broken(e.to_string()),
         }
+        let answer_deadline = answer_by.unwrap_or(deadline);
 
         tokio::select! {
             req = requests.recv() => match req {
@@ -409,6 +530,14 @@ async fn serve(
                     None => return Ended::Dropped,
                 };
                 deadline = Instant::now() + READ_TIMEOUT;
+                // `onReceivedSome`: a fast answer shortens the wait again.
+                answer_by = None;
+                if let Some(sent) = first_sent.take() {
+                    let took = sent.elapsed();
+                    if took * 2 < timing.receive {
+                        timing.receive = (took * 2).max(MIN_RECEIVE);
+                    }
+                }
                 let incoming = match session.unpack(&frame) {
                     Ok(e) => e,
                     Err(e) => { warn!("dropping bad frame: {e}"); continue; }
@@ -420,6 +549,12 @@ async fn serve(
             }
             _ = tokio::time::sleep_until(deadline) => {
                 return Ended::Broken("no data from server".into());
+            }
+            _ = tokio::time::sleep_until(answer_deadline), if answer_by.is_some() => {
+                // `waitReceivedFailed`: a new connection, and more patience next time.
+                let waited = timing.receive;
+                timing.receive = (timing.receive * 2).min(MAX_RECEIVE);
+                return Ended::Broken(format!("no answer in {waited:?}"));
             }
             _ = ping.tick() => {
                 ping_id += 1;
@@ -475,12 +610,14 @@ fn handle(
     }
 }
 
+/// Sends what is queued; returns the size of the requests sent (acks alone count 0).
 async fn flush(
     session: &mut Session,
     conn: &mut Connection,
     pending: &mut HashMap<i64, Request>,
     queue: &mut Vec<Request>,
-) -> std::io::Result<()> {
+) -> std::io::Result<usize> {
+    let mut sent = 0;
     // A bind request must travel alone (its inner message repeats the outer msg_id).
     while let Some(pos) = queue
         .iter()
@@ -493,6 +630,7 @@ async fn flush(
         let (frame, msg_id) = session.pack_bind(perm, *expires_at);
         r.sent = Some((msg_id, 0));
         pending.insert(msg_id, r);
+        sent += frame.len();
         conn.writer.send(&frame).await?;
     }
     while !queue.is_empty() || session.has_pending_acks() {
@@ -509,11 +647,15 @@ async fn flush(
         // Requests that did not fit stay in the queue for the next frame.
         let rest = queue.split_off(ids.len());
         let packed = std::mem::replace(queue, rest);
+        let requests = !packed.is_empty();
         for (id, mut r) in ids.into_iter().zip(packed) {
             r.sent = Some(id);
             pending.insert(id.0, r);
         }
+        if requests {
+            sent += frame.len();
+        }
         conn.writer.send(&frame).await?;
     }
-    Ok(())
+    Ok(sent)
 }

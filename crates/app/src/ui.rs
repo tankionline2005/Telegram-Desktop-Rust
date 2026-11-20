@@ -21,7 +21,7 @@ use tdr_data::tdr_storage::PeerKey;
 use tdr_theme::{Color, Palette};
 use tokio::sync::mpsc;
 
-use crate::bridge::{Command, DialogItem, MessageItem, Update};
+use crate::bridge::{Command, DialogItem, FolderItem, MessageItem, Update};
 use crate::icons::{Icon, icon, icon_width};
 use crate::one_line::one_line;
 use crate::placement::{COLUMN_MIN_LEFT, Columns};
@@ -29,6 +29,7 @@ use crate::present;
 use crate::scale::{self, dpx, lg, px};
 use crate::text_input::{FieldMenu, Submit, TagSpan, TextInput};
 
+mod chrome;
 mod menus;
 mod message_text;
 
@@ -749,7 +750,18 @@ pub struct MainView {
     /// The floating date's opacity (`_scrollDateOpacity`).
     scroll_date: Fade,
     input: Entity<TextInput>,
-    status: String,
+    /// The chat search field over the chat list.
+    search: Entity<TextInput>,
+    /// The folder column (empty: the account has no folders) and the open folder.
+    folders: Vec<FolderItem>,
+    active_folder: i32,
+    /// The home DC's connection and the "Connecting..." box.
+    connection: chrome::Connection,
+    /// The icon button under the mouse, and press ripples of buttons.
+    button_hovered: Option<SharedString>,
+    button_ripples: Vec<chrome::ButtonRipple>,
+    /// What the send button shows (send: the field has text) and since when.
+    send_switch: (bool, Instant),
     fatal: Option<String>,
     commands: mpsc::UnboundedSender<Command>,
     focus: FocusHandle,
@@ -771,6 +783,12 @@ impl MainView {
     ) -> Self {
         let palette = tdr_theme::palette(dark);
         let input = cx.new(|cx| TextInput::new("Write a message…", palette, cx));
+        let search = cx.new(|cx| {
+            let mut field = TextInput::new("Search", palette, cx);
+            field.set_single_line(true);
+            field
+        });
+        cx.observe(&search, |_, _, cx| cx.notify()).detach();
         cx.observe(&input, |this: &mut Self, _, cx| this.input_changed(cx))
             .detach();
         cx.subscribe(&input, |this: &mut Self, _, FieldMenu(at), cx| {
@@ -892,7 +910,13 @@ impl MainView {
             to_up_shown: Fade::new(0., TO_DOWN_DURATION),
             scroll_date: Fade::new(0., SCROLL_DATE_FADE),
             input,
-            status: String::new(),
+            search,
+            folders: Vec::new(),
+            active_folder: 0,
+            connection: chrome::Connection::new(),
+            button_hovered: None,
+            button_ripples: Vec::new(),
+            send_switch: (false, Instant::now() - Duration::from_secs(1)),
             fatal: None,
             commands,
             focus: cx.focus_handle(),
@@ -1136,10 +1160,19 @@ impl MainView {
     }
 
     /// The chat list's width in this window.
+    /// The folder column's width (0 without folders).
+    fn filters_width(&self) -> f32 {
+        if self.folders.is_empty() {
+            0.
+        } else {
+            lg(chrome::FILTERS_WIDTH)
+        }
+    }
+
     fn dialogs_width(&self, window: &Window) -> f32 {
         self.columns.width(
             self.selected.is_none(),
-            f32::from(window.viewport_size().width),
+            f32::from(window.viewport_size().width) - self.filters_width(),
         )
     }
 
@@ -1150,7 +1183,7 @@ impl MainView {
 
     /// The open chat's width.
     fn chat_width(&self, window: &Window) -> f32 {
-        f32::from(window.viewport_size().width) - self.dialogs_width(window)
+        f32::from(window.viewport_size().width) - self.filters_width() - self.dialogs_width(window)
     }
 
     fn dragging(&self) -> bool {
@@ -1508,6 +1541,14 @@ impl MainView {
     fn apply(&mut self, update: Update, cx: &mut Context<Self>) {
         match update {
             Update::Dialogs(mut list) => {
+                // The open chat stays open when the list no longer has it (another
+                // folder is shown): its header data is kept aside.
+                if let Some(peer) = self.selected
+                    && !list.iter().any(|d| d.peer == peer)
+                    && let Some(item) = self.dialogs.iter().find(|d| d.peer == peer)
+                {
+                    self.extra_chats.insert(peer, item.clone());
+                }
                 if let Some((order, at)) = &self.pinned_override {
                     let current: Vec<PeerKey> = list
                         .iter()
@@ -1595,7 +1636,13 @@ impl MainView {
             } => {
                 self.userpics.insert(peer, (photo_id, image));
             }
-            Update::Status(s) => self.status = s,
+            Update::Connected(connected) => self.set_connected(connected, cx),
+            Update::Folders(list) => {
+                if !list.iter().any(|f| f.id == self.active_folder) {
+                    self.active_folder = 0;
+                }
+                self.folders = list;
+            }
             Update::Toast(text) => self.show_toast(&text, None),
             Update::PhoneResolved { phone, user } => self.phone_resolved(&phone, user),
             Update::BankCard { number, data } => self.bank_card_resolved(&number, data),
@@ -1868,6 +1915,7 @@ impl MainView {
         const SAVE_DRAFT_ANYWAY: Duration = Duration::from_secs(5); // kSaveDraftAnywayTimeout
         const SAVE_CLOUD_DRAFT_IDLE: Duration = Duration::from_secs(14); // kSaveCloudDraftIdleTimeout
         let text = self.input.read(cx).text();
+        self.update_send_state(!text.is_empty());
         if text == self.input_text {
             return;
         }
@@ -1977,6 +2025,8 @@ impl MainView {
         self.dark = !self.dark;
         let palette = self.palette();
         self.input
+            .update(cx, |input, cx| input.set_palette(palette, cx));
+        self.search
             .update(cx, |input, cx| input.set_palette(palette, cx));
         cx.notify();
     }
@@ -3315,7 +3365,7 @@ impl MainView {
             .min_h(px(46.))
             .flex()
             .items_center()
-            .pl(px(16.))
+            .pl(px(chrome::COMPOSE_BUTTON_WIDTH))
             .bg(c(p.history_compose_area_bg))
             .border_t_1()
             .border_color(border)
@@ -3590,6 +3640,7 @@ impl MainView {
                         d.child(div().text_color(c(status_fg)).child(one_line(status)))
                     }),
             )
+            .child(self.render_top_bar_buttons(chat, window, cx))
     }
 }
 
@@ -3622,6 +3673,7 @@ impl Render for MainView {
         if self.tick_code_hint() | self.tick_ripple() {
             window.request_animation_frame();
         }
+        self.tick_chrome(window);
         if self
             .text_ui
             .toast
@@ -3694,44 +3746,7 @@ impl Render for MainView {
         let dialogs_width = self.dialogs_width(window);
         let narrow = self.narrow(window);
 
-        let top_bar = div()
-            .h(px(TOP_BAR_HEIGHT))
-            .flex_none()
-            .flex()
-            .items_center()
-            // Narrow: the menu button alone, centered over the userpics.
-            .px(px(if narrow {
-                (dialogs_width - 40.) / 2.
-            } else {
-                8.
-            }))
-            .gap(px(8.))
-            .border_b_1()
-            .border_color(border)
-            .child(
-                div()
-                    .id("main-menu-toggle")
-                    .size(px(40.))
-                    .rounded_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(c(p.window_bg_over)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.main_menu_open = !this.main_menu_open;
-                        cx.notify();
-                    }))
-                    .child(icon(Icon::DialogsMenu, p.dialogs_menu_icon_fg, window)),
-            )
-            .when(!narrow, |d| {
-                d.child(
-                    div()
-                        .flex_1()
-                        .text_color(c(p.window_sub_text_fg))
-                        .child(self.status.clone()),
-                )
-            });
+        let top_bar = self.render_dialogs_header(dialogs_width, narrow, window, cx);
 
         let dialogs = uniform_list(
             "dialogs",
@@ -3838,7 +3853,8 @@ impl Render for MainView {
             .child(dialogs)
             .children(floating_row)
             .children(self.render_scrollbar(Area::Dialogs, cx))
-            .children(to_up);
+            .children(to_up)
+            .children(self.render_connecting(window, cx));
 
         let left = div()
             .w(px(dialogs_width))
@@ -3939,16 +3955,19 @@ impl Render for MainView {
                     .children(floating_date)
                     .children(scrollbar)
                     .children(to_down);
+                let has_text = !self.input.read(cx).is_empty();
+                let field_extras = self.render_field_extras(self.chat_width(window), window, cx);
                 let composer = div()
+                    .relative()
                     .flex_none()
                     .min_h(px(46.))
                     .flex()
                     .items_end()
-                    .pl(px(16.))
                     .bg(c(p.history_compose_area_bg))
                     .text_color(c(p.history_compose_area_fg))
                     .border_t_1()
                     .border_color(border)
+                    .child(self.render_attach(window, cx))
                     .child(
                         div()
                             .id("composer-field")
@@ -3987,23 +4006,9 @@ impl Render for MainView {
                             )
                             .child(self.input.clone()),
                     )
-                    .child(
-                        div()
-                            .id("send")
-                            .flex_none()
-                            .w(px(44.))
-                            .h(px(46.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let focus = this.input.focus_handle(cx);
-                                window.focus(&focus);
-                                window.dispatch_action(Box::new(crate::text_input::Enter), cx);
-                            }))
-                            .child(icon(Icon::Send, p.history_send_icon_fg, window)),
-                    );
+                    .child(self.render_emoji(window, cx))
+                    .child(self.render_send(has_text, window, cx))
+                    .children(field_extras);
                 let live = div()
                     .flex_1()
                     .min_w(px(0.))
@@ -4043,6 +4048,7 @@ impl Render for MainView {
                     .min_h(px(0.))
                     .flex()
                     .track_focus(&self.focus)
+                    .children(self.render_folders(window, cx))
                     .child(left)
                     .child(right)
                     // The column edge (`_firstColumnResizeArea`): at the chat's left side.
@@ -4051,7 +4057,7 @@ impl Render for MainView {
                             .id("column-resize")
                             .absolute()
                             .top_0()
-                            .left(px(dialogs_width))
+                            .left(px(dialogs_width + self.filters_width()))
                             .w(px(RESIZE_WIDTH))
                             .h_full()
                             .cursor(gpui::CursorStyle::ResizeLeftRight)

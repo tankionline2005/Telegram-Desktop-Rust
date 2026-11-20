@@ -119,6 +119,7 @@ async fn main() -> Result<()> {
         ["probe", "relist", id] => probe_keep(id.parse().context("user id")?, false).await,
         ["probe", "entities"] => probe_entities(),
         ["probe", "bank-card", number] => probe_bank_card(number).await,
+        ["probe", "folders"] => probe_folders().await,
         ["logout"] => logout().await,
         ["selftest", "reconnect"] => selftest_reconnect().await,
         ["selftest", "unknown-key"] => selftest_unknown_key().await,
@@ -684,6 +685,63 @@ async fn probe_bank_card(number: &str) -> Result<()> {
                 println!("{n:?}: title {:?}, {} links", d.title, d.open_urls.len())
             }
             Err(e) => println!("{n:?}: error {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// The account's folders: per folder its icon, rule sizes and how many cached chats
+/// it holds (no titles, no chat names).
+async fn probe_folders() -> Result<()> {
+    use tdr_data::describe::PeerKind as K;
+    use tdr_data::filters::{ChatTraits, FilterEntry};
+    let client = logged_in()?;
+    let mut sync = Sync::new(client.clone(), open_cache()?)?;
+    let list = sync.dialog_filters().await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    let store = sync.store();
+    let mut chats: Vec<ChatTraits> = Vec::new();
+    for folder in [0, 1] {
+        for d in store.dialogs(folder, 100_000)? {
+            let info = d
+                .peer
+                .as_ref()
+                .map(tdr_data::describe::peer_info)
+                .unwrap_or_default();
+            let kind = match d.dialog.peer.kind {
+                tdr_data::tdr_storage::PeerKind::Chat => K::Group,
+                _ => info.kind,
+            };
+            chats.push(ChatTraits {
+                peer: d.dialog.peer,
+                kind,
+                contact: info.contact,
+                muted: d.dialog.mute_until.is_some_and(|m| i64::from(m) > now),
+                unread: d.dialog.unread_count > 0,
+                archived: d.dialog.folder_id == 1,
+            });
+        }
+    }
+    println!(
+        "{} cached chats; unread (all chats): {:?}",
+        chats.len(),
+        tdr_data::filters::unread_badge(chats.iter(), None)
+    );
+    for (i, entry) in list.iter().enumerate() {
+        match entry {
+            FilterEntry::All => println!("{i}: All chats"),
+            FilterEntry::Folder(f) => println!(
+                "{i}: folder id {}, icon {:?}, pinned {}, included {}, excluded {}, holds {} chats, badge {:?}",
+                f.id,
+                f.icon(),
+                f.pinned.len(),
+                f.include.len(),
+                f.exclude.len(),
+                chats.iter().filter(|c| f.contains(c)).count(),
+                tdr_data::filters::unread_badge(chats.iter(), Some(f)),
+            ),
         }
     }
     Ok(())

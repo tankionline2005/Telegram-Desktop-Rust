@@ -13,6 +13,7 @@ use tdr_data::tdr_storage::{FileCache, FileCacheConfig};
 
 use chrono::Local;
 use tdr_api::{Client, Config, SessionData};
+use tdr_data::filters::{self, ChatFilter, ChatTraits, FilterEntry, FilterIcon};
 use tdr_data::tdr_storage::{DialogView, MessageRow, PeerKey, PeerKind, Storage};
 use tdr_data::{Applied, Sync};
 use tokio::sync::mpsc;
@@ -33,6 +34,8 @@ pub enum Command {
     ReorderPinned(Vec<PeerKey>),
     /// The chat view was closed (Esc).
     CloseChat,
+    /// Show the chats of this folder (0: all chats).
+    SelectFolder(i32),
     /// The user scrolled to the top of the open chat: load older messages.
     LoadOlder(PeerKey),
     /// Open a chat on top of the open one (the "go to original" button, a mention,
@@ -112,8 +115,10 @@ pub enum Update {
     },
     /// An opened chat's header data, for chats not in the loaded chat list.
     ChatInfo(Box<DialogItem>),
-    /// Connection state for the header ("Connecting…"), empty when online.
-    Status(String),
+    /// Whether the home DC is connected (`false`: "Connecting...").
+    Connected(bool),
+    /// The folders for the column on the left; empty: no folders (no column).
+    Folders(Vec<FolderItem>),
     /// A username resolved: open this chat (at this message).
     Resolved {
         peer: PeerKey,
@@ -169,6 +174,89 @@ impl DialogItem {
     pub fn is_group(&self) -> bool {
         self.kind == ChatKind::Group
     }
+}
+
+/// A folder in the column on the left (`Window::FiltersMenu`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FolderItem {
+    /// 0: "All chats".
+    pub id: i32,
+    pub title: String,
+    pub icon: FilterIcon,
+    /// Unread chats, and whether all of them are muted (a grey badge).
+    pub badge: Option<(u32, bool)>,
+}
+
+/// The folders and the one the chat list shows.
+struct Folders {
+    entries: Vec<FilterEntry>,
+    active: i32,
+    /// What the column was last sent (sent again only when it changes).
+    sent: Option<Vec<FolderItem>>,
+}
+
+impl Folders {
+    fn new(entries: Vec<FilterEntry>) -> Self {
+        Self {
+            entries,
+            active: 0,
+            sent: None,
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|e| matches!(e, FilterEntry::Folder(_)))
+    }
+
+    fn filter(&self, id: i32) -> Option<&ChatFilter> {
+        self.entries.iter().find_map(|e| match e {
+            FilterEntry::Folder(f) if f.id == id => Some(f),
+            _ => None,
+        })
+    }
+
+    fn set(&mut self, entries: Vec<FilterEntry>) {
+        self.entries = entries;
+        if self.filter(self.active).is_none() {
+            self.active = 0;
+        }
+    }
+}
+
+/// What a folder needs to know about a cached chat.
+fn chat_traits(d: &DialogView, ctx: &Context) -> ChatTraits {
+    let info = d.peer.as_ref().map(describe::peer_info).unwrap_or_default();
+    let kind = match d.dialog.peer.kind {
+        PeerKind::Chat => ChatKind::Group,
+        _ => info.kind,
+    };
+    ChatTraits {
+        peer: d.dialog.peer,
+        kind,
+        contact: info.contact,
+        muted: muted(d, kind, ctx),
+        unread: d.dialog.unread_count > 0,
+        archived: d.dialog.folder_id == 1,
+    }
+}
+
+/// Notifications of the chat are off (its own setting, else the default of its kind).
+fn muted(d: &DialogView, kind: ChatKind, ctx: &Context) -> bool {
+    let default_mute = match kind {
+        ChatKind::User | ChatKind::Bot => ctx.mute_users,
+        ChatKind::Group => ctx.mute_chats,
+        ChatKind::Channel => ctx.mute_broadcasts,
+    };
+    d.dialog.mute_until.map_or(default_mute, i64::from) > ctx.now
+}
+
+/// The time a chat is sorted by (`adjustedChatListTimeId`: a draft lifts it).
+fn list_time(d: &DialogView) -> i32 {
+    d.dialog
+        .top_date
+        .max(d.draft.as_ref().map_or(0, |(_, date)| *date))
 }
 
 /// The second line of a chat-list row: "Sender: " and a media caption or service text
@@ -487,13 +575,7 @@ fn dialog_item(store: &Storage, d: &DialogView, ctx: &Context) -> DialogItem {
         .as_ref()
         .filter(|m| m.out && !is_saved && !is_channel)
         .map(|m| m.id <= d.dialog.read_outbox_max_id);
-    let default_mute = match kind {
-        ChatKind::User | ChatKind::Bot => ctx.mute_users,
-        ChatKind::Group => ctx.mute_chats,
-        ChatKind::Channel => ctx.mute_broadcasts,
-    };
-    let mute_until = d.dialog.mute_until.map_or(default_mute, i64::from);
-    let muted = mute_until > ctx.now;
+    let muted = muted(d, kind, ctx);
     let now = Local::now();
     let status = if is_saved {
         String::new()
@@ -918,23 +1000,88 @@ pub fn start(
     (cmd_tx, up_rx)
 }
 
+/// Every cached chat, the main list and the archive (what folders pick from).
+const ALL_DIALOGS: usize = 100_000;
+
 fn send_dialogs(
     store: &Storage,
     shown: usize,
+    folders: &mut Folders,
     tx: &mpsc::UnboundedSender<Update>,
 ) -> anyhow::Result<()> {
-    let list = store.dialogs(0, shown)?;
     let ctx = Context::load(store);
-    let items = list
-        .iter()
-        .filter(|d| {
-            !d.peer
-                .as_ref()
-                .is_some_and(|p| describe::peer_info(p).migrated)
-        })
-        .map(|d| dialog_item(store, d, &ctx))
-        .collect();
+    let listed = |d: &DialogView| {
+        !d.peer
+            .as_ref()
+            .is_some_and(|p| describe::peer_info(p).migrated)
+    };
+    // Folders pick from every chat: their badges, and the open folder's list.
+    let everything: Vec<DialogView> = if folders.any() {
+        let mut all = store.dialogs(0, ALL_DIALOGS)?;
+        all.extend(store.dialogs(1, ALL_DIALOGS)?);
+        all.retain(listed);
+        all
+    } else {
+        Vec::new()
+    };
+    let traits: Vec<ChatTraits> = everything.iter().map(|d| chat_traits(d, &ctx)).collect();
+    let items: Vec<DialogItem> = match folders.filter(folders.active) {
+        None => store
+            .dialogs(0, shown)?
+            .iter()
+            .filter(|d| listed(d))
+            .map(|d| dialog_item(store, d, &ctx))
+            .collect(),
+        Some(filter) => {
+            // The folder's pinned chats first, in its order, then by time
+            // (`Dialogs::MainList` of the filter).
+            let mut picked: Vec<(usize, &DialogView)> = everything
+                .iter()
+                .zip(&traits)
+                .filter(|(_, t)| filter.contains(t))
+                .map(|(d, _)| {
+                    let pin = filter.pinned.iter().position(|p| *p == d.dialog.peer);
+                    (pin.unwrap_or(usize::MAX), d)
+                })
+                .collect();
+            picked.sort_by(|a, b| a.0.cmp(&b.0).then(list_time(b.1).cmp(&list_time(a.1))));
+            picked
+                .into_iter()
+                .map(|(pin, d)| DialogItem {
+                    pinned: pin != usize::MAX,
+                    ..dialog_item(store, d, &ctx)
+                })
+                .collect()
+        }
+    };
     let _ = tx.send(Update::Dialogs(items));
+    // The column: "All chats" and the folders, with their unread chats.
+    let column: Vec<FolderItem> = if folders.any() {
+        folders
+            .entries
+            .iter()
+            .map(|e| match e {
+                FilterEntry::All => FolderItem {
+                    id: 0,
+                    title: "All chats".into(),
+                    icon: FilterIcon::All,
+                    badge: filters::unread_badge(traits.iter(), None),
+                },
+                FilterEntry::Folder(f) => FolderItem {
+                    id: f.id,
+                    title: f.title.clone(),
+                    icon: f.icon(),
+                    badge: filters::unread_badge(traits.iter(), Some(f)),
+                },
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if folders.sent.as_ref() != Some(&column) {
+        folders.sent = Some(column.clone());
+        let _ = tx.send(Update::Folders(column));
+    }
     Ok(())
 }
 
@@ -1071,7 +1218,8 @@ async fn run(
     let store = Storage::open(&paths.cache)?;
     // How many chats the list shows (grows as it is scrolled down).
     let mut shown_dialogs = DIALOGS;
-    send_dialogs(&store, shown_dialogs, &tx)?;
+    let mut folders = Folders::new(tdr_data::cached_dialog_filters(&store).unwrap_or_default());
+    send_dialogs(&store, shown_dialogs, &mut folders, &tx)?;
     info!(elapsed = ?crate::STARTED.elapsed(), "data: cached chat list sent");
 
     let session = match std::fs::read(&paths.session) {
@@ -1100,20 +1248,44 @@ async fn run(
         }
     };
 
+    // The "Connecting..." state follows the home DC's connection.
+    {
+        let mut connected = client.connected();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            loop {
+                let now = *connected.borrow_and_update();
+                if tx.send(Update::Connected(now)).is_err() || connected.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     // 2. Catch up with the server.
-    let _ = tx.send(Update::Status("Updating…".into()));
     let mut sync = Sync::new(client.clone(), store)?;
     let started = std::time::Instant::now();
     let applied = sync.start().await?;
     sync_clock(&client);
     info!(elapsed = ?started.elapsed(), "synced");
     save(&client);
-    send_dialogs(sync.store(), shown_dialogs, &tx)?;
+    send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
     send_draft_changes(&applied, &tx);
-    let _ = tx.send(Update::Status(String::new()));
+    // The folders, and more addresses of the DCs for the next connections.
+    match sync.dialog_filters().await {
+        Ok(list) => {
+            folders.set(list);
+            send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
+        }
+        Err(e) => error!("folders: {e}"),
+    }
+    if let Err(e) = client.refresh_dc_options().await {
+        error!("config: {e}");
+    }
+    save(&client);
     // The shown part of the cached list may be stale below what the start refreshed.
     if confirm_dialogs(&mut sync, shown_dialogs).await {
-        send_dialogs(sync.store(), shown_dialogs, &tx)?;
+        send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
     }
     // When to save drafts to the cloud. Drafts left unsaved last time (the app quit
     // first) go up right away.
@@ -1144,18 +1316,25 @@ async fn run(
                     cmd => (cmd, false),
                 };
                 match cmd {
+                    Command::SelectFolder(id) => {
+                        folders.active = id;
+                        if folders.filter(id).is_none() {
+                            folders.active = 0;
+                        }
+                        send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
+                    }
                     Command::LoadMoreDialogs => {
                         shown_dialogs += DIALOGS_STEP;
-                        send_dialogs(sync.store(), shown_dialogs, &tx)?;
+                        send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
                         if confirm_dialogs(&mut sync, shown_dialogs).await {
-                            send_dialogs(sync.store(), shown_dialogs, &tx)?;
+                            send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
                         }
                     }
                     Command::ReorderPinned(order) => {
                         if let Err(e) = sync.reorder_pinned(order).await {
                             error!("pinned order: {e}");
                         }
-                        send_dialogs(sync.store(), shown_dialogs, &tx)?;
+                        send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
                     }
                     Command::OpenChat(peer) => {
                         back.clear();
@@ -1184,7 +1363,7 @@ async fn run(
                         if let Err(e) = sync.refresh_user(peer).await {
                             error!("user: {e}");
                         }
-                        send_dialogs(sync.store(), shown_dialogs, &tx)?;
+                        send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
                         // Supergroups and channels: the member count is in the full info.
                         match sync.member_count(peer).await {
                             Ok(Some(n)) => {
@@ -1196,7 +1375,7 @@ async fn run(
                         }
                     }
                     Command::Read { peer, max_id } => match sync.read_history(peer, max_id).await {
-                        Ok(_) => send_dialogs(sync.store(), shown_dialogs, &tx)?,
+                        Ok(_) => send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?,
                         Err(e) => error!("read: {e}"),
                     },
                     // Not in the file cache (the userpic thread looked): download.
@@ -1227,7 +1406,7 @@ async fn run(
                     }
                     Command::SaveDraft { peer, text, cloud } => {
                         if sync.set_draft(peer, &text)? {
-                            send_dialogs(sync.store(), shown_dialogs, &tx)?;
+                            send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
                         }
                         if cloud && sync.has_unsaved_drafts() && cloud_save_at.is_none() {
                             cloud_save_at = Some(tokio::time::Instant::now() + SAVE_CLOUD_DRAFT_DELAY);
@@ -1367,7 +1546,7 @@ async fn run(
                         if let Err(e) = sync.refresh_user(peer).await {
                             error!("user: {e}");
                         }
-                        send_dialogs(sync.store(), shown_dialogs, &tx)?;
+                        send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
                         match sync.member_count(peer).await {
                             Ok(Some(n)) => {
                                 let text = members_text(sync.store(), peer, n);
@@ -1417,14 +1596,14 @@ async fn run(
                     } => {
                         match sync.send_text(peer, &text, &entities).await {
                             Ok(_) => {
-                                send_dialogs(sync.store(), shown_dialogs, &tx)?;
+                                send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
                                 if open == Some(peer) {
                                     send_history(sync.store(), peer, &shown, None, &tx)?;
                                 }
                             }
                             Err(e) => {
                                 error!("send: {e}");
-                                let _ = tx.send(Update::Status(format!("Not sent: {e}")));
+                                let _ = tx.send(Update::Toast(format!("Not sent: {e}")));
                             }
                         }
                     }
@@ -1450,8 +1629,14 @@ async fn run(
             event = sync.wait_event(Duration::from_secs(5)) => {
                 let applied = sync.process(event).await?;
                 sync_clock(&client);
-                if changed(&applied) {
-                    send_dialogs(sync.store(), shown_dialogs, &tx)?;
+                if applied.filters_changed {
+                    match sync.dialog_filters().await {
+                        Ok(list) => folders.set(list),
+                        Err(e) => error!("folders: {e}"),
+                    }
+                }
+                if changed(&applied) || applied.filters_changed {
+                    send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
                     send_draft_changes(&applied, &tx);
                     if let Some(peer) = open {
                         let touched = applied.new_messages.iter().any(|m| m.peer == peer)
@@ -1733,6 +1918,49 @@ pub fn start_demo() -> (
         });
     }
     let _ = up_tx.send(Update::Dialogs(dialogs.clone()));
+    // `--folders`: the folder column with a few folders.
+    let demo_folders = std::env::args().any(|a| a == "--folders");
+    let folder_of = |id: i32, d: &DialogItem| match id {
+        1 => matches!(d.kind, ChatKind::User | ChatKind::Bot),
+        2 => d.kind == ChatKind::Group,
+        3 => d.kind == ChatKind::Channel,
+        4 => d.unread > 0,
+        5 => matches!(d.peer.id, 2 | 8),
+        _ => true,
+    };
+    let folder_items = move |list: &[DialogItem]| -> Vec<FolderItem> {
+        let folders = [
+            (0, "All chats", FilterIcon::All),
+            (1, "Personal", FilterIcon::Private),
+            (2, "Groups", FilterIcon::Groups),
+            (3, "Channels", FilterIcon::Channels),
+            (4, "Unread", FilterIcon::Unread),
+            (5, "Work", FilterIcon::Work),
+        ];
+        folders
+            .iter()
+            .map(|(id, title, icon)| {
+                let unread: Vec<&DialogItem> = list
+                    .iter()
+                    .filter(|d| d.unread > 0 && folder_of(*id, d))
+                    .collect();
+                FolderItem {
+                    id: *id,
+                    title: title.to_string(),
+                    icon: *icon,
+                    badge: (!unread.is_empty())
+                        .then(|| (unread.len() as u32, unread.iter().all(|d| d.muted))),
+                }
+            })
+            .collect()
+    };
+    if demo_folders {
+        let _ = up_tx.send(Update::Folders(folder_items(&dialogs)));
+    }
+    // `--connecting`: the "Connecting..." box, as if the connection were lost.
+    let _ = up_tx.send(Update::Connected(
+        !std::env::args().any(|a| a == "--connecting"),
+    ));
     std::thread::spawn(move || {
         let text =
             |out: bool, text: &str| (out, Some(text.to_string()), None::<&str>, None::<&str>);
@@ -1822,6 +2050,14 @@ pub fn start_demo() -> (
         let mut focus: Option<(PeerKey, i32)> = None;
         while let Some(cmd) = cmd_rx.blocking_recv() {
             match cmd {
+                Command::SelectFolder(id) => {
+                    let shown: Vec<DialogItem> = dialogs
+                        .iter()
+                        .filter(|d| folder_of(id, d))
+                        .cloned()
+                        .collect();
+                    let _ = up_tx.send(Update::Dialogs(shown));
+                }
                 Command::ReorderPinned(order) => {
                     let rank = |d: &DialogItem| order.iter().position(|p| *p == d.peer);
                     let pinned = dialogs.iter().take_while(|d| d.pinned).count();

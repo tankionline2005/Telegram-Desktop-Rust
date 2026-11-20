@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use tdr_crypto::AuthKey;
 
 const MAGIC: &[u8; 4] = b"TDRS";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 #[derive(Clone, Default)]
 pub struct DcKeys {
@@ -36,6 +36,9 @@ pub struct SessionData {
     /// `server_time - local_time`, seconds.
     pub time_offset: i32,
     pub dcs: BTreeMap<i32, DcKeys>,
+    /// Addresses of the DCs from `help.getConfig` ("ip:port", IPv4, TCP), tried
+    /// together with the built-in ones (tdesktop keeps its `DcOptions` the same way).
+    pub dc_options: BTreeMap<i32, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +107,17 @@ impl SessionData {
                 out.extend_from_slice(&t.salt.to_le_bytes());
             }
         }
+        let options: Vec<(&i32, &String)> = self
+            .dc_options
+            .iter()
+            .flat_map(|(dc, list)| list.iter().map(move |a| (dc, a)))
+            .collect();
+        out.extend_from_slice(&(options.len() as u32).to_le_bytes());
+        for (dc, addr) in options {
+            out.extend_from_slice(&dc.to_le_bytes());
+            out.extend_from_slice(&(addr.len() as u16).to_le_bytes());
+            out.extend_from_slice(addr.as_bytes());
+        }
         out
     }
 
@@ -133,7 +147,7 @@ impl SessionData {
                 );
                 Ok(s)
             }
-            version @ (2 | 3) => {
+            version @ (2..=4) => {
                 let home_dc = c.i32()?;
                 let time_offset = c.i32()?;
                 let count = c.i32()?;
@@ -168,10 +182,21 @@ impl SessionData {
                         },
                     );
                 }
+                let mut dc_options: BTreeMap<i32, Vec<String>> = BTreeMap::new();
+                if version >= 4 {
+                    for _ in 0..c.i32()? {
+                        let dc = c.i32()?;
+                        let len = u16::from_le_bytes(c.take(2)?.try_into().unwrap());
+                        let addr = std::str::from_utf8(c.take(len as usize)?)
+                            .map_err(|_| SessionError("bad address"))?;
+                        dc_options.entry(dc).or_default().push(addr.to_string());
+                    }
+                }
                 Ok(Self {
                     home_dc,
                     time_offset,
                     dcs,
+                    dc_options,
                 })
             }
             _ => Err(SessionError("unsupported version")),
@@ -212,7 +237,13 @@ mod tests {
             },
         );
 
+        s.dc_options.insert(
+            2,
+            vec!["149.154.167.50:443".into(), "149.154.167.51:80".into()],
+        );
+
         let back = SessionData::from_bytes(&s.to_bytes(true)).unwrap();
+        assert_eq!(back.dc_options, s.dc_options);
         assert_eq!(back.home_dc, 2);
         assert_eq!(back.time_offset, -7);
         assert!(back.is_authorized());

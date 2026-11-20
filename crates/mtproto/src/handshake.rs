@@ -26,6 +26,22 @@ fn security(msg: &'static str) -> Error {
     Error::Security(msg)
 }
 
+/// How long a key exchange step may wait for its answer.
+const PLAIN_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A fake `req_pq_multi` that checks that the server answers on a new connection
+/// (tdesktop's `PreparePQFake`: a connection counts as connected only after it).
+pub async fn probe(r: &mut Reader, w: &mut Writer) -> Result<(), Error> {
+    let mut ids = MsgIdGen::new(0);
+    let nonce: [u8; 16] = random_bytes();
+    let enums::ResPQ::ResPQ(res) =
+        plain_call(r, w, &mut ids, &functions::ReqPqMulti { nonce }).await?;
+    if res.nonce != nonce {
+        return Err(security("resPQ nonce mismatch"));
+    }
+    Ok(())
+}
+
 /// Sends an unencrypted request and reads the unencrypted answer.
 async fn plain_call<R: RemoteCall>(
     r: &mut Reader,
@@ -42,7 +58,11 @@ async fn plain_call<R: RemoteCall>(
     msg.extend_from_slice(&body);
     w.send(&msg).await?;
 
-    let frame = r.recv().await?;
+    let frame = tokio::time::timeout(PLAIN_ANSWER_WAIT, r.recv())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "no answer to a plain request")
+        })??;
     if frame.len() < 20 || frame[..8] != [0; 8] {
         return Err(security("expected an unencrypted message"));
     }

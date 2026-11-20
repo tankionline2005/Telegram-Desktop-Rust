@@ -245,6 +245,8 @@ pub struct TextInput {
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     last_edit: Option<EditKind>,
+    /// One line only (the chat search): no line feeds, typed or pasted.
+    single_line: bool,
 }
 
 impl EventEmitter<Submit> for TextInput {}
@@ -408,7 +410,24 @@ impl TextInput {
             undo: Vec::new(),
             redo: Vec::new(),
             last_edit: None,
+            single_line: false,
         }
+    }
+
+    /// The lines the text takes, wrapped (1 when empty).
+    pub fn shown_lines(&self) -> usize {
+        self.layout.as_ref().map_or(1, |l| {
+            (l.height / f32::from(line_height())).round().max(1.) as usize
+        })
+    }
+
+    /// Something besides spaces is typed.
+    pub fn has_text(&self) -> bool {
+        self.content.chars().any(|c| !c.is_whitespace())
+    }
+
+    pub fn set_single_line(&mut self, single: bool) {
+        self.single_line = single;
     }
 
     /// Whether the caret is drawn now: on for the first half of every blink period.
@@ -645,6 +664,10 @@ impl TextInput {
     }
 
     fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
+        // The chat search: Enter opens the first result (search comes later).
+        if self.single_line {
+            return;
+        }
         let trimmed = self.content.trim();
         if trimmed.is_empty() {
             return;
@@ -662,6 +685,9 @@ impl TextInput {
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.single_line {
+            return;
+        }
         self.replace_text_in_range(None, "\n", window, cx);
     }
 
@@ -950,7 +976,10 @@ impl TextInput {
     pub fn paste_text(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             let r = self.selected_range.clone();
-            let text = text.replace("\r\n", "\n");
+            let mut text = text.replace("\r\n", "\n");
+            if self.single_line {
+                text = text.replace('\n', " ");
+            }
             self.edit(r.clone(), &text, EditKind::Other);
             let end = r.start + text.len();
             self.selected_range = end..end;
@@ -1177,9 +1206,12 @@ impl TextInput {
         (self.content.clone(), entities, false)
     }
 
-    fn colors(&self, placeholder: bool) -> TextColors {
+    /// `placeholderFg`, `placeholderFgActive` while focused.
+    fn colors(&self, placeholder: bool, focused: bool) -> TextColors {
         let p = self.palette;
-        let fg = if placeholder {
+        let fg = if placeholder && focused {
+            p.placeholder_fg_active
+        } else if placeholder {
             p.placeholder_fg
         } else {
             p.history_compose_area_fg
@@ -1278,6 +1310,13 @@ impl EntityInputHandler for TextInput {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let joined;
+        let new_text = if self.single_line && new_text.contains(['\n', '\r']) {
+            joined = new_text.replace("\r\n", " ").replace(['\n', '\r'], " ");
+            joined.as_str()
+        } else {
+            new_text
+        };
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
@@ -1523,7 +1562,7 @@ impl Element for TextElement {
         let focus_handle = input.focus_handle.clone();
         let scroll_y = input.scroll_y;
         let placeholder = input.content.is_empty();
-        let colors = input.colors(placeholder);
+        let colors = input.colors(placeholder, focus_handle.is_focused(window));
         let selected = input.selected_range.clone();
         let caret_on = input.caret_on();
         let cursor = if placeholder {
