@@ -10,6 +10,7 @@ pub mod convert;
 pub mod describe;
 pub mod drafts;
 pub mod filters;
+pub mod login;
 
 use std::time::{Duration, Instant};
 

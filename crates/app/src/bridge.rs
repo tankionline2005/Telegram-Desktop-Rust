@@ -36,6 +36,9 @@ pub enum Command {
     CloseChat,
     /// Show the chats of this folder (0: all chats).
     SelectFolder(i32),
+    /// The window shows this account again (switched to it): everything it shows
+    /// is sent anew, no chat open.
+    Refresh,
     /// The user scrolled to the top of the open chat: load older messages.
     LoadOlder(PeerKey),
     /// Open a chat on top of the open one (the "go to original" button, a mention,
@@ -117,6 +120,10 @@ pub enum Update {
     ChatInfo(Box<DialogItem>),
     /// Whether the home DC is connected (`false`: "Connecting...").
     Connected(bool),
+    /// The account's own user (the main menu, the accounts list).
+    Me(MeInfo),
+    /// The account's unread counters (its row in other accounts' menus, the archive).
+    AccountState(AccountState),
     /// The folders for the column on the left; empty: no folders (no column).
     Folders(Vec<FolderItem>),
     /// A username resolved: open this chat (at this message).
@@ -176,6 +183,79 @@ impl DialogItem {
     }
 }
 
+/// The account's own user.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeInfo {
+    pub peer: PeerKey,
+    pub name: String,
+    pub initials: String,
+    pub color: u8,
+    pub photo: Option<(i64, i32)>,
+    pub premium: bool,
+}
+
+/// Unread counters of an account (`Data::Session::unreadBadge`, the archive's
+/// `chatListBadgesState`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AccountState {
+    /// Unread messages of the main list, muted chats counted.
+    pub unread: u32,
+    /// All of them are in muted chats (a grey badge, no dot).
+    pub unread_muted: bool,
+    /// Chats in the archive, and those with unread messages.
+    pub archive_chats: u32,
+    pub archive_unread: u32,
+}
+
+/// The counters from the cache.
+fn account_state(store: &Storage, ctx: &Context) -> AccountState {
+    let mut state = AccountState::default();
+    let mut muted_messages = 0u32;
+    for (peer, folder, unread, mute_until, broadcast) in store.unread_counts().unwrap_or_default() {
+        if folder == 1 {
+            state.archive_chats += 1;
+            if unread > 0 {
+                state.archive_unread += 1;
+            }
+            continue;
+        }
+        let default_mute = match peer.kind {
+            PeerKind::User => ctx.mute_users,
+            PeerKind::Channel if broadcast => ctx.mute_broadcasts,
+            _ => ctx.mute_chats,
+        };
+        let unread = unread.max(0) as u32;
+        state.unread += unread;
+        if mute_until.map_or(default_mute, i64::from) > ctx.now {
+            muted_messages += unread;
+        }
+    }
+    state.unread_muted = state.unread > 0 && muted_messages >= state.unread;
+    state
+}
+
+/// The account's own user from the cache.
+fn me_info(store: &Storage) -> Option<MeInfo> {
+    let self_id = store.meta_i64("self_id").ok().flatten()?;
+    let peer = PeerKey::user(self_id);
+    let row = store.peer(peer).ok().flatten()?;
+    let info = describe::peer_info(&row);
+    Some(MeInfo {
+        peer,
+        initials: initials(&row.name),
+        color: info.color.unwrap_or_else(|| color_index(self_id)),
+        name: row.name,
+        photo: info.photo,
+        premium: info.premium,
+    })
+}
+
+fn send_me(store: &Storage, tx: &mpsc::UnboundedSender<Update>) {
+    if let Some(me) = me_info(store) {
+        let _ = tx.send(Update::Me(me));
+    }
+}
+
 /// A folder in the column on the left (`Window::FiltersMenu`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FolderItem {
@@ -193,6 +273,8 @@ struct Folders {
     active: i32,
     /// What the column was last sent (sent again only when it changes).
     sent: Option<Vec<FolderItem>>,
+    /// The counters last sent.
+    state_sent: Option<AccountState>,
 }
 
 impl Folders {
@@ -201,6 +283,7 @@ impl Folders {
             entries,
             active: 0,
             sent: None,
+            state_sent: None,
         }
     }
 
@@ -1082,6 +1165,11 @@ fn send_dialogs(
         folders.sent = Some(column.clone());
         let _ = tx.send(Update::Folders(column));
     }
+    let state = account_state(store, &ctx);
+    if folders.state_sent != Some(state) {
+        folders.state_sent = Some(state);
+        let _ = tx.send(Update::AccountState(state));
+    }
     Ok(())
 }
 
@@ -1220,6 +1308,7 @@ async fn run(
     let mut shown_dialogs = DIALOGS;
     let mut folders = Folders::new(tdr_data::cached_dialog_filters(&store).unwrap_or_default());
     send_dialogs(&store, shown_dialogs, &mut folders, &tx)?;
+    send_me(&store, &tx);
     info!(elapsed = ?crate::STARTED.elapsed(), "data: cached chat list sent");
 
     let session = match std::fs::read(&paths.session) {
@@ -1271,6 +1360,7 @@ async fn run(
     save(&client);
     send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
     send_draft_changes(&applied, &tx);
+    send_me(sync.store(), &tx);
     // The folders, and more addresses of the DCs for the next connections.
     match sync.dialog_filters().await {
         Ok(list) => {
@@ -1316,6 +1406,20 @@ async fn run(
                     cmd => (cmd, false),
                 };
                 match cmd {
+                    Command::Refresh => {
+                        if let Some(previous) = open.take() {
+                            remembered.insert(
+                                previous,
+                                std::mem::replace(&mut shown, Shown::Latest(HISTORY)),
+                            );
+                        }
+                        folders.active = 0;
+                        folders.sent = None;
+                        folders.state_sent = None;
+                        send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
+                        send_me(sync.store(), &tx);
+                        let _ = tx.send(Update::Connected(*client.connected().borrow()));
+                    }
                     Command::SelectFolder(id) => {
                         folders.active = id;
                         if folders.filter(id).is_none() {
@@ -1745,7 +1849,11 @@ fn demo_author(out: bool) -> Author {
 }
 
 /// Fake chats for screenshots and UI work without an account (`--demo`).
-pub fn start_demo() -> (
+/// Fake chats for checks and screenshots. `account` (0-based) picks which demo account
+/// this is (the accounts list of `--accounts`).
+pub fn start_demo(
+    account: usize,
+) -> (
     mpsc::UnboundedSender<Command>,
     mpsc::UnboundedReceiver<Update>,
 ) {
@@ -1957,6 +2065,36 @@ pub fn start_demo() -> (
     if demo_folders {
         let _ = up_tx.send(Update::Folders(folder_items(&dialogs)));
     }
+    // The demo account's own user and counters.
+    let names = ["Alex Morgan", "Jamie Lee", "Sam Taylor"];
+    let me = MeInfo {
+        peer: PeerKey::user(103 + account as i64),
+        name: names[account % names.len()].into(),
+        initials: initials(names[account % names.len()]),
+        color: color_index(103 + account as i64),
+        photo: None,
+        premium: false,
+    };
+    let state = match account {
+        0 => AccountState {
+            unread: dialogs.iter().map(|d| d.unread.max(0) as u32).sum(),
+            unread_muted: false,
+            archive_chats: 130,
+            archive_unread: 39,
+        },
+        1 => AccountState {
+            unread: 303_412,
+            unread_muted: false,
+            ..Default::default()
+        },
+        _ => AccountState {
+            unread: 55_804,
+            unread_muted: true,
+            ..Default::default()
+        },
+    };
+    let _ = up_tx.send(Update::Me(me.clone()));
+    let _ = up_tx.send(Update::AccountState(state));
     // `--connecting`: the "Connecting..." box, as if the connection were lost.
     let _ = up_tx.send(Update::Connected(
         !std::env::args().any(|a| a == "--connecting"),
@@ -2050,6 +2188,15 @@ pub fn start_demo() -> (
         let mut focus: Option<(PeerKey, i32)> = None;
         while let Some(cmd) = cmd_rx.blocking_recv() {
             match cmd {
+                Command::Refresh => {
+                    let _ = up_tx.send(Update::Dialogs(dialogs.clone()));
+                    if demo_folders {
+                        let _ = up_tx.send(Update::Folders(folder_items(&dialogs)));
+                    }
+                    let _ = up_tx.send(Update::Me(me.clone()));
+                    let _ = up_tx.send(Update::AccountState(state));
+                    let _ = up_tx.send(Update::Connected(true));
+                }
                 Command::SelectFolder(id) => {
                     let shown: Vec<DialogItem> = dialogs
                         .iter()

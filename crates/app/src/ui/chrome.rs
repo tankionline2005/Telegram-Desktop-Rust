@@ -169,6 +169,29 @@ fn radial_arc(ms: f32) -> (f32, f32) {
     }
 }
 
+/// `InfiniteRadialAnimation::draw` in a `size` square, `ms` after it started.
+pub(crate) fn paint_radial(
+    bounds: gpui::Bounds<Pixels>,
+    size: f32,
+    thickness: f32,
+    ms: f32,
+    color: Color,
+    window: &mut Window,
+) {
+    let inset = gpui::Bounds::new(
+        bounds.origin + point(gpui::px(thickness / 2.), gpui::px(thickness / 2.)),
+        gpui::size(gpui::px(size - thickness), gpui::px(size - thickness)),
+    );
+    paint_arc(
+        inset,
+        size - thickness,
+        thickness,
+        radial_arc(ms),
+        color,
+        window,
+    );
+}
+
 /// Paints an arc like `QPainter::drawArc` (angles in 1/16 degrees, counterclockwise
 /// from 3 o'clock) in a `size` square at `bounds`' top left, with round caps.
 fn paint_arc(
@@ -254,7 +277,7 @@ impl MainView {
         cx.notify();
     }
 
-    fn press_button(&mut self, id: SharedString, center: (f32, f32)) {
+    pub(super) fn press_button(&mut self, id: SharedString, center: (f32, f32)) {
         self.button_ripples.retain(|r| r.id != id);
         self.button_ripples.push(ButtonRipple {
             id,
@@ -264,14 +287,21 @@ impl MainView {
         });
     }
 
-    fn release_buttons(&mut self) {
+    pub(super) fn release_buttons(&mut self) {
         for r in &mut self.button_ripples {
             r.released.get_or_insert_with(Instant::now);
         }
     }
 
     /// The ripple circle of button `id` inside a `w` x `h` area, if pressed.
-    fn ripple_layer(&self, id: &str, w: f32, h: f32, color: Color, round: bool) -> Option<Div> {
+    pub(super) fn ripple_layer(
+        &self,
+        id: &str,
+        w: f32,
+        h: f32,
+        color: Color,
+        round: bool,
+    ) -> Option<Div> {
         let r = self.button_ripples.iter().find(|r| r.id.as_ref() == id)?;
         let shown = ease_out_quint(r.start.elapsed().as_secs_f32() * 1000. / RIPPLE_SHOW);
         let fade = r.released.map_or(1., |t| {
@@ -407,10 +437,16 @@ impl MainView {
             return None;
         }
         let p = self.palette();
+        // `windowFiltersMainMenuUnread(Muted)`.
+        let dot = self.menu_dot(cx);
         let menu = self.side_bar_button(
             "folders-menu".into(),
             None,
-            Icon::DialogsMenu,
+            if dot.is_some() {
+                Icon::DialogsMenuUnread
+            } else {
+                Icon::DialogsMenu
+            },
             false,
             None,
             window,
@@ -420,6 +456,17 @@ impl MainView {
                 cx.notify();
             },
         );
+        let menu = match dot {
+            Some(muted) => menu.child(Self::dot_layer(
+                if muted {
+                    p.side_bar_badge_bg_muted
+                } else {
+                    p.side_bar_badge_bg
+                },
+                window,
+            )),
+            None => menu,
+        };
         let mut list = div().flex().flex_col();
         for folder in &self.folders {
             let id = folder.id;
@@ -717,12 +764,37 @@ impl MainView {
         )
     }
 
-    /// `dialogsMenuToggle`: the main menu.
+    /// The other accounts' unread messages put a dot on the menu button
+    /// (`OtherAccountsUnreadState`): `Some(muted)` when there are any.
+    fn menu_dot(&self, cx: &Context<Self>) -> Option<bool> {
+        let (count, muted) = self.accounts.read(cx).others_unread();
+        (count > 0).then_some(muted)
+    }
+
+    /// The dot over a centered menu icon (`dialogs_menu_unread_dot`).
+    fn dot_layer(color: Color, window: &Window) -> Div {
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon(Icon::DialogsMenuUnreadDot, color, window))
+    }
+
+    /// `dialogsMenuToggle`: the main menu; with unread messages in other accounts
+    /// `dialogsMenuToggleUnread` (the dot in `dialogsUnreadBg`, or the icon's color
+    /// when they are all muted).
     fn menu_toggle(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         let p = self.palette();
-        self.icon_button(
+        let dot = self.menu_dot(cx);
+        let button = self.icon_button(
             "main-menu-toggle",
-            Icon::DialogsMenu,
+            if dot.is_some() {
+                Icon::DialogsMenuUnread
+            } else {
+                Icon::DialogsMenu
+            },
             (MENU_TOGGLE, MENU_TOGGLE),
             None,
             ((0., 0.), MENU_TOGGLE),
@@ -733,7 +805,18 @@ impl MainView {
                 this.main_menu_open = !this.main_menu_open;
                 cx.notify();
             },
-        )
+        );
+        match dot {
+            Some(muted) => button.child(Self::dot_layer(
+                if muted {
+                    p.dialogs_menu_icon_fg
+                } else {
+                    p.dialogs_unread_bg
+                },
+                window,
+            )),
+            None => button,
+        }
     }
 
     /// `dialogsFilter`: a rounded field with "Search"; searching comes later.

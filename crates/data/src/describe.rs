@@ -480,6 +480,8 @@ pub struct PeerInfo {
     /// Small userpic: photo id and the DC that stores it.
     pub photo: Option<(i64, i32)>,
     pub verified: bool,
+    /// A Telegram Premium user.
+    pub premium: bool,
     pub first_name: Option<String>,
     /// A user in the contacts.
     pub contact: bool,
@@ -518,6 +520,7 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
                     _ => None,
                 },
                 verified: u.verified,
+                premium: u.premium,
                 first_name: u.first_name.clone(),
                 contact: u.contact,
                 migrated: false,

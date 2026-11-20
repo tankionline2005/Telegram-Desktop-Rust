@@ -6,16 +6,19 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accounts;
 mod bridge;
 mod icons;
 #[cfg(windows)]
 mod instance;
+mod intro;
 mod lottie;
 mod one_line;
 mod placement;
 mod popup_menu;
 mod present;
 mod rich_text;
+mod root;
 mod scale;
 mod spoiler;
 mod text_input;
@@ -36,7 +39,7 @@ use gpui::{
 };
 use tdr_api::Config;
 
-const APP_NAME: &str = "Unofficial Telegram Desktop Rust";
+pub const APP_NAME: &str = "Unofficial Telegram Desktop Rust";
 
 /// Process start, for startup timing logs.
 pub static STARTED: std::sync::LazyLock<std::time::Instant> =
@@ -84,7 +87,7 @@ fn install_crash_log() {
 }
 
 /// Saves the window placement shortly after it stops changing.
-fn watch_placement(path: PathBuf, window: &mut gpui::Window, cx: &mut gpui::Context<ui::MainView>) {
+fn watch_placement(path: PathBuf, window: &mut gpui::Window, cx: &mut gpui::Context<root::Root>) {
     let latest = std::rc::Rc::new(std::cell::Cell::new(None::<WindowBounds>));
     cx.observe_window_bounds(window, move |_, window, cx| {
         let first = latest.replace(Some(window.window_bounds())).is_none();
@@ -107,7 +110,7 @@ fn watch_placement(path: PathBuf, window: &mut gpui::Window, cx: &mut gpui::Cont
 
 /// The tray icon; the window's close button hides it there, as in tdesktop.
 #[cfg(windows)]
-fn setup_tray(window: gpui::WindowHandle<ui::MainView>, placement_path: PathBuf, cx: &mut App) {
+fn setup_tray(window: gpui::WindowHandle<root::Root>, placement_path: PathBuf, cx: &mut App) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     let hwnd = window
@@ -195,22 +198,24 @@ fn main() {
     if !demo && !instance::claim(&data_dir(), tray::Tray::show_window) {
         return;
     }
-    let (commands, updates) = if demo {
-        bridge::start_demo()
+    let config = if demo {
+        None
     } else {
         let Some(config) = config() else {
             eprintln!("API credentials are missing: fill in .env (see .env.example) and rebuild");
             std::process::exit(1);
         };
-        bridge::start(
-            config,
-            bridge::Paths {
-                session: data_dir().join("session.bin"),
-                cache: data_dir().join("cache.sqlite"),
-                files: data_dir().join("files"),
-            },
-        )
+        Some(config)
     };
+    // Demo: `--accounts` shows three accounts, `--intro` the login screens.
+    let demo_accounts = demo.then(|| {
+        if std::env::args().any(|a| a == "--accounts") {
+            3
+        } else {
+            1
+        }
+    });
+    let demo_intro = demo && std::env::args().any(|a| a == "--intro");
 
     Application::new().run(move |cx: &mut App| {
         tracing::info!(elapsed = ?STARTED.elapsed(), "ui: platform ready");
@@ -265,28 +270,35 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
+                    let accounts =
+                        cx.new(|cx| accounts::Accounts::new(data_dir(), config, demo_accounts, cx));
                     cx.new(|cx| {
-                        let mut view = ui::MainView::new(commands, updates, dark, cx);
-                        view.open_on_start = open_on_start.map(|n| n.saturating_sub(1));
-                        view.set_columns_path(data_dir().join(if demo {
+                        let columns = data_dir().join(if demo {
                             "columns-demo.txt"
                         } else {
                             "columns.txt"
-                        }));
-                        // Keys (Esc) need a focused element from the start.
-                        window.focus(&gpui::Focusable::focus_handle(&view, cx));
+                        });
+                        let root = root::Root::new(
+                            accounts,
+                            dark,
+                            columns,
+                            open_on_start.map(|n| n.saturating_sub(1)),
+                            demo_intro,
+                            window,
+                            cx,
+                        );
                         watch_placement(placement_path.clone(), window, cx);
                         cx.observe_window_activation(
                             window,
-                            |view: &mut ui::MainView, window, _| {
+                            |root: &mut root::Root, window, cx| {
                                 let active = window.is_window_active();
                                 #[cfg(windows)]
                                 tray::Tray::window_activation_changed(active);
-                                view.window_activation_changed(active);
+                                root.window_activation_changed(active, cx);
                             },
                         )
                         .detach();
-                        view
+                        root
                     })
                 },
             )

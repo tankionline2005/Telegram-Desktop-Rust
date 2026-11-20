@@ -81,6 +81,22 @@ pub enum Icon {
     ConnectingRight,
     ConnectingLeftShadow,
     ConnectingRightShadow,
+    // The main menu (`menuIcon*`, `settingsIconAdd`) and the menu button's dot.
+    MenuProfile,
+    MenuGroups,
+    MenuChannel,
+    MenuContacts,
+    MenuPhone,
+    MenuSaved,
+    MenuSettings,
+    MenuArchive,
+    SettingsAdd,
+    DialogsMenuUnread,
+    DialogsMenuUnreadDot,
+    // The login screens.
+    IntroQrPlane,
+    IntroCountryDropdown,
+    BoxBack,
 }
 
 /// Where an icon's mask comes from.
@@ -167,6 +183,22 @@ impl Icon {
             Icon::ConnectingRight => Source::Png(icon_bytes!("connecting_right")),
             Icon::ConnectingLeftShadow => Source::Png(icon_bytes!("connecting_left_shadow")),
             Icon::ConnectingRightShadow => Source::Png(icon_bytes!("connecting_right_shadow")),
+            Icon::MenuProfile => Source::Png(icon_bytes!("menu__profile")),
+            Icon::MenuGroups => Source::Png(icon_bytes!("menu__groups")),
+            Icon::MenuChannel => Source::Png(icon_bytes!("menu__channel")),
+            Icon::MenuContacts => Source::Png(icon_bytes!("menu__name_show")),
+            Icon::MenuPhone => Source::Png(icon_bytes!("menu__phone")),
+            Icon::MenuSaved => Source::Png(icon_bytes!("menu__saved_messages")),
+            Icon::MenuSettings => Source::Png(icon_bytes!("menu__settings")),
+            Icon::MenuArchive => Source::Png(icon_bytes!("menu__archive_open")),
+            Icon::SettingsAdd => Source::Png(icon_bytes!("settings__add")),
+            Icon::DialogsMenuUnread => Source::Png(icon_bytes!("dialogs__dialogs_menu_unread")),
+            Icon::DialogsMenuUnreadDot => {
+                Source::Png(icon_bytes!("dialogs__dialogs_menu_unread_dot"))
+            }
+            Icon::IntroQrPlane => Source::Png(icon_bytes!("intro_qr_plane")),
+            Icon::IntroCountryDropdown => Source::Png(icon_bytes!("intro_country_dropdown")),
+            Icon::BoxBack => Source::Png(icon_bytes!("box_button_back")),
             other => Source::Png(other.files()),
         }
     }

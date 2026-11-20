@@ -73,6 +73,17 @@
   `tdr_data::filters` (rules and icons ported) through `bridge` (`Update::Folders`,
   `Command::SelectFolder`). Demo flags: `--folders`, `--connecting`.
   `tdr probe folders` prints folder rule sizes and counts (no titles).
+- Accounts: `accounts.rs` (registry `data/accounts.txt`, account 1 in `data/`, others in
+  `data/accounts/<id>/`; `Accounts` runs a bridge per account and routes updates),
+  `root.rs` (the window root, rebuilds `MainView` on switch), `intro.rs` (login screens,
+  driven by `tdr_data::login::run`), `ui/main_menu.rs`. Demo: `--accounts` (three fake
+  accounts), `--intro` (the login screens; the demo walks through code and password).
+  `tdr probe login` checks the login flow (event kinds only).
+- Demo checks must not run while the user's own window is in front: `uilib.ps1`'s
+  `Shot` guards too, a screenshot never captures anything but the demo window.
+- GPUI text input: typed characters reach an element through its input handler
+  (`window.handle_input` + `EntityInputHandler`), not `KeyDownEvent::key_char` alone
+  (IME, unicode SendInput); key listeners handle only the command keys.
 - GPUI 0.2.2 samples atlas images with linear filtering: at a fractional scale an image
   touching its edge bleeds its atlas neighbour (a stripe). `icons` pads every mask.
 - Drags (scrollbars, the column edge) follow the mouse through window-level listeners

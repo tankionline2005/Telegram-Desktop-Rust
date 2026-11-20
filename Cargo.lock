@@ -5671,6 +5671,7 @@ dependencies = [
  "gpui",
  "image",
  "lyon",
+ "qrcode",
  "raw-window-handle",
  "resvg",
  "serde_json",
@@ -5721,6 +5722,7 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
  "tdr-api",
+ "tdr-crypto",
  "tdr-storage",
  "tdr-tl",
  "tdr-updates",

@@ -128,6 +128,10 @@ pub struct DialogView {
     pub draft: Option<(String, i32)>,
 }
 
+/// See [`Storage::unread_counts`]: peer, folder, unread messages, own mute time, a
+/// broadcast channel.
+pub type UnreadRow = (PeerKey, i32, i32, Option<i32>, bool);
+
 /// See [`Storage::history`].
 #[derive(Debug, Clone)]
 pub struct CachedHistory {
@@ -470,6 +474,32 @@ impl Storage {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })
             .optional()
+    }
+
+    /// The unread state of every cached chat: (peer, folder, unread messages, own mute
+    /// time, a broadcast channel). Cheap: no messages, no TL objects.
+    pub fn unread_counts(&self) -> Result<Vec<UnreadRow>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT d.kind, d.id, d.folder_id, d.unread_count, d.mute_until,
+                    COALESCE(p.is_megagroup, 0)
+             FROM dialogs d
+             LEFT JOIN peers p ON p.kind = d.kind AND p.id = d.id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let peer = PeerKey {
+                kind: PeerKind::from_i64(r.get(0)?),
+                id: r.get(1)?,
+            };
+            let megagroup: bool = r.get(5)?;
+            Ok((
+                peer,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                peer.kind == PeerKind::Channel && !megagroup,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
     }
 
     pub fn dialogs(&self, folder_id: i32, limit: usize) -> Result<Vec<DialogView>> {

@@ -120,6 +120,7 @@ async fn main() -> Result<()> {
         ["probe", "entities"] => probe_entities(),
         ["probe", "bank-card", number] => probe_bank_card(number).await,
         ["probe", "folders"] => probe_folders().await,
+        ["probe", "login"] => probe_login().await,
         ["logout"] => logout().await,
         ["selftest", "reconnect"] => selftest_reconnect().await,
         ["selftest", "unknown-key"] => selftest_unknown_key().await,
@@ -690,6 +691,48 @@ async fn probe_bank_card(number: &str) -> Result<()> {
     Ok(())
 }
 
+/// A login as the window starts it (`tdr_data::login::run`): the kinds of the first
+/// events only (no tokens, no numbers). The session goes to a temporary file.
+async fn probe_login() -> Result<()> {
+    use tdr_data::login::{LoginEvent, run};
+    let client = Client::new(config()?, SessionData::new(2));
+    let path = std::env::temp_dir().join("tdr-probe-login.bin");
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(run(client, path.clone(), cmd_rx, ev_tx));
+    let started = Instant::now();
+    let mut seen = 0;
+    while seen < 2 {
+        match tokio::time::timeout(Duration::from_secs(20), ev_rx.recv()).await {
+            Ok(Some(LoginEvent::QrCode(url))) => {
+                println!(
+                    "QR code after {}: {} chars, tg://login link: {}",
+                    ms(started.elapsed()),
+                    url.len(),
+                    url.starts_with("tg://login?token=")
+                );
+                seen += 1;
+            }
+            Ok(Some(LoginEvent::Countries { list, nearest })) => {
+                println!(
+                    "countries after {}: {} codes, nearest known: {}",
+                    ms(started.elapsed()),
+                    list.len(),
+                    !nearest.is_empty()
+                );
+                seen += 1;
+            }
+            Ok(Some(LoginEvent::Error(e))) => println!("error: {e}"),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    drop(cmd_tx);
+    task.abort();
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// The account's folders: per folder its icon, rule sizes and how many cached chats
 /// it holds (no titles, no chat names).
 async fn probe_folders() -> Result<()> {
@@ -728,6 +771,19 @@ async fn probe_folders() -> Result<()> {
         "{} cached chats; unread (all chats): {:?}",
         chats.len(),
         tdr_data::filters::unread_badge(chats.iter(), None)
+    );
+    let archive = store.dialogs(1, 100_000)?;
+    println!(
+        "archive: {} chats, {} unread chats, {} unread messages",
+        archive.len(),
+        archive.iter().filter(|d| d.dialog.unread_count > 0).count(),
+        archive.iter().map(|d| d.dialog.unread_count).sum::<i32>()
+    );
+    let main = store.dialogs(0, 100_000)?;
+    println!(
+        "main list: {} unread chats, {} unread messages",
+        main.iter().filter(|d| d.dialog.unread_count > 0).count(),
+        main.iter().map(|d| d.dialog.unread_count).sum::<i32>()
     );
     for (i, entry) in list.iter().enumerate() {
         match entry {

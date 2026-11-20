@@ -35,6 +35,8 @@ flate2 = "1.1"
 serde_json = "1"
 # Line break opportunities for message text (UAX #14, as Qt's).
 unicode-linebreak = "0.1"
+# Already built for the console client: the QR code of the login screen.
+qrcode = { version = "0.14.1", default-features = false }
 
 [target."cfg(windows)".dependencies]
 # Same version and a subset of the features GPUI enables: no extra build.

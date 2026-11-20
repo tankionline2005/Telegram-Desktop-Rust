@@ -29,7 +29,10 @@ use crate::present;
 use crate::scale::{self, dpx, lg, px};
 use crate::text_input::{FieldMenu, Submit, TagSpan, TextInput};
 
+pub(crate) use chrome::paint_radial;
+
 mod chrome;
+mod main_menu;
 mod menus;
 mod message_text;
 
@@ -46,7 +49,7 @@ pub fn bind_keys(cx: &mut gpui::App) {
 }
 
 // widgets.style: windowTitleHeight, windowTitleButtonWidth
-const TITLE_HEIGHT: f32 = 24.;
+pub(crate) const TITLE_HEIGHT: f32 = 24.;
 const TITLE_BUTTON_WIDTH: f32 = 36.;
 // dialogs.style: defaultDialogRow
 const DIALOG_ROW_HEIGHT: f32 = 62.;
@@ -62,8 +65,6 @@ const UNREAD_PADDING: f32 = 5.;
 const CHAT_WIDE_WIDTH: f32 = 880.;
 // chat.style: historyResizeWidth (the column edge you drag)
 const RESIZE_WIDTH: f32 = 6.;
-// window_main_menu.style: mainMenuWidth
-const MAIN_MENU_WIDTH: f32 = 274.;
 // chat.style
 const MSG_MAX_WIDTH: f32 = 430.;
 const MSG_PADDING_X: f32 = 11.;
@@ -139,7 +140,7 @@ fn c(color: Color) -> Rgba {
 }
 
 /// Width of the longest line of `text` when laid out without wrapping.
-fn text_width(window: &Window, text: &str, size: f32, weight: FontWeight) -> f32 {
+pub(crate) fn text_width(window: &Window, text: &str, size: f32, weight: FontWeight) -> f32 {
     let mut f = font(FONT_FAMILY);
     f.weight = weight;
     text.split('\n')
@@ -688,7 +689,6 @@ pub struct MainView {
     /// The list length when more chats were last asked for.
     more_dialogs_requested: usize,
     /// The main menu's "Night Mode" row is under the mouse.
-    menu_hovered: bool,
     /// Header data of opened chats that are not in the loaded chat list.
     extra_chats: HashMap<PeerKey, DialogItem>,
     /// Show this chat's row once the chat list has it (it joins it when opened).
@@ -752,6 +752,11 @@ pub struct MainView {
     input: Entity<TextInput>,
     /// The chat search field over the chat list.
     search: Entity<TextInput>,
+    /// The accounts: their rows in the menu, switching, adding.
+    accounts: Entity<crate::accounts::Accounts>,
+    /// The login screens (no account yet, or "Add Account"), with the id the new
+    /// account gets.
+    intro: Option<(Entity<crate::intro::IntroView>, u32)>,
     /// The folder column (empty: the account has no folders) and the open folder.
     folders: Vec<FolderItem>,
     active_folder: i32,
@@ -775,12 +780,15 @@ pub struct MainView {
 }
 
 impl MainView {
+    /// The view of one account: `commands` go to its data thread; its updates come
+    /// through `accounts` ([`Self::apply`]).
     pub fn new(
         commands: mpsc::UnboundedSender<Command>,
-        mut updates: mpsc::UnboundedReceiver<Update>,
+        accounts: Entity<crate::accounts::Accounts>,
         dark: bool,
         cx: &mut Context<Self>,
     ) -> Self {
+        cx.observe(&accounts, |_, _, cx| cx.notify()).detach();
         let palette = tdr_theme::palette(dark);
         let input = cx.new(|cx| TextInput::new("Write a message…", palette, cx));
         let search = cx.new(|cx| {
@@ -819,16 +827,6 @@ impl MainView {
                 });
             }
             cx.notify();
-        })
-        .detach();
-
-        // Updates from the data thread.
-        cx.spawn(async move |this, cx| {
-            while let Some(update) = updates.recv().await {
-                if this.update(cx, |view, cx| view.apply(update, cx)).is_err() {
-                    break;
-                }
-            }
         })
         .detach();
 
@@ -877,7 +875,6 @@ impl MainView {
             suppress_open: false,
             scroll_anim: None,
             more_dialogs_requested: 0,
-            menu_hovered: false,
             extra_chats: HashMap::new(),
             reveal_pending: None,
             remembered: HashMap::new(),
@@ -911,6 +908,8 @@ impl MainView {
             scroll_date: Fade::new(0., SCROLL_DATE_FADE),
             input,
             search,
+            accounts,
+            intro: None,
             folders: Vec::new(),
             active_folder: 0,
             connection: chrome::Connection::new(),
@@ -1538,7 +1537,7 @@ impl MainView {
         }
     }
 
-    fn apply(&mut self, update: Update, cx: &mut Context<Self>) {
+    pub(crate) fn apply(&mut self, update: Update, cx: &mut Context<Self>) {
         match update {
             Update::Dialogs(mut list) => {
                 // The open chat stays open when the list no longer has it (another
@@ -1637,6 +1636,8 @@ impl MainView {
                 self.userpics.insert(peer, (photo_id, image));
             }
             Update::Connected(connected) => self.set_connected(connected, cx),
+            // The accounts keep these (the menu reads them there).
+            Update::Me(_) | Update::AccountState(_) => {}
             Update::Folders(list) => {
                 if !list.iter().any(|f| f.id == self.active_folder) {
                     self.active_folder = 0;
@@ -2021,6 +2022,56 @@ impl MainView {
         cx.notify();
     }
 
+    /// The login screens over this view: for the first account (no way back) or for
+    /// "Add Account" (`Main::Domain::addActivated`).
+    pub fn show_intro(&mut self, can_back: bool, cx: &mut Context<Self>) {
+        let accounts = self.accounts.read(cx);
+        let (id, session) = accounts.new_account();
+        let login = accounts
+            .config()
+            .filter(|_| !accounts.is_demo())
+            .map(|config| crate::accounts::start_login(config.clone(), session));
+        let palette = self.palette();
+        let intro = cx.new(|cx| crate::intro::IntroView::new(palette, can_back, login, cx));
+        cx.subscribe(
+            &intro,
+            |this: &mut Self, _, event: &crate::intro::IntroEvent, cx| {
+                match event {
+                    crate::intro::IntroEvent::Back => {
+                        if let Some((_, id)) = this.intro.take() {
+                            // A login left halfway leaves nothing behind.
+                            let base = this.accounts.read(cx).base().to_path_buf();
+                            if id != 1 && !crate::accounts::logged_in(&base, id) {
+                                let _ = std::fs::remove_dir_all(crate::accounts::account_dir(
+                                    &base, id,
+                                ));
+                            }
+                        }
+                        cx.notify();
+                    }
+                    crate::intro::IntroEvent::Done => {
+                        if let Some((_, id)) = this.intro.as_ref() {
+                            let id = *id;
+                            this.accounts.update(cx, |a, cx| a.logged_in(id, cx));
+                        }
+                    }
+                }
+            },
+        )
+        .detach();
+        self.intro = Some((intro, id));
+        cx.notify();
+    }
+
+    fn start_add_account(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.show_intro(true, cx);
+    }
+
+    /// Light or dark.
+    pub fn is_dark(&self) -> bool {
+        self.dark
+    }
+
     fn toggle_theme(&mut self, cx: &mut Context<Self>) {
         self.dark = !self.dark;
         let palette = self.palette();
@@ -2028,6 +2079,9 @@ impl MainView {
             .update(cx, |input, cx| input.set_palette(palette, cx));
         self.search
             .update(cx, |input, cx| input.set_palette(palette, cx));
+        if let Some((intro, _)) = &self.intro {
+            intro.update(cx, |v, cx| v.set_palette(palette, cx));
+        }
         cx.notify();
     }
 
@@ -3076,125 +3130,6 @@ impl MainView {
             .into_any_element()
     }
 
-    fn render_main_menu(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = self.palette();
-        let hovered = self.menu_hovered;
-        // `ToggleView::paint` with `defaultSettingsToggle`: a 28x14 track in the
-        // foreground color and a 16 px ring (2 px pen) filled with the window color.
-        let toggle = {
-            let on = self.dark;
-            let fg = if on {
-                p.window_bg_active
-            } else if hovered {
-                p.menu_icon_fg_over
-            } else {
-                p.menu_icon_fg
-            };
-            const BORDER: f32 = 2.;
-            const SHIFT: f32 = 1.;
-            const DIAMETER: f32 = 16.;
-            const WIDTH: f32 = 14.;
-            let knob_left = BORDER + if on { WIDTH } else { 0. };
-            div()
-                .relative()
-                .flex_none()
-                .w(px(DIAMETER + WIDTH + 2. * BORDER))
-                .h(px(DIAMETER + 2. * BORDER))
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(BORDER + SHIFT))
-                        .top(px(BORDER + SHIFT))
-                        .w(px(DIAMETER + WIDTH - 2. * SHIFT))
-                        .h(px(DIAMETER - 2. * SHIFT))
-                        .rounded(px((DIAMETER - 2. * SHIFT) / 2.))
-                        .bg(c(fg)),
-                )
-                .child(
-                    // The pen is centered on the circle's outline.
-                    div()
-                        .absolute()
-                        .left(px(knob_left - BORDER / 2.))
-                        .top(px(BORDER / 2.))
-                        .size(px(DIAMETER + BORDER))
-                        .rounded_full()
-                        .border_2()
-                        .border_color(c(fg))
-                        .bg(c(p.window_bg)),
-                )
-        };
-        let (row_bg, text_fg, icon_fg) = if hovered {
-            (p.window_bg_over, p.window_bold_fg_over, p.menu_icon_fg_over)
-        } else {
-            (p.window_bg, p.window_bold_fg, p.menu_icon_fg)
-        };
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .child(
-                div()
-                    .id("main-menu")
-                    .w(px(MAIN_MENU_WIDTH))
-                    .h_full()
-                    .bg(c(p.main_menu_bg))
-                    .occlude()
-                    .flex()
-                    .flex_col()
-                    .pt(px(8.))
-                    .child(
-                        // `mainMenuButton`: padding (61, 11, 20, 9), iconLeft 21,
-                        // toggleSkip 19, semibold text.
-                        div()
-                            .id("menu-night-mode")
-                            .relative()
-                            .h(px(40.))
-                            .flex()
-                            .items_center()
-                            .bg(c(row_bg))
-                            .cursor_pointer()
-                            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                                this.menu_hovered = *hovered;
-                                cx.notify();
-                            }))
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx)))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px(21.))
-                                    .top_0()
-                                    .h_full()
-                                    .flex()
-                                    .items_center()
-                                    .child(icon(Icon::NightMode, icon_fg, window)),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .pl(px(61.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(c(text_fg))
-                                    .child("Night Mode"),
-                            )
-                            .child(div().pr(px(19.)).child(toggle)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("main-menu-backdrop")
-                    .flex_1()
-                    .h_full()
-                    .bg(c(p.layer_bg))
-                    .occlude()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.main_menu_open = false;
-                        cx.notify();
-                    })),
-            )
-    }
-
     /// An overlay scrollbar (`historyScroll` in the chat, the default `ScrollArea` style
     /// in the chat list): shown while scrolling and on hover.
     fn render_scrollbar(
@@ -4038,45 +3973,50 @@ impl Render for MainView {
                 this.copy_selected_text(cx);
             }))
             .child(self.render_title_bar(window, cx))
+            .when_some(self.intro.as_ref().map(|(i, _)| i.clone()), |d, intro| {
+                d.child(div().relative().flex_1().min_h(px(0.)).child(intro))
+            })
             // Focus tracking stays below the title bar: a focusable element swallows mouse
             // downs (prevent_default), and GPUI then skips the native caption-button
             // handling (minimize / maximize / close / drag would do nothing).
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .flex()
-                    .track_focus(&self.focus)
-                    .children(self.render_folders(window, cx))
-                    .child(left)
-                    .child(right)
-                    // The column edge (`_firstColumnResizeArea`): at the chat's left side.
-                    .child(
-                        div()
-                            .id("column-resize")
-                            .absolute()
-                            .top_0()
-                            .left(px(dialogs_width + self.filters_width()))
-                            .w(px(RESIZE_WIDTH))
-                            .h_full()
-                            .cursor(gpui::CursorStyle::ResizeLeftRight)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
-                                    this.column_drag = Some(ColumnDrag {
-                                        start_mouse_x: e.position.x,
-                                        start_width: dialogs_width,
-                                    });
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .when(self.main_menu_open, |d| {
-                        d.child(self.render_main_menu(window, cx))
-                    }),
-            )
+            .when(self.intro.is_none(), |d| {
+                d.child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .flex()
+                        .track_focus(&self.focus)
+                        .children(self.render_folders(window, cx))
+                        .child(left)
+                        .child(right)
+                        // The column edge (`_firstColumnResizeArea`): at the chat's left side.
+                        .child(
+                            div()
+                                .id("column-resize")
+                                .absolute()
+                                .top_0()
+                                .left(px(dialogs_width + self.filters_width()))
+                                .w(px(RESIZE_WIDTH))
+                                .h_full()
+                                .cursor(gpui::CursorStyle::ResizeLeftRight)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
+                                        this.column_drag = Some(ColumnDrag {
+                                            start_mouse_x: e.position.x,
+                                            start_width: dialogs_width,
+                                        });
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                        .when(self.main_menu_open, |d| {
+                            d.child(self.render_main_menu(window, cx))
+                        }),
+                )
+            })
             .children(self.render_drag_capture(cx))
             .children(self.render_menu(window, cx))
             .children(self.text_ui.toast.as_ref().and_then(|t| {
