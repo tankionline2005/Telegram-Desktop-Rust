@@ -97,6 +97,31 @@ pub enum Icon {
     IntroQrPlane,
     IntroCountryDropdown,
     BoxBack,
+    // Settings (`menuIcon*`) and its top bar.
+    MenuAddAccount,
+    MenuLeave,
+    MenuQrCode,
+    MenuLock,
+    MenuChatBubble,
+    MenuShowInFolder,
+    MenuManage,
+    MenuUnmute,
+    MenuPowerUsage,
+    MenuTranslate,
+    MenuShowInChat,
+    MenuShop,
+    MenuGiftPremium,
+    MenuFaq,
+    MenuEmojiObjects,
+    MenuDiscussion,
+    InfoClose,
+    // The start screen's cover (`introCoverLeft/Right`, the plane's four layers).
+    IntroLeft,
+    IntroRight,
+    IntroPlaneTrace,
+    IntroPlaneInner,
+    IntroPlaneOuter,
+    IntroPlaneTop,
 }
 
 /// Where an icon's mask comes from.
@@ -199,6 +224,29 @@ impl Icon {
             Icon::IntroQrPlane => Source::Png(icon_bytes!("intro_qr_plane")),
             Icon::IntroCountryDropdown => Source::Png(icon_bytes!("intro_country_dropdown")),
             Icon::BoxBack => Source::Png(icon_bytes!("box_button_back")),
+            Icon::MenuAddAccount => Source::Png(icon_bytes!("menu__add_account")),
+            Icon::MenuLeave => Source::Png(icon_bytes!("menu__leave")),
+            Icon::MenuQrCode => Source::Png(icon_bytes!("menu__qr_code")),
+            Icon::MenuLock => Source::Png(icon_bytes!("menu__lock")),
+            Icon::MenuChatBubble => Source::Png(icon_bytes!("menu__chat_bubble")),
+            Icon::MenuShowInFolder => Source::Png(icon_bytes!("menu__show_in_folder")),
+            Icon::MenuManage => Source::Png(icon_bytes!("menu__manage")),
+            Icon::MenuUnmute => Source::Png(icon_bytes!("menu__unmute")),
+            Icon::MenuPowerUsage => Source::Png(icon_bytes!("menu__power_usage")),
+            Icon::MenuTranslate => Source::Png(icon_bytes!("menu__translate")),
+            Icon::MenuShowInChat => Source::Png(icon_bytes!("menu__show_in_chat")),
+            Icon::MenuShop => Source::Png(icon_bytes!("menu__shop")),
+            Icon::MenuGiftPremium => Source::Png(icon_bytes!("menu__gift_premium")),
+            Icon::MenuFaq => Source::Png(icon_bytes!("menu__faq")),
+            Icon::MenuEmojiObjects => Source::Png(icon_bytes!("emoji__emoji_objects")),
+            Icon::MenuDiscussion => Source::Png(icon_bytes!("menu__discussion")),
+            Icon::InfoClose => Source::Png(icon_bytes!("info__info_close")),
+            Icon::IntroLeft => Source::Png(icon_bytes!("intro_left")),
+            Icon::IntroRight => Source::Png(icon_bytes!("intro_right")),
+            Icon::IntroPlaneTrace => Source::Png(icon_bytes!("intro_plane_trace")),
+            Icon::IntroPlaneInner => Source::Png(icon_bytes!("intro_plane_inner")),
+            Icon::IntroPlaneOuter => Source::Png(icon_bytes!("intro_plane_outer")),
+            Icon::IntroPlaneTop => Source::Png(icon_bytes!("intro_plane_top")),
             other => Source::Png(other.files()),
         }
     }
@@ -316,6 +364,12 @@ fn base_size(icon: Icon) -> (u32, u32) {
     };
     BASE_SIZES.lock().unwrap().insert(icon, size);
     size
+}
+
+/// The icon's style size (100 % pixels).
+pub fn style_size(icon: Icon) -> (f32, f32) {
+    let (w, h) = base_size(icon);
+    (w as f32, h as f32)
 }
 
 /// The icon's height in logical pixels at the current scale.
@@ -451,4 +505,72 @@ pub fn stretched(icon: Icon, color: Color, window: &Window) -> gpui::Img {
         .w(px(t.width / scale))
         .h_full()
         .object_fit(gpui::ObjectFit::Fill)
+}
+
+/// `settings/star.svg` filled with a gradient from the bottom left to the top right
+/// (`Ui::Premium::ColorizedSvg`): Telegram Premium's star (`ButtonGradientStops`),
+/// or the Stars' one (`CreditsIconGradientStops`). `size` is in style pixels.
+pub fn premium_star(colors: &[(f32, Color)], size: f32, window: &Window) -> Div {
+    type Stars = HashMap<(u32, Vec<u32>), Arc<RenderImage>>;
+    static CACHE: LazyLock<Mutex<Stars>> = LazyLock::new(Default::default);
+    let scale = window.scale_factor();
+    let device = crate::scale::device(size).max(1.);
+    let key = (
+        device.to_bits(),
+        colors.iter().map(|(_, c)| c.rgba()).collect::<Vec<_>>(),
+    );
+    let cached = CACHE.lock().unwrap().get(&key).cloned();
+    let image = cached.unwrap_or_else(|| {
+        let svg = std::str::from_utf8(include_bytes!(
+            "../../../assets/tdesktop-icons/settings__star.svg"
+        ))
+        .unwrap_or_default();
+        let stops: String = colors
+            .iter()
+            .map(|(at, c)| format!("<stop offset='{at}' stop-color='#{:06x}'/>", c.rgba() >> 8))
+            .collect();
+        let gradient = format!(
+            "<linearGradient id='Gradient2' x1='0' x2='1' y1='1' y2='0'>{stops}</linearGradient>"
+        );
+        let svg = svg
+            .replace("gradientPlaceholder", &gradient)
+            .replace("#fff", "url(#Gradient2)");
+        let n = device as u32;
+        let mut out = image::RgbaImage::new(n + 2 * PAD, n + 2 * PAD);
+        if let (Ok(tree), Some(mut pixmap)) = (
+            resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default()),
+            resvg::tiny_skia::Pixmap::new(n, n),
+        ) {
+            let size = tree.size();
+            let transform = resvg::tiny_skia::Transform::from_scale(
+                n as f32 / size.width(),
+                n as f32 / size.height(),
+            );
+            resvg::render(&tree, transform, &mut pixmap.as_mut());
+            for (i, px) in pixmap.pixels().iter().enumerate() {
+                let c = px.demultiply();
+                let (x, y) = (i as u32 % n, i as u32 / n);
+                // GPUI expects BGRA.
+                out.put_pixel(
+                    x + PAD,
+                    y + PAD,
+                    image::Rgba([c.blue(), c.green(), c.red(), c.alpha()]),
+                );
+            }
+        }
+        let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+            out
+        )]));
+        CACHE.lock().unwrap().insert(key, image.clone());
+        image
+    });
+    let pad = PAD as f32 / scale;
+    let side = device / scale;
+    div().flex_none().relative().size(px(side)).child(
+        img(image)
+            .absolute()
+            .left(px(-pad))
+            .top(px(-pad))
+            .size(px(side + 2. * pad)),
+    )
 }

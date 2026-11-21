@@ -699,7 +699,7 @@ async fn probe_login() -> Result<()> {
     let path = std::env::temp_dir().join("tdr-probe-login.bin");
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
-    let task = tokio::spawn(run(client, path.clone(), cmd_rx, ev_tx));
+    let task = tokio::spawn(run(client, path.clone(), true, cmd_rx, ev_tx));
     let started = Instant::now();
     let mut seen = 0;
     while seen < 2 {

@@ -371,6 +371,8 @@ impl Sync {
                     read_inbox_max_id: d.read_inbox_max_id,
                     read_outbox_max_id: d.read_outbox_max_id,
                     mute_until: convert::mute_until(&d.notify_settings),
+                    unread_mentions: d.unread_mentions_count,
+                    unread_mark: d.unread_mark,
                 }
             })
             .collect();
@@ -660,6 +662,8 @@ impl Sync {
                 read_inbox_max_id: d.read_inbox_max_id,
                 read_outbox_max_id: d.read_outbox_max_id,
                 mute_until: convert::mute_until(&d.notify_settings),
+                unread_mentions: d.unread_mentions_count,
+                unread_mark: d.unread_mark,
             });
         }
         let complete = !slice || dialogs.len() < DIALOGS_PAGE as usize || rows.is_empty();
@@ -1252,6 +1256,9 @@ fn new_message(
 ) -> tdr_storage::Result<()> {
     w.put_message(&row)?;
     w.message_arrived(&row)?;
+    if convert::unread_mention(&row) {
+        w.mention_arrived(row.peer)?;
+    }
     applied.new_messages.push(row);
     Ok(())
 }
@@ -1309,6 +1316,8 @@ fn apply_item(
                     read_inbox_max_id: d.read_inbox_max_id,
                     read_outbox_max_id: d.read_outbox_max_id,
                     mute_until: convert::mute_until(&d.notify_settings),
+                    unread_mentions: d.unread_mentions_count,
+                    unread_mark: d.unread_mark,
                 })?;
             }
         }
@@ -1455,6 +1464,12 @@ fn apply_update(
                     .collect();
                 w.set_pinned_order(0, &peers)?;
                 applied.pinned_changed = true;
+            }
+        }
+        U::DialogUnreadMark(x) if x.saved_peer_id.is_none() => {
+            if let enums::DialogPeer::DialogPeer(d) = &x.peer {
+                w.set_unread_mark(convert::peer_key(&d.peer), x.unread)?;
+                applied.marks_changed = true;
             }
         }
         U::DialogFilter(_) | U::DialogFilterOrder(_) | U::DialogFilters => {

@@ -32,9 +32,11 @@ use crate::text_input::{FieldMenu, Submit, TagSpan, TextInput};
 pub(crate) use chrome::paint_radial;
 
 mod chrome;
+mod layers;
 mod main_menu;
 mod menus;
 mod message_text;
+mod settings;
 
 gpui::actions!(main_view, [Escape]);
 
@@ -739,7 +741,8 @@ pub struct MainView {
     draft_generation: u64,
     /// The first unsaved edit (tdesktop's `_saveDraftStart`).
     draft_dirty_since: Option<Instant>,
-    main_menu_open: bool,
+    /// The main menu, Settings and boxes over the window (`LayerStackWidget`).
+    layers: layers::Layers,
     /// The caption button under the mouse.
     title_hovered: Option<&'static str>,
     /// The "scroll down" / "scroll to top" button under the mouse.
@@ -900,7 +903,7 @@ impl MainView {
             input_text: String::new(),
             draft_generation: 0,
             draft_dirty_since: None,
-            main_menu_open: false,
+            layers: Default::default(),
             title_hovered: None,
             jump_hovered: None,
             to_down_shown: Fade::new(0., TO_DOWN_DURATION),
@@ -1651,6 +1654,8 @@ impl MainView {
                 self.text_ui.pending_open = Some((peer, msg_id));
             }
             Update::Fatal(e) => self.fatal = Some(e),
+            // `Accounts` takes the account away.
+            Update::LoggedOut => {}
         }
         cx.notify();
     }
@@ -1956,8 +1961,8 @@ impl MainView {
     /// in tdesktop.
     fn escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
         if self.hide_menu() || self.clear_text_selection() {
-        } else if self.main_menu_open {
-            self.main_menu_open = false;
+        } else if self.layers.any() {
+            self.layers.hide_current();
         } else if !self.back_stack.is_empty() {
             self.go_back(window, cx);
             return;
@@ -2030,9 +2035,10 @@ impl MainView {
         let login = accounts
             .config()
             .filter(|_| !accounts.is_demo())
-            .map(|config| crate::accounts::start_login(config.clone(), session));
+            .map(|config| crate::accounts::start_login(config.clone(), session, can_back));
         let palette = self.palette();
-        let intro = cx.new(|cx| crate::intro::IntroView::new(palette, can_back, login, cx));
+        let intro =
+            cx.new(|cx| crate::intro::IntroView::new(palette, can_back, !can_back, login, cx));
         cx.subscribe(
             &intro,
             |this: &mut Self, _, event: &crate::intro::IntroEvent, cx| {
@@ -2064,7 +2070,19 @@ impl MainView {
     }
 
     fn start_add_account(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.layers.reset();
         self.show_intro(true, cx);
+    }
+
+    /// "Add Account" (the main menu, Settings' menu): the login, or the toast about
+    /// the limit (`AccountsLimitBox`).
+    fn add_account_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let accounts = self.accounts.read(cx);
+        if accounts.slots.len() >= accounts.max_accounts() {
+            self.show_toast("You have reached the limit of connected accounts.", None);
+        } else {
+            self.start_add_account(window, cx);
+        }
     }
 
     /// Light or dark.
@@ -3956,6 +3974,7 @@ impl Render for MainView {
                 self.with_slide(live, border, window, cx)
             }
         };
+        let layers = self.render_layers(window, cx);
 
         div()
             .relative()
@@ -4011,12 +4030,10 @@ impl Render for MainView {
                                         cx.notify();
                                     }),
                                 ),
-                        )
-                        .when(self.main_menu_open, |d| {
-                            d.child(self.render_main_menu(window, cx))
-                        }),
+                        ),
                 )
             })
+            .when(self.intro.is_none(), |d| d.children(layers))
             .children(self.render_drag_capture(cx))
             .children(self.render_menu(window, cx))
             .children(self.text_ui.toast.as_ref().and_then(|t| {

@@ -82,6 +82,7 @@ enum RowAction {
     NightMode,
     Account(u32),
     AddAccount,
+    Settings,
 }
 
 impl MainView {
@@ -206,25 +207,16 @@ impl MainView {
             RowAction::NightMode => self.toggle_theme(cx),
             RowAction::Account(id) => {
                 let active = self.accounts.read(cx).registry.active;
-                self.main_menu_open = false;
+                self.layers.hide_all();
                 if id != active {
                     // The draft of the chat left stays.
                     self.save_draft(cx);
                     self.accounts.update(cx, |a, cx| a.activate(id, cx));
                 }
             }
-            RowAction::AddAccount => {
-                let accounts = self.accounts.read(cx);
-                let count = accounts.slots.len();
-                let max = accounts.max_accounts();
-                if count >= max {
-                    // `AccountsLimitBox`.
-                    self.show_toast("You have reached the limit of connected accounts.", None);
-                } else {
-                    self.main_menu_open = false;
-                    self.start_add_account(window, cx);
-                }
-            }
+            RowAction::AddAccount => self.add_account_clicked(window, cx),
+            // `showSettings`: in a window this wide, a layer.
+            RowAction::Settings => self.layers.show_special(super::layers::Special::Settings),
         }
         cx.notify();
     }
@@ -252,8 +244,14 @@ impl MainView {
 
     /// `ToggleView` of the Night Mode row.
     fn night_toggle(&self, over: bool) -> AnyElement {
-        let p = self.palette();
-        let on = self.dark;
+        Self::toggle_view(self.palette(), self.dark, over)
+            .mr(px(TOGGLE_SKIP - ROW_RIGHT))
+            .into_any_element()
+    }
+
+    /// `Ui::ToggleView` (`defaultToggle`, `menuIconFg` when off): the rail and the
+    /// knob.
+    pub(super) fn toggle_view(p: &tdr_theme::Palette, on: bool, over: bool) -> Div {
         let fg = if on {
             p.window_bg_active
         } else if over {
@@ -269,7 +267,6 @@ impl MainView {
         div()
             .relative()
             .flex_none()
-            .mr(px(TOGGLE_SKIP - ROW_RIGHT))
             .w(px(DIAMETER + WIDTH + 2. * BORDER))
             .h(px(DIAMETER + 2. * BORDER))
             .child(
@@ -293,7 +290,22 @@ impl MainView {
                     .border_color(c(fg))
                     .bg(c(p.window_bg)),
             )
-            .into_any_element()
+    }
+
+    /// The shown account's userpic.
+    pub(super) fn active_userpic(&self, size: f32, cx: &Context<Self>) -> AnyElement {
+        let accounts = self.accounts.read(cx);
+        let slot = accounts.active();
+        let pic = AccountPic {
+            image: slot.and_then(|s| s.userpic.as_ref().map(|(_, i)| i.clone())),
+            initials: slot
+                .and_then(|s| s.me.as_ref().map(|m| m.initials.clone()))
+                .unwrap_or_default(),
+            color: slot
+                .and_then(|s| s.me.as_ref().map(|m| m.color))
+                .unwrap_or(0),
+        };
+        self.account_userpic(&pic, size)
     }
 
     /// An account's userpic: its photo or the colored circle with initials.
@@ -589,12 +601,17 @@ impl MainView {
             ("menu-settings", Icon::MenuSettings, "Settings"),
         ];
         for (id, glyph, text) in items {
+            let action = if id == "menu-settings" {
+                RowAction::Settings
+            } else {
+                RowAction::None
+            };
             list = list.child(self.menu_row(
                 id.into(),
                 self.row_icon(glyph, hovered(id), window),
                 text.into(),
                 None,
-                RowAction::None,
+                action,
                 cx,
             ));
         }
@@ -606,7 +623,10 @@ impl MainView {
             RowAction::NightMode,
             cx,
         ));
-        // The footer: the app and its version (`mainMenuTelegramLabel`).
+        // The footer (`mainMenuTelegramLabel`, `mainMenuVersionLabel`): the app, a
+        // link to the repository; the version (its releases) and "About".
+        use super::layers::{LinkTarget, Part, repo_url};
+        let sub = (p.window_sub_text_fg, p.window_sub_text_fg);
         let footer = div()
             .relative()
             .flex_none()
@@ -617,19 +637,41 @@ impl MainView {
                     .absolute()
                     .left(px(FOOTER_LEFT))
                     .bottom(px(TELEGRAM_BOTTOM))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(c(p.window_sub_text_fg))
-                    .child(crate::APP_NAME),
+                    .child(self.linked_label(
+                        "menu-app-name",
+                        vec![Part::Link(
+                            crate::APP_NAME.into(),
+                            LinkTarget::Url(repo_url("")),
+                        )],
+                        None,
+                        13.,
+                        None,
+                        FontWeight::SEMIBOLD,
+                        sub,
+                        cx,
+                    )),
             )
             .child(
                 div()
                     .absolute()
                     .left(px(FOOTER_LEFT))
                     .bottom(px(VERSION_BOTTOM))
-                    .text_color(c(p.window_sub_text_fg))
-                    .child(format!(
-                        "Version {} x64 \u{2013} About",
-                        env!("CARGO_PKG_VERSION")
+                    .child(self.linked_label(
+                        "menu-version",
+                        vec![
+                            Part::Link(
+                                format!("Version {} x64", env!("CARGO_PKG_VERSION")),
+                                LinkTarget::Url(repo_url("releases")),
+                            ),
+                            Part::Text(" \u{2013} "),
+                            Part::Link("About".into(), LinkTarget::About),
+                        ],
+                        None,
+                        13.,
+                        None,
+                        FontWeight::NORMAL,
+                        sub,
+                        cx,
                     )),
             );
         let body = div()
@@ -643,35 +685,15 @@ impl MainView {
             .child(footer);
 
         div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
+            .id("main-menu")
+            .w(px(width))
+            .h_full()
+            .bg(c(p.main_menu_bg))
+            .occlude()
             .flex()
-            .child(
-                div()
-                    .id("main-menu")
-                    .w(px(width))
-                    .h_full()
-                    .bg(c(p.main_menu_bg))
-                    .occlude()
-                    .flex()
-                    .flex_col()
-                    .child(cover)
-                    .child(body),
-            )
-            .child(
-                div()
-                    .id("main-menu-backdrop")
-                    .flex_1()
-                    .h_full()
-                    .bg(c(p.layer_bg))
-                    .occlude()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.main_menu_open = false;
-                        cx.notify();
-                    })),
-            )
+            .flex_col()
+            .child(cover)
+            .child(body)
     }
 }
 

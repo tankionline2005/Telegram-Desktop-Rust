@@ -101,6 +101,7 @@ struct Phone {
 pub async fn run(
     client: Client,
     session_path: std::path::PathBuf,
+    qr: bool,
     mut commands: mpsc::UnboundedReceiver<LoginCommand>,
     events: mpsc::UnboundedSender<LoginEvent>,
 ) {
@@ -117,40 +118,13 @@ pub async fn run(
                 Ok(enums::NearestDc::NearestDc(n)) => n.country,
                 Err(_) => String::new(),
             };
-            let list = match client
-                .invoke(&functions::help::GetCountriesList {
-                    lang_code: "en".into(),
-                    hash: 0,
-                })
-                .await
-            {
-                Ok(enums::help::CountriesList::CountriesList(l)) => l
-                    .countries
-                    .iter()
-                    .flat_map(|c| {
-                        let enums::help::Country::Country(c) = c;
-                        let name = c.name.clone().unwrap_or_else(|| c.default_name.clone());
-                        c.country_codes
-                            .iter()
-                            .map(|code| {
-                                let enums::help::CountryCode::CountryCode(code) = code;
-                                Country {
-                                    iso2: c.iso2.clone(),
-                                    name: name.clone(),
-                                    code: code.country_code.clone(),
-                                    patterns: code.patterns.clone().unwrap_or_default(),
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
+            let list = countries(&client).await;
             let _ = events.send(LoginEvent::Countries { list, nearest });
         });
     }
 
-    let mut qr = true;
+    // The start screen shows first: no QR code until `LoginCommand::Qr`.
+    let mut qr = qr;
     let mut shown_token: Vec<u8> = Vec::new();
     let mut phone: Option<Phone> = None;
     let mut password: Option<types::account::Password> = None;
@@ -493,6 +467,46 @@ fn base64url(data: &[u8]) -> String {
         }
     }
     out
+}
+
+/// The countries with their calling codes and number patterns
+/// (`help.getCountriesList`; tdesktop has the same list built in). Empty on errors.
+pub async fn countries(client: &Client) -> Vec<Country> {
+    match client
+        .invoke(&functions::help::GetCountriesList {
+            lang_code: "en".into(),
+            hash: 0,
+        })
+        .await
+    {
+        Ok(enums::help::CountriesList::CountriesList(l)) => l
+            .countries
+            .iter()
+            .flat_map(|c| {
+                let enums::help::Country::Country(c) = c;
+                let name = c.name.clone().unwrap_or_else(|| c.default_name.clone());
+                c.country_codes
+                    .iter()
+                    .map(|code| {
+                        let enums::help::CountryCode::CountryCode(code) = code;
+                        Country {
+                            iso2: c.iso2.clone(),
+                            name: name.clone(),
+                            code: code.country_code.clone(),
+                            patterns: code.patterns.clone().unwrap_or_default(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `auth.logOut`, waiting at most `timeout` (the account goes either way, as in
+/// tdesktop's `MTP::Instance::logout`, which finishes on failures too).
+pub async fn log_out(client: &Client, timeout: std::time::Duration) {
+    let _ = tokio::time::timeout(timeout, client.invoke(&functions::auth::LogOut {})).await;
 }
 
 /// The phone formatted by the country's pattern (`Ui::FormatPhone`): "+7 900 123 45 67".

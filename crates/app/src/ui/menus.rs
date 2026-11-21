@@ -74,6 +74,34 @@ impl CodeHint {
 }
 
 impl MainView {
+    /// Settings' "⋮" menu (`Settings::Main::fillTopBarMenu`), its top right at `at`.
+    pub(super) fn open_settings_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let accounts = self.accounts.read(cx);
+        let mut entries = Vec::new();
+        if accounts.slots.len() < accounts.max_accounts() {
+            entries.push(Entry::action(
+                "Add Account",
+                Icon::MenuAddAccount,
+                MenuAction::AddAccount,
+            ));
+        }
+        entries.push(Entry::action(
+            "Edit profile",
+            Icon::MenuEdit,
+            MenuAction::EditProfile,
+        ));
+        entries.push(Entry::attention(
+            "Log out",
+            Icon::MenuLeave,
+            MenuAction::LogOut,
+        ));
+        self.text_ui.menu = Some(OpenMenu {
+            menu: PopupMenu::new(entries, true, at).top_right_origin(),
+            tag: MenuTag::Other,
+            phone_author: None,
+        });
+    }
+
     fn open_menu(&mut self, entries: Vec<Entry>, at: Point<Pixels>, tag: MenuTag) {
         if entries.is_empty() {
             return;
@@ -492,6 +520,11 @@ impl MainView {
                 }
             }
             MenuAction::OpenUrl(url) => cx.open_url(&url),
+            MenuAction::AddAccount => self.add_account_clicked(window, cx),
+            MenuAction::LogOut => {
+                let id = self.accounts.read(cx).registry.active;
+                self.layers.show_layer(super::layers::LayerBox::LogOut(id));
+            }
             // Replies, editing, pins, forwarding, deleting, selecting messages,
             // contacts, calendar export, profiles and notifications come later.
             MenuAction::Reply
@@ -508,7 +541,9 @@ impl MainView {
             | MenuAction::TrayShow
             | MenuAction::TrayHide
             | MenuAction::TrayQuit
-            | MenuAction::SetReminder => {}
+            | MenuAction::SetReminder
+            // "Edit profile" comes with the profile section.
+            | MenuAction::EditProfile => {}
         }
     }
 

@@ -24,6 +24,10 @@ pub const PREMIUM_MAX_ACCOUNTS: usize = 6;
 
 const REGISTRY_FILE: &str = "accounts.txt";
 
+/// A logout that the data thread does not report in this time (stuck connecting)
+/// removes the account anyway.
+const LOG_OUT_FALLBACK: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// The accounts' order, the active one and whether the menu shows the list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registry {
@@ -114,6 +118,8 @@ pub struct AccountSlot {
     pub userpic: Option<(i64, Arc<RenderImage>)>,
     pub state: AccountState,
     asked_photo: Option<i64>,
+    /// "Log out" was asked: the account goes once its data thread reports.
+    logging_out: bool,
 }
 
 /// The window should show the active account anew.
@@ -188,6 +194,7 @@ impl Accounts {
             userpic: None,
             state: AccountState::default(),
             asked_photo: None,
+            logging_out: false,
         });
         cx.spawn(async move |this, cx| {
             while let Some(update) = updates.recv().await {
@@ -200,6 +207,10 @@ impl Accounts {
     }
 
     fn route(&mut self, id: u32, update: Update, cx: &mut Context<Self>) {
+        if matches!(update, Update::LoggedOut) {
+            self.remove(id, cx);
+            return;
+        }
         let active = self.registry.active == id;
         if let Some(slot) = self.slots.iter_mut().find(|s| s.id == id) {
             match &update {
@@ -326,6 +337,57 @@ impl Accounts {
         (id, paths(&self.base, id).session)
     }
 
+    /// "Log out" (`Core::Application::logoutWithChecks`): the server forgets the
+    /// session, the account's data goes, another account (or the login) is shown.
+    /// Without an answer in a while it goes anyway.
+    pub fn log_out(&mut self, id: u32, cx: &mut Context<Self>) {
+        let Some(slot) = self.slots.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        if slot.logging_out {
+            return;
+        }
+        slot.logging_out = true;
+        if slot.commands.send(Command::LogOut).is_err() {
+            self.remove(id, cx);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(LOG_OUT_FALLBACK).await;
+            let _ = this.update(cx, |a, cx| a.remove(id, cx));
+        })
+        .detach();
+    }
+
+    /// The account leaves: its thread stops (the slot's sender goes), its files are
+    /// removed, the next account is shown (`Main::Domain::removeRedundantAccounts`).
+    fn remove(&mut self, id: u32, cx: &mut Context<Self>) {
+        let Some(index) = self.slots.iter().position(|s| s.id == id) else {
+            return;
+        };
+        self.slots.remove(index);
+        self.registry.ids.retain(|i| *i != id);
+        if !self.demo {
+            bridge::remove_account_files(&paths(&self.base, id));
+            if id != 1 {
+                let _ = std::fs::remove_dir_all(account_dir(&self.base, id));
+            }
+        }
+        if self.registry.ids.len() < 2 {
+            self.registry.menu_accounts = false;
+        }
+        let was_active = self.registry.active == id;
+        if was_active && let Some(next) = self.registry.ids.first() {
+            self.registry.active = *next;
+        }
+        self.save();
+        if was_active {
+            // No account left: the window shows the login (the start screen).
+            cx.emit(Activated);
+        }
+        cx.notify();
+    }
+
     /// A login finished: the account joins the list and is shown.
     pub fn logged_in(&mut self, id: u32, cx: &mut Context<Self>) {
         if !self.registry.ids.contains(&id) {
@@ -340,9 +402,11 @@ impl Accounts {
 }
 
 /// One login in its own thread (`tdr_data::login::run`).
+/// `qr`: the QR code at once (adding an account); else after the start screen.
 pub fn start_login(
     config: Config,
     session_path: PathBuf,
+    qr: bool,
 ) -> (
     mpsc::UnboundedSender<tdr_data::login::LoginCommand>,
     mpsc::UnboundedReceiver<tdr_data::login::LoginEvent>,
@@ -359,7 +423,7 @@ pub fn start_login(
                 .expect("tokio runtime");
             rt.block_on(async move {
                 let client = tdr_api::Client::new(config, SessionData::new(2));
-                tdr_data::login::run(client, session_path, cmd_rx, ev_tx).await;
+                tdr_data::login::run(client, session_path, qr, cmd_rx, ev_tx).await;
             });
         })
         .expect("spawn login thread");

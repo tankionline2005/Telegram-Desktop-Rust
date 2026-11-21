@@ -24,7 +24,7 @@ pub use rusqlite::Error;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Schema version (`PRAGMA user_version`); bump with a migration in [`migrate`].
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 /// Message ids above this are made by the client (tdesktop's `ServerMaxMsgId`), e.g.
 /// service notifications that the server sends as updates rather than messages.
@@ -116,6 +116,10 @@ pub struct DialogRow {
     pub read_outbox_max_id: i32,
     /// Muted until this Unix time; `None`: the default for the chat type.
     pub mute_until: Option<i32>,
+    /// Unread messages that mention us.
+    pub unread_mentions: i32,
+    /// Marked as unread by hand (`dialog.unread_mark`).
+    pub unread_mark: bool,
 }
 
 /// A chat-list entry with what is needed to show it.
@@ -128,9 +132,18 @@ pub struct DialogView {
     pub draft: Option<(String, i32)>,
 }
 
-/// See [`Storage::unread_counts`]: peer, folder, unread messages, own mute time, a
-/// broadcast channel.
-pub type UnreadRow = (PeerKey, i32, i32, Option<i32>, bool);
+/// See [`Storage::unread_counts`].
+#[derive(Debug, Clone, Copy)]
+pub struct UnreadRow {
+    pub peer: PeerKey,
+    pub folder_id: i32,
+    pub unread: i32,
+    pub mute_until: Option<i32>,
+    /// A broadcast channel (its default notifications are the channels' ones).
+    pub broadcast: bool,
+    pub mentions: i32,
+    pub mark: bool,
+}
 
 /// See [`Storage::history`].
 #[derive(Debug, Clone)]
@@ -213,6 +226,12 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         // Chats the server's chat list leaves out (`messages.getPeerDialogs` still has
         // them), kept once opened: list clean-ups leave them alone.
         tx.execute_batch("ALTER TABLE dialogs ADD COLUMN kept INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    if version < 8 {
+        tx.execute_batch(
+            "ALTER TABLE dialogs ADD COLUMN unread_mentions INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE dialogs ADD COLUMN unread_mark INTEGER NOT NULL DEFAULT 0;",
+        )?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()
@@ -481,7 +500,7 @@ impl Storage {
     pub fn unread_counts(&self) -> Result<Vec<UnreadRow>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT d.kind, d.id, d.folder_id, d.unread_count, d.mute_until,
-                    COALESCE(p.is_megagroup, 0)
+                    COALESCE(p.is_megagroup, 0), d.unread_mentions, d.unread_mark
              FROM dialogs d
              LEFT JOIN peers p ON p.kind = d.kind AND p.id = d.id",
         )?;
@@ -491,13 +510,15 @@ impl Storage {
                 id: r.get(1)?,
             };
             let megagroup: bool = r.get(5)?;
-            Ok((
+            Ok(UnreadRow {
                 peer,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                peer.kind == PeerKind::Channel && !megagroup,
-            ))
+                folder_id: r.get(2)?,
+                unread: r.get(3)?,
+                mute_until: r.get(4)?,
+                broadcast: peer.kind == PeerKind::Channel && !megagroup,
+                mentions: r.get(6)?,
+                mark: r.get(7)?,
+            })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
     }
@@ -508,7 +529,8 @@ impl Storage {
                     p.kind, p.id, p.access_hash, p.is_min, p.is_megagroup, p.name, p.username, p.raw_layer, p.raw,
                     m.date, m.from_kind, m.from_id, m.out, m.text, m.raw_layer, m.raw,
                     dr.text, dr.date,
-                    d.read_inbox_max_id, d.read_outbox_max_id, d.mute_until
+                    d.read_inbox_max_id, d.read_outbox_max_id, d.mute_until,
+                    d.unread_mentions, d.unread_mark
              FROM dialogs d
              LEFT JOIN peers p ON p.kind = d.kind AND p.id = d.id
              LEFT JOIN messages m ON m.kind = d.kind AND m.peer_id = d.id AND m.id = d.top_message
@@ -533,6 +555,8 @@ impl Storage {
                 read_inbox_max_id: r.get(26)?,
                 read_outbox_max_id: r.get(27)?,
                 mute_until: r.get(28)?,
+                unread_mentions: r.get(29)?,
+                unread_mark: r.get(30)?,
             };
             let peer = match r.get::<_, Option<i64>>(8)? {
                 Some(_) => Some(read_peer_at(r, 8)?),
@@ -783,9 +807,11 @@ impl Writer<'_> {
         self.tx
             .prepare_cached(
                 "INSERT INTO dialogs (kind, id, top_message, top_date, pinned, folder_id, unread_count, pts, cached_from,
-                                      read_inbox_max_id, read_outbox_max_id, mute_until)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?3, ?10, ?11, ?12)
+                                      read_inbox_max_id, read_outbox_max_id, mute_until, unread_mentions, unread_mark)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?3, ?10, ?11, ?12, ?13, ?14)
                  ON CONFLICT (kind, id) DO UPDATE SET
+                    unread_mentions  = excluded.unread_mentions,
+                    unread_mark      = excluded.unread_mark,
                     read_inbox_max_id  = MAX(dialogs.read_inbox_max_id, excluded.read_inbox_max_id),
                     read_outbox_max_id = MAX(dialogs.read_outbox_max_id, excluded.read_outbox_max_id),
                     mute_until       = excluded.mute_until,
@@ -816,7 +842,7 @@ impl Writer<'_> {
                 d.read_inbox_max_id,
                 d.read_outbox_max_id,
                 d.mute_until
-            ])?;
+            , d.unread_mentions, d.unread_mark])?;
         Ok(())
     }
 
@@ -836,11 +862,32 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// `updateReadHistoryInbox`: read up to `max_id`, `unread` left.
+    /// An incoming message that mentions us and is not read yet.
+    pub fn mention_arrived(&self, peer: PeerKey) -> Result<()> {
+        self.tx
+            .prepare_cached(
+                "UPDATE dialogs SET unread_mentions = unread_mentions + 1 WHERE kind = ?1 AND id = ?2",
+            )?
+            .execute(params![peer.kind as i64, peer.id])?;
+        Ok(())
+    }
+
+    /// `updateDialogUnreadMark`.
+    pub fn set_unread_mark(&self, peer: PeerKey, mark: bool) -> Result<()> {
+        self.tx
+            .prepare_cached("UPDATE dialogs SET unread_mark = ?3 WHERE kind = ?1 AND id = ?2")?
+            .execute(params![peer.kind as i64, peer.id, mark])?;
+        Ok(())
+    }
+
+    /// `updateReadHistoryInbox`: read up to `max_id`, `unread` left. Reading
+    /// everything also reads the mentions and drops the mark.
     pub fn set_read_inbox(&self, peer: PeerKey, max_id: i32, unread: i32) -> Result<()> {
         self.tx
             .prepare_cached(
-                "UPDATE dialogs SET unread_count = ?4, read_inbox_max_id = MAX(read_inbox_max_id, ?3)
+                "UPDATE dialogs SET unread_count = ?4, read_inbox_max_id = MAX(read_inbox_max_id, ?3),
+                        unread_mentions = CASE WHEN ?4 = 0 THEN 0 ELSE unread_mentions END,
+                        unread_mark = CASE WHEN ?4 = 0 THEN 0 ELSE unread_mark END
                  WHERE kind = ?1 AND id = ?2",
             )?
             .execute(params![peer.kind as i64, peer.id, max_id, unread])?;
@@ -1076,6 +1123,8 @@ mod tests {
             read_inbox_max_id: 0,
             read_outbox_max_id: 0,
             mute_until: None,
+            unread_mentions: 0,
+            unread_mark: false,
         };
         s.write(|w| {
             w.put_message(&msg(tg, 100, 1000, false, "old"))?;
@@ -1134,6 +1183,8 @@ mod tests {
                     read_inbox_max_id: 0,
                     read_outbox_max_id: 0,
                     mute_until: None,
+                    unread_mentions: 0,
+                    unread_mark: false,
                 })?;
             }
             Ok(())
@@ -1266,6 +1317,8 @@ mod tests {
             read_inbox_max_id: 0,
             read_outbox_max_id: 0,
             mute_until: None,
+            unread_mentions: 0,
+            unread_mark: false,
         };
         // Chat list load: only the top message is known.
         s.write(|w| {
@@ -1344,6 +1397,8 @@ mod tests {
             read_inbox_max_id: 0,
             read_outbox_max_id: 0,
             mute_until: None,
+            unread_mentions: 0,
+            unread_mark: false,
         };
         s.write(|w| {
             for (id, date) in [(1, 100), (2, 200), (3, 300), (4, 400), (5, 500)] {

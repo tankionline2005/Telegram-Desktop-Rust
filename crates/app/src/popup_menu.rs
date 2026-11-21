@@ -111,6 +111,10 @@ pub enum MenuAction {
     /// Copy this, then show this toast (if any).
     Copy(String, Option<&'static str>),
     OpenUrl(String),
+    // Settings' "⋮" menu.
+    AddAccount,
+    EditProfile,
+    LogOut,
     /// The tray menu's first item: show or hide the window.
     TrayShow,
     TrayHide,
@@ -131,6 +135,8 @@ pub enum Entry {
         label: SharedString,
         icon: Option<Icon>,
         action: MenuAction,
+        /// `menuWithIconsAttention`: red text and icon ("Log out").
+        attention: bool,
     },
     /// A plain item (`defaultMenu`): its shortcut on the right, greyed out when
     /// disabled, or a submenu (an arrow on the right, opens on hover).
@@ -166,6 +172,17 @@ impl Entry {
             label: label.to_string().into(),
             icon: Some(icon),
             action,
+            attention: false,
+        }
+    }
+
+    /// An item in `attentionButtonFg` (`isAttention`).
+    pub fn attention(label: &str, icon: Icon, action: MenuAction) -> Self {
+        Entry::Action {
+            label: label.to_string().into(),
+            icon: Some(icon),
+            action,
+            attention: true,
         }
     }
 
@@ -234,6 +251,8 @@ pub struct PopupMenu {
     /// A submenu: the parent's left edge and width (it goes left of the parent
     /// when it does not fit on the right).
     parent: Option<(f32, f32)>,
+    /// `setForcedOrigin(TopRight)`: the anchor is the top right corner.
+    top_right: bool,
 }
 
 /// Mouse input over a menu.
@@ -315,7 +334,15 @@ impl PopupMenu {
             ripple: None,
             child: None,
             parent: None,
+            top_right: false,
         }
+    }
+
+    /// Opens to the left of the anchor and unrolls from the top right corner
+    /// (`PanelAnimation::Origin::TopRight`).
+    pub fn top_right_origin(mut self) -> Self {
+        self.top_right = true;
+        self
     }
 
     fn style(&self) -> &'static Style {
@@ -509,7 +536,7 @@ impl PopupMenu {
             left + f32::from(area.size.width),
             top + f32::from(area.size.height),
         );
-        let from_right = ax + w > right;
+        let from_right = self.top_right || ax + w > right;
         let from_bottom = ay + h > bottom;
         // A submenu that does not fit on the right goes left of its parent.
         let flipped = match self.parent {
@@ -545,6 +572,9 @@ pub struct MenuColors {
     pub disabled: Color,
     pub icon: Color,
     pub separator: Color,
+    /// `attentionButtonFg`, `attentionButtonFgOver`.
+    pub attention: Color,
+    pub attention_over: Color,
 }
 
 impl MenuColors {
@@ -561,6 +591,8 @@ impl MenuColors {
             disabled: p.menu_fg_disabled,
             icon: p.window_bold_fg,
             separator: p.menu_separator_fg,
+            attention: p.attention_button_fg,
+            attention_over: p.attention_button_fg_over,
         }
     }
 }
@@ -803,14 +835,25 @@ fn render_frame(
                     .bg(hsla(colors.separator)),
             ),
             Entry::Action {
-                label, icon: kind, ..
+                label,
+                icon: kind,
+                attention,
+                ..
             } => row
                 .children(kind.map(|k| {
                     div()
                         .absolute()
                         .left(px(st.icon_position.0))
                         .top(px(st.icon_position.1))
-                        .child(icon(k, colors.icon, window))
+                        .child(icon(
+                            k,
+                            if *attention {
+                                colors.attention
+                            } else {
+                                colors.icon
+                            },
+                            window,
+                        ))
                 }))
                 .child(
                     div()
@@ -819,7 +862,11 @@ fn render_frame(
                         .top(gpx(pt))
                         .w(gpx(g.w - pl - lg(st.item_padding[2])))
                         .h(font_h.line_height())
-                        .text_color(hsla(fg))
+                        .text_color(hsla(match (*attention, hovered) {
+                            (true, true) => colors.attention_over,
+                            (true, false) => colors.attention,
+                            _ => fg,
+                        }))
                         .child(one_line(label.clone())),
                 ),
             Entry::WideSeparator => row.child(

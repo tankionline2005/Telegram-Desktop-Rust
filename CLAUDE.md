@@ -79,6 +79,15 @@
   driven by `tdr_data::login::run`), `ui/main_menu.rs`. Demo: `--accounts` (three fake
   accounts), `--intro` (the login screens; the demo walks through code and password).
   `tdr probe login` checks the login flow (event kinds only).
+- Layers (`ui/layers.rs`, tdesktop's `LayerStackWidget`): the main menu, Settings
+  (`ui/settings.rs`, the special layer) and boxes (About, the logout confirmation)
+  with the stack's animations; they are drawn at the view's root, below the title
+  bar. Animation helpers: `anim.rs` (`Simple`, easings). Demo: `--start` (the first
+  launch's start screen), `--intro` (the login of "Add Account").
+- Links to the repository come only from `REPO_URL` (`main.rs`, from Cargo.toml's
+  `repository`) through `ui::layers::repo_url`.
+- Demo click coordinates are logical: screenshots are device pixels (divide by the
+  scale, 1.25 here).
 - Demo checks must not run while the user's own window is in front: `uilib.ps1`'s
   `Shot` guards too, a screenshot never captures anything but the demo window.
 - GPUI text input: typed characters reach an element through its input handler

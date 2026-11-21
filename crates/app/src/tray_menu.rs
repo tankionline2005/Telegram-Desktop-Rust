@@ -147,6 +147,7 @@ pub fn open(
         label: label.to_string().into(),
         icon: None,
         action,
+        attention: false,
     };
     let entries = vec![
         // The window on screen: it goes to the tray; in the tray: it comes back.

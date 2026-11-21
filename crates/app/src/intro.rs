@@ -14,6 +14,7 @@ use tdr_data::login::{Country, LoginCommand, LoginEvent};
 use tdr_theme::{Color, Palette};
 use tokio::sync::mpsc;
 
+use crate::anim::{self, Simple};
 use crate::icons::{Icon, icon};
 use crate::one_line::one_line;
 use crate::scale::{self, px};
@@ -67,6 +68,32 @@ const BOX_RADIUS: f32 = 3.;
 /// `defaultInputField`: the placeholder floats up 20 px, scaled to 0.9.
 const PLACEHOLDER_SHIFT: f32 = -20.;
 const CARET_BLINK: Duration = Duration::from_millis(530);
+// The start screen's cover (`introCover*`) and the transitions.
+const COVER_HEIGHT: f32 = 208.;
+const COVER_MAX_WIDTH: f32 = 880.;
+const COVER_ICONS_MIN_SKIP: f32 = 120.;
+const COVER_ICON_LEFT: f32 = 50.;
+const COVER_ICON_TOP: f32 = 46.;
+const COVER_TITLE_TOP: f32 = 136.;
+const COVER_TITLE_FONT: f32 = 22.;
+const COVER_DESCRIPTION_TOP: f32 = 174.;
+const COVER_DESCRIPTION_FONT: f32 = 15.;
+const COVER_DESCRIPTION_LINE: f32 = 24.;
+const CONTENT_TOP_ADD: f32 = 30.;
+const STEP_HEIGHT_FULL: f32 = 590.;
+const WINDOW_MIN_HEIGHT: f32 = 480.;
+/// `introStepWidth`, `introStepHeight`: the part of a step that slides.
+const SLIDE_WIDTH: f32 = 380.;
+const SLIDE_HEIGHT: f32 = 384.;
+/// `introSlideDuration`, `introCoverDuration`.
+const SLIDE_DURATION: f32 = 200.;
+const COVER_DURATION: f32 = 200.;
+/// `introNextSlide`, `slideDuration` (the Next button going away or coming),
+/// `fadeWrapDuration`.
+const NEXT_SLIDE: f32 = 200.;
+const NEXT_SLIDE_DURATION: f32 = 240.;
+const FADE_DURATION: f32 = 200.;
+const SETTINGS_SKIP: f32 = 10.;
 
 /// The login screen asks the window to go back, or is done.
 pub enum IntroEvent {
@@ -76,10 +103,54 @@ pub enum IntroEvent {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Step {
+    /// "Start Messaging" (`StartWidget`), the first launch.
+    Start,
     Qr,
     Phone,
     Code,
     Password,
+}
+
+impl Step {
+    fn has_cover(self) -> bool {
+        self == Step::Start
+    }
+
+    /// The Next button's text (`nextButtonText`); none on the QR step.
+    fn next_text(self) -> Option<&'static str> {
+        match self {
+            Step::Start => Some("Start Messaging"),
+            Step::Qr => None,
+            Step::Phone | Step::Code => Some("Next"),
+            Step::Password => Some("Submit"),
+        }
+    }
+}
+
+/// A step change being animated (`Widget::historyMove`, `Step::showAnimated`).
+struct Transition {
+    from: Step,
+    back: bool,
+    start: Instant,
+    /// Where the Next button and the top controls were (`_nextTopFrom`,
+    /// `_controlsTopFrom`).
+    next_top_from: f32,
+    controls_top_from: f32,
+}
+
+impl Transition {
+    fn t(&self) -> f32 {
+        (self.start.elapsed().as_secs_f32() * 1000. / SLIDE_DURATION.max(COVER_DURATION)).min(1.)
+    }
+}
+
+fn fade(on: bool, duration: f32) -> Option<Simple> {
+    Some(Simple::new(
+        f32::from(!on),
+        f32::from(on),
+        duration,
+        anim::linear,
+    ))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -156,15 +227,30 @@ pub struct IntroView {
     /// The step changed without a window at hand: its field takes the focus when
     /// drawn.
     focus_pending: bool,
+    /// The login began at the start screen: back from the QR code returns there.
+    start_below: bool,
+    transition: Option<Transition>,
+    /// The Next button: shown, its slide and fade, and its last text.
+    next_shown: bool,
+    next_slide: Option<Simple>,
+    next_fade: Option<Simple>,
+    next_text: &'static str,
+    /// The back arrow and "Settings" fading in and out (`FadeWrap::toggle`).
+    back_fade: Option<Simple>,
+    settings_fade: Option<Simple>,
+    /// The area's height at the last frame.
+    last_height: f32,
 }
 
 impl EventEmitter<IntroEvent> for IntroView {}
 
 impl IntroView {
     /// `login`: the login thread's channels (`None`: a demo, nothing happens).
+    /// `start`: begin at the start screen (no account yet), else at the QR code.
     pub fn new(
         palette: &'static Palette,
         can_back: bool,
+        start: bool,
         login: Option<(
             mpsc::UnboundedSender<LoginCommand>,
             mpsc::UnboundedReceiver<LoginEvent>,
@@ -203,7 +289,7 @@ impl IntroView {
         let mut this = Self {
             palette,
             commands,
-            step: Step::Qr,
+            step: if start { Step::Start } else { Step::Qr },
             can_back,
             qr: None,
             qr_url: None,
@@ -225,6 +311,15 @@ impl IntroView {
             hovered: None,
             blink: Instant::now(),
             focus_pending: false,
+            start_below: start,
+            transition: None,
+            next_shown: start,
+            next_slide: None,
+            next_fade: None,
+            next_text: "Start Messaging",
+            back_fade: None,
+            settings_fade: None,
+            last_height: 0.,
         };
         if this.commands.is_none() {
             // The demo: a QR code that leads nowhere, a few countries.
@@ -344,13 +439,13 @@ impl IntroView {
                 self.code_current = 0;
                 self.code_error = false;
                 self.error = None;
-                self.step = Step::Code;
+                self.switch_to(Step::Code, false);
                 self.focus_pending = true;
             }
             LoginEvent::PasswordNeeded { hint } => {
                 self.hint = hint;
                 self.error = None;
-                self.step = Step::Password;
+                self.switch_to(Step::Password, false);
                 self.focus_pending = true;
             }
             LoginEvent::Error(text) => {
@@ -362,7 +457,7 @@ impl IntroView {
                         self.code_current = 0;
                     }
                     Step::Password => self.fields[FieldId::Password as usize].error = true,
-                    Step::Qr => {}
+                    Step::Qr | Step::Start => {}
                 }
                 self.error = Some(text);
             }
@@ -388,30 +483,101 @@ impl IntroView {
         };
     }
 
-    fn go(&mut self, step: Step, window: &mut Window, cx: &mut Context<Self>) {
+    /// To `step` (`back`: the animation goes the other way). Nothing while a step
+    /// change is animated (`Widget::historyMove`).
+    fn go(&mut self, step: Step, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.transition.as_ref().is_some_and(|t| t.t() < 1.) {
+            return;
+        }
         self.error = None;
         match (self.step, step) {
-            (Step::Qr, Step::Phone) => self.send(LoginCommand::StopQr, cx),
+            (Step::Qr, Step::Phone | Step::Start) => self.send(LoginCommand::StopQr, cx),
             (_, Step::Qr) => self.send(LoginCommand::Qr, cx),
             _ => {}
         }
-        self.step = step;
+        self.switch_to(step, back);
         match step {
             Step::Phone => window.focus(&self.fields[FieldId::Phone as usize].focus),
             Step::Code => window.focus(&self.code_focus),
             Step::Password => window.focus(&self.fields[FieldId::Password as usize].focus),
-            Step::Qr => {}
+            Step::Qr | Step::Start => {}
         }
         cx.notify();
+    }
+
+    /// The step changes, animated from where things are now.
+    fn switch_to(&mut self, step: Step, back: bool) {
+        let from = self.step;
+        if from == step {
+            return;
+        }
+        self.transition = Some(Transition {
+            from,
+            back,
+            start: Instant::now(),
+            next_top_from: self.content_top(from, self.last_height) + scale::lg(NEXT_TOP),
+            controls_top_from: if from.has_cover() {
+                scale::lg(COVER_HEIGHT)
+            } else {
+                0.
+            },
+        });
+        let (back_was, settings_was) = (self.has_back(from), !from.has_cover());
+        self.step = step;
+        if self.has_back(step) != back_was {
+            self.back_fade = fade(self.has_back(step), FADE_DURATION);
+        }
+        if !step.has_cover() != settings_was {
+            self.settings_fade = fade(!step.has_cover(), FADE_DURATION);
+        }
+        let next = step.next_text();
+        if let Some(text) = next {
+            self.next_text = text;
+        }
+        if next.is_some() != self.next_shown {
+            self.next_shown = next.is_some();
+            self.next_slide = Some(Simple::new(
+                f32::from(!self.next_shown),
+                f32::from(self.next_shown),
+                NEXT_SLIDE_DURATION,
+                anim::linear,
+            ));
+            self.next_fade = fade(self.next_shown, FADE_DURATION);
+        }
+    }
+
+    fn has_back(&self, step: Step) -> bool {
+        match step {
+            Step::Start => false,
+            Step::Qr => self.can_back || self.start_below,
+            _ => true,
+        }
+    }
+
+    /// `Step::contentTop`: the steps' top, lower on the start screen in a low window.
+    fn content_top(&self, step: Step, height: f32) -> f32 {
+        let mut top = ((height - scale::lg(INTRO_HEIGHT)) / 2.)
+            .floor()
+            .max(scale::lg(STEP_TOP_MIN));
+        if step.has_cover() {
+            let full = top + scale::lg(NEXT_TOP) + scale::lg(CONTENT_TOP_ADD);
+            let added = 1.
+                - ((full - scale::lg(WINDOW_MIN_HEIGHT))
+                    / (scale::lg(STEP_HEIGHT_FULL) - scale::lg(WINDOW_MIN_HEIGHT)))
+                .clamp(0., 1.);
+            top += (added * scale::lg(CONTENT_TOP_ADD)).round();
+        }
+        top
     }
 
     /// `Widget::backRequested`: the previous step, else back to the accounts.
     fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.step {
-            Step::Code | Step::Password => self.go(Step::Phone, window, cx),
-            Step::Phone => self.go(Step::Qr, window, cx),
+            Step::Code | Step::Password => self.go(Step::Phone, true, window, cx),
+            Step::Phone => self.go(Step::Qr, true, window, cx),
+            Step::Qr if self.start_below => self.go(Step::Start, true, window, cx),
             Step::Qr if self.can_back => cx.emit(IntroEvent::Back),
-            Step::Qr => {}
+            Step::Qr | Step::Start => {}
         }
     }
 
@@ -421,6 +587,8 @@ impl IntroView {
         }
         match self.step {
             Step::Qr => {}
+            // `StartWidget::submit`.
+            Step::Start => self.go(Step::Qr, false, window, cx),
             Step::Phone => {
                 let digits: String = format!(
                     "{}{}",
@@ -952,7 +1120,7 @@ impl IntroView {
                     "intro-to-phone",
                     "Log in using phone number",
                     cx,
-                    |this, window, cx| this.go(Step::Phone, window, cx),
+                    |this, window, cx| this.go(Step::Phone, false, window, cx),
                 ))
                 .into_any_element(),
         );
@@ -1129,6 +1297,10 @@ fn render_qr(url: &str, scale_factor: f32) -> Option<(Arc<RenderImage>, f32)> {
     ))
 }
 
+/// The start screen's description, in lines (the original's says "the official
+/// Telegram Desktop app"; this one is not).
+const START_DESCRIPTION: &str = "Welcome to an unofficial Telegram client, completely rewritten in Rust.\nIt\u{2019}s faster, smoother, and much lighter on your system resources\nthan the original.";
+
 fn super_text_width(window: &Window, text: &str, size: f32, weight: FontWeight) -> f32 {
     crate::ui::text_width(window, text, size, weight)
 }
@@ -1147,35 +1319,216 @@ impl Render for IntroView {
                 Step::Code => window.focus(&self.code_focus),
                 Step::Password => window.focus(&self.fields[FieldId::Password as usize].focus),
                 Step::Phone => window.focus(&self.fields[FieldId::Phone as usize].focus),
-                Step::Qr => {}
+                Step::Qr | Step::Start => {}
             }
         }
         let viewport = window.viewport_size();
         let width = f32::from(viewport.width);
         let height = f32::from(viewport.height) - scale::lg(crate::ui::TITLE_HEIGHT);
-        // `Step::contentTop`, `contentLeft`.
-        let top = ((height - scale::lg(INTRO_HEIGHT)) / 2.).max(scale::lg(STEP_TOP_MIN));
-        let left = (width - STEP_WIDTH) / 2.;
+        self.last_height = height;
+        let step = self.step;
+        let top = self.content_top(step, height);
+        let transition = self
+            .transition
+            .as_ref()
+            .filter(|t| t.t() < 1.)
+            .map(|t| (t.from, t.back, t.t(), t.next_top_from, t.controls_top_from));
+        if transition.is_none() {
+            self.transition = None;
+        }
+        let animating = transition.is_some()
+            || [
+                &self.next_slide,
+                &self.next_fade,
+                &self.back_fade,
+                &self.settings_fade,
+            ]
+            .iter()
+            .any(|a| a.as_ref().is_some_and(Simple::animating));
+        if animating {
+            window.request_animation_frame();
+        }
         let mut root = div()
             .id("intro")
             .relative()
             .size_full()
+            .overflow_hidden()
             .bg(c(p.intro_bg))
             .text_color(c(p.window_fg));
-        // The back arrow (`introBackButton`).
-        let has_back = match self.step {
-            Step::Qr => self.can_back,
-            _ => true,
+
+        // The Next button (`Widget::updateControlsGeometry`): it follows the step's
+        // top while the cover comes or goes, and slides down and fades when a step
+        // has none.
+        let cover_change =
+            transition.is_some_and(|(from, ..)| from.has_cover() != step.has_cover());
+        let shown = match transition {
+            Some((from, _, t, ..)) if cover_change => {
+                if from.has_cover() {
+                    t
+                } else {
+                    anim::ease_out_circ(t)
+                }
+            }
+            _ => 1.,
         };
-        if has_back {
+        let next_top_to = top + scale::lg(NEXT_TOP);
+        let next_top = match transition {
+            Some((.., next_from, _)) if cover_change => anim::mix(next_from, next_top_to, shown),
+            _ => next_top_to,
+        };
+        let next_amount = anim::value(&self.next_slide, f32::from(self.next_shown));
+        let real_next_top = anim::mix(next_top + scale::lg(NEXT_SLIDE), next_top, next_amount);
+        let next_opacity = anim::value(&self.next_fade, f32::from(self.next_shown));
+
+        // The step, or the two steps of a change.
+        let left = (width - STEP_WIDTH) / 2.;
+        match transition {
+            None => {
+                if step.has_cover() {
+                    root = root.child(self.render_cover(width, 0., false, window));
+                }
+                root = root.child(self.step_content(step, width, height, top, window, cx));
+            }
+            Some((from, _, t, ..)) if cover_change => {
+                // `Step::paintAnimated` with a cover: it comes down or goes up, the
+                // start screen's labels move and fade, the other step's content comes
+                // up from the bottom or goes down.
+                let progress = if step.has_cover() {
+                    anim::ease_out_circ(t)
+                } else {
+                    t
+                };
+                let cover_top = if step.has_cover() {
+                    anim::mix(-scale::lg(COVER_HEIGHT), 0., progress)
+                } else {
+                    anim::mix(0., -scale::lg(COVER_HEIGHT), progress)
+                };
+                root = root.child(self.render_cover(width, cover_top, !step.has_cover(), window));
+                let other = if step.has_cover() { from } else { step };
+                let other_top = self.content_top(other, height);
+                let start_top = self.content_top(Step::Start, height);
+                // The labels go between their places on the two steps.
+                let (label_t, alpha) = if step.has_cover() {
+                    (progress, progress)
+                } else {
+                    (1. - progress, 1. - progress)
+                };
+                root = root
+                    .child(
+                        self.moving_label(
+                            true, width, start_top, other_top, label_t, alpha, window,
+                        ),
+                    )
+                    .child(
+                        self.moving_label(
+                            false, width, start_top, other_top, label_t, alpha, window,
+                        ),
+                    );
+                // `paintContentSnapshot`: what is below the description.
+                let snap_top = other_top + scale::lg(QR_TOP);
+                let hidden = if step.has_cover() {
+                    progress
+                } else {
+                    1. - progress
+                };
+                let alpha = 1. - hidden;
+                let dy = ((height - snap_top) * hidden).round();
+                let clip_bottom = if next_amount > 0. {
+                    real_next_top
+                } else {
+                    height
+                };
+                let visible = (clip_bottom - snap_top - dy).max(0.);
+                let content = self.step_content(other, width, height, other_top, window, cx);
+                root = root.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top(gpui::px(snap_top + dy))
+                        .w(gpui::px(width))
+                        .h(gpui::px(visible))
+                        .overflow_hidden()
+                        .opacity(alpha)
+                        .child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top(gpui::px(-snap_top))
+                                .child(content),
+                        ),
+                );
+            }
+            Some((from, back, t, ..)) => {
+                // `Ui::SlideAnimation`: the old step goes one way and fades, the new
+                // one comes from the other side.
+                let w = scale::lg(SLIDE_WIDTH);
+                let x0 = ((width - w) / 2.).floor();
+                let (ease_out, ease_in) = (anim::ease_out_circ(t), anim::ease_in_circ(t));
+                let (old_x, new_x) = if back {
+                    (anim::mix(0., w, ease_in), anim::mix(-w, 0., ease_out))
+                } else {
+                    (anim::mix(0., -w, ease_in), anim::mix(w, 0., ease_out))
+                };
+                let from_top = self.content_top(from, height);
+                for (s, x, alpha, s_top) in [
+                    (from, old_x, 1. - ease_out, from_top),
+                    (step, new_x, ease_in, top),
+                ] {
+                    let content = self.step_content(s, width, height, s_top, window, cx);
+                    root = root.child(
+                        div()
+                            .absolute()
+                            .left(gpui::px(x0 + x.round()))
+                            .top(gpui::px(s_top))
+                            .w(gpui::px(w))
+                            .h(gpui::px(scale::lg(SLIDE_HEIGHT)))
+                            .overflow_hidden()
+                            .opacity(alpha)
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(gpui::px(-x0))
+                                    .top(gpui::px(-s_top))
+                                    .child(content),
+                            ),
+                    );
+                }
+            }
+        }
+
+        // The controls: their top follows the cover (`controlsTop`).
+        let controls_to = if step.has_cover() {
+            scale::lg(COVER_HEIGHT)
+        } else {
+            0.
+        };
+        let controls_top = match transition {
+            Some((.., controls_from)) if cover_change => {
+                anim::mix(controls_from, controls_to, shown)
+            }
+            _ => controls_to,
+        };
+        if next_opacity > 0. {
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(gpui::px(left))
+                    .top(gpui::px(real_next_top))
+                    .opacity(next_opacity)
+                    .child(self.render_next(self.next_text, cx)),
+            );
+        }
+        let back_opacity = anim::value(&self.back_fade, f32::from(self.has_back(step)));
+        if back_opacity > 0. {
             let over = self.hovered == Some("intro-back");
             root = root.child(
                 div()
                     .id("intro-back")
                     .absolute()
                     .left_0()
-                    .top_0()
+                    .top(gpui::px(controls_top))
                     .size(px(BACK_SIZE))
+                    .opacity(back_opacity)
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1205,17 +1558,20 @@ impl Render for IntroView {
                     .on_click(cx.listener(|this, _, window, cx| this.back(window, cx))),
             );
         }
-        // "Settings" (`defaultBoxButton`, upper case): settings come later.
-        {
+        // "Settings" (`defaultBoxButton`, upper case), not on the start screen:
+        // settings come later.
+        let settings_opacity = anim::value(&self.settings_fade, f32::from(!step.has_cover()));
+        if settings_opacity > 0. {
             let over = self.hovered == Some("intro-settings");
             root = root.child(
                 div()
                     .id("intro-settings")
                     .absolute()
-                    .right(px(10.))
-                    .top(px(10.))
+                    .right(px(SETTINGS_SKIP))
+                    .top(gpui::px(controls_top + scale::lg(SETTINGS_SKIP)))
                     .h(px(36.))
                     .px(px(12.))
+                    .opacity(settings_opacity)
                     .rounded(px(BUTTON_RADIUS))
                     .when(over, |d| d.bg(c(p.light_button_bg_over)))
                     .flex()
@@ -1234,6 +1590,215 @@ impl Render for IntroView {
                     })),
             );
         }
+        root
+    }
+}
+
+impl IntroView {
+    /// The start screen's cover (`Step::paintCover`): the gradient, the clouds in its
+    /// bottom corners and the plane, `top` above its place while it comes or goes.
+    /// `moving_plane`: drawn by a step without a cover (the plane flies right).
+    fn render_cover(
+        &self,
+        width: f32,
+        top: f32,
+        moving_plane: bool,
+        window: &Window,
+    ) -> AnyElement {
+        use crate::icons::icon_width;
+        let p = self.palette;
+        let cover_h = scale::lg(COVER_HEIGHT);
+        let cover_bottom = top + cover_h;
+        let left_w = icon_width(Icon::IntroLeft, window);
+        let right_w = icon_width(Icon::IntroRight, window);
+        let left_h = crate::icons::icon_height(Icon::IntroLeft, window);
+        let right_h = crate::icons::icon_height(Icon::IntroRight, window);
+        let (mut left, mut right) = (0., 0.);
+        if width < scale::lg(COVER_MAX_WIDTH) {
+            let max_skip = scale::lg(COVER_MAX_WIDTH) - left_w - right_w;
+            let min_skip = scale::lg(COVER_ICONS_MIN_SKIP);
+            let skip = min_skip
+                + (max_skip - min_skip) * (width - scale::lg(SLIDE_WIDTH))
+                    / (scale::lg(COVER_MAX_WIDTH) - scale::lg(SLIDE_WIDTH));
+            let outside = (skip + left_w + right_w - width).floor();
+            left = -(outside / 2.).floor();
+            right = -outside - left;
+        }
+        if top < 0. {
+            let shown = cover_bottom / cover_h;
+            left = (shown * (left + left_w)).round() - left_w;
+            right = (shown * (right + right_w)).round() - right_w;
+        }
+        let plane_w = icon_width(Icon::IntroPlaneTrace, window);
+        let mut plane_left = ((width - plane_w) / 2.).floor() - scale::lg(COVER_ICON_LEFT);
+        if top < 0. && moving_plane {
+            // `ratio`: introPlaneWidth / introPlaneHeight in whole pixels, 1.
+            plane_left += -top.round();
+        }
+        let plane_top = top + scale::lg(COVER_ICON_TOP);
+        let mut plane = div()
+            .absolute()
+            .left(gpui::px(plane_left))
+            .top(gpui::px(plane_top));
+        for (glyph, color) in [
+            (Icon::IntroPlaneTrace, p.intro_cover_plane_trace),
+            (Icon::IntroPlaneInner, p.intro_cover_plane_inner),
+            (Icon::IntroPlaneOuter, p.intro_cover_plane_outer),
+            (Icon::IntroPlaneTop, p.intro_cover_plane_top),
+        ] {
+            plane = plane.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .child(icon(glyph, color, window)),
+            );
+        }
+        div()
+            .absolute()
+            .left_0()
+            .top_0()
+            .w(gpui::px(width))
+            .h(gpui::px(cover_bottom.max(0.)))
+            .overflow_hidden()
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(gpui::px(top))
+                    .w(gpui::px(width))
+                    .h(gpui::px(cover_h))
+                    .bg(gpui::linear_gradient(
+                        180.,
+                        gpui::linear_color_stop(c(p.intro_cover_top_bg), 0.),
+                        gpui::linear_color_stop(c(p.intro_cover_bottom_bg), 1.),
+                    )),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(gpui::px(left))
+                    .top(gpui::px(cover_bottom - left_h))
+                    .child(icon(Icon::IntroLeft, p.intro_cover_icons_fg, window)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(gpui::px(width - right - right_w))
+                    .top(gpui::px(cover_bottom - right_h))
+                    .child(icon(Icon::IntroRight, p.intro_cover_icons_fg, window)),
+            )
+            .child(plane)
+            .into_any_element()
+    }
+
+    /// The start screen's title: our app's name (the original names itself).
+    fn cover_title(&self, width: f32, top: f32, alpha: f32) -> Div {
+        let font = scale::font(COVER_TITLE_FONT);
+        div()
+            .absolute()
+            .left_0()
+            .top(gpui::px(top + scale::lg(COVER_TITLE_TOP)))
+            .w(gpui::px(width))
+            .flex()
+            .justify_center()
+            .opacity(alpha)
+            .text_size(font.size)
+            .line_height(font.line_height())
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(c(self.palette.intro_title_fg))
+            .child(crate::APP_NAME)
+    }
+
+    fn cover_description(&self, width: f32, top: f32, alpha: f32) -> Div {
+        let font = scale::font(COVER_DESCRIPTION_FONT);
+        let mut lines = div()
+            .absolute()
+            .left_0()
+            .top(gpui::px(top + scale::lg(COVER_DESCRIPTION_TOP)))
+            .w(gpui::px(width))
+            .flex()
+            .flex_col()
+            .items_center()
+            .opacity(alpha)
+            .text_size(font.size)
+            .line_height(px(COVER_DESCRIPTION_LINE))
+            .text_color(c(self.palette.intro_description_fg));
+        for line in START_DESCRIPTION.lines() {
+            lines = lines.child(line);
+        }
+        lines
+    }
+
+    /// A start screen label on its way between its place (`t` = 1) and the other
+    /// step's title or description place (`t` = 0) (`FlatLabel::CrossFade`).
+    #[allow(clippy::too_many_arguments)]
+    fn moving_label(
+        &self,
+        title: bool,
+        width: f32,
+        start_top: f32,
+        other_top: f32,
+        t: f32,
+        alpha: f32,
+        window: &Window,
+    ) -> Div {
+        let left = (width - STEP_WIDTH) / 2. + BUTTON_RADIUS;
+        let (dx_to, dy_to) = if title {
+            (left, other_top + TITLE_TOP)
+        } else {
+            (left, other_top + DESCRIPTION_TOP)
+        };
+        let (place_top, label) = if title {
+            (COVER_TITLE_TOP, self.cover_title(width, 0., alpha))
+        } else {
+            (
+                COVER_DESCRIPTION_TOP,
+                self.cover_description(width, 0., alpha),
+            )
+        };
+        // The centered label's left edge goes to the other step's label.
+        let text_w = if title {
+            super_text_width(
+                window,
+                crate::APP_NAME,
+                COVER_TITLE_FONT,
+                FontWeight::SEMIBOLD,
+            )
+        } else {
+            super_text_width(
+                window,
+                START_DESCRIPTION,
+                COVER_DESCRIPTION_FONT,
+                FontWeight::NORMAL,
+            )
+        };
+        let from_x = 0.;
+        let to_x = dx_to - (width - text_w) / 2.;
+        let x = anim::mix(to_x, from_x, t);
+        let y = anim::mix(dy_to, start_top + scale::lg(place_top), t);
+        label.left(gpui::px(x)).top(gpui::px(y))
+    }
+
+    /// The step's own content (its labels, fields, links, errors), laid out over
+    /// the whole area with its top at `top`.
+    fn step_content(
+        &mut self,
+        step: Step,
+        width: f32,
+        height: f32,
+        top: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = self.palette;
+        let left = (width - STEP_WIDTH) / 2.;
+        let mut root = div()
+            .absolute()
+            .left_0()
+            .top_0()
+            .w(gpui::px(width))
+            .h(gpui::px(height));
         let title = |text: String| {
             div()
                 .absolute()
@@ -1270,14 +1835,13 @@ impl Render for IntroView {
                 d.left(px(left + BUTTON_RADIUS)).child(text.to_string())
             }
         };
-        let next_at = |el: gpui::Stateful<Div>| {
-            div()
-                .absolute()
-                .left(px(left))
-                .top(px(top + NEXT_TOP))
-                .child(el)
-        };
-        match self.step {
+        match step {
+            Step::Start => {
+                // `Step::updateLabelsPosition` with a cover: centered.
+                root = root
+                    .child(self.cover_title(width, top, 1.))
+                    .child(self.cover_description(width, top, 1.));
+            }
             Step::Qr => {
                 for el in self.render_qr_step(width, top, window, cx) {
                     root = root.child(el);
@@ -1341,7 +1905,6 @@ impl Render for IntroView {
                                 cx,
                             )),
                     )
-                    .child(next_at(self.render_next("Next", cx)))
                     .child(
                         div()
                             .absolute()
@@ -1354,7 +1917,7 @@ impl Render for IntroView {
                                 "intro-to-qr",
                                 "Quick log in using QR code",
                                 cx,
-                                |this, window, cx| this.go(Step::Qr, window, cx),
+                                |this, window, cx| this.go(Step::Qr, false, window, cx),
                             )),
                     );
                 if let Some(e) = &self.error {
@@ -1440,7 +2003,6 @@ impl Render for IntroView {
                             )),
                     );
                 }
-                root = root.child(next_at(self.render_next("Next", cx)));
                 if let Some(e) = &self.error {
                     root = root.child(error_at(top + ERROR_TOP, false, e));
                 }
@@ -1473,26 +2035,19 @@ impl Render for IntroView {
                     );
                 }
                 // "Forgot password?": recovery comes later.
-                root = root
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(left + BUTTON_RADIUS))
-                            .top(px(top + PASSWORD_HINT_TOP + 20. + LINK_TOP))
-                            .child(self.link(
-                                "intro-recover",
-                                "Forgot password?",
-                                cx,
-                                |_, _, _| {},
-                            )),
-                    )
-                    .child(next_at(self.render_next("Submit", cx)));
+                root = root.child(
+                    div()
+                        .absolute()
+                        .left(px(left + BUTTON_RADIUS))
+                        .top(px(top + PASSWORD_HINT_TOP + 20. + LINK_TOP))
+                        .child(self.link("intro-recover", "Forgot password?", cx, |_, _, _| {})),
+                );
                 if let Some(e) = &self.error {
                     root = root.child(error_at(top + ERROR_TOP, false, e));
                 }
             }
         }
-        root
+        root.into_any_element()
     }
 }
 

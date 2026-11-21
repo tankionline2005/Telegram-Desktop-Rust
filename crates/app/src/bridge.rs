@@ -84,6 +84,9 @@ pub enum Command {
         text: String,
         cloud: bool,
     },
+    /// "Log out" (`Main::Account::logOut`): `auth.logOut`, then the account's
+    /// session, cache and files go; [`Update::LoggedOut`] follows.
+    LogOut,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +147,8 @@ pub enum Update {
         data: Option<tdr_data::BankCard>,
     },
     Fatal(String),
+    /// The account logged out and its data is gone.
+    LoggedOut,
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +197,9 @@ pub struct MeInfo {
     pub color: u8,
     pub photo: Option<(i64, i32)>,
     pub premium: bool,
+    /// "+7 900 123 45 67" (`Ui::FormatPhone`), and the username without "@".
+    pub phone: Option<String>,
+    pub username: Option<String>,
 }
 
 /// Unread counters of an account (`Data::Session::unreadBadge`, the archive's
@@ -208,29 +216,44 @@ pub struct AccountState {
 }
 
 /// The counters from the cache.
+/// `Data::Session::unreadWithMentionsBadge` and `...Muted` over the main list:
+/// unread messages plus chats marked unread, muted ones counted; muted only when
+/// there are no unread mentions and everything is muted.
 fn account_state(store: &Storage, ctx: &Context) -> AccountState {
     let mut state = AccountState::default();
-    let mut muted_messages = 0u32;
-    for (peer, folder, unread, mute_until, broadcast) in store.unread_counts().unwrap_or_default() {
-        if folder == 1 {
+    let (mut messages, mut messages_muted) = (0u32, 0u32);
+    let (mut marks, mut marks_muted, mut mentions) = (0u32, 0u32, 0u32);
+    for row in store.unread_counts().unwrap_or_default() {
+        let unread = row.unread.max(0) as u32;
+        if row.folder_id == 1 {
             state.archive_chats += 1;
-            if unread > 0 {
+            if unread > 0 || row.mark {
                 state.archive_unread += 1;
             }
             continue;
         }
-        let default_mute = match peer.kind {
+        let default_mute = match row.peer.kind {
             PeerKind::User => ctx.mute_users,
-            PeerKind::Channel if broadcast => ctx.mute_broadcasts,
+            PeerKind::Channel if row.broadcast => ctx.mute_broadcasts,
             _ => ctx.mute_chats,
         };
-        let unread = unread.max(0) as u32;
-        state.unread += unread;
-        if mute_until.map_or(default_mute, i64::from) > ctx.now {
-            muted_messages += unread;
+        let muted = row.mute_until.map_or(default_mute, i64::from) > ctx.now;
+        messages += unread;
+        mentions += row.mentions.max(0) as u32;
+        if muted {
+            messages_muted += unread;
+        }
+        // A mark counts for a chat without unread messages (`UnreadState::marks`).
+        if row.mark && unread == 0 {
+            marks += 1;
+            if muted {
+                marks_muted += 1;
+            }
         }
     }
-    state.unread_muted = state.unread > 0 && muted_messages >= state.unread;
+    state.unread = marks + messages;
+    state.unread_muted =
+        state.unread > 0 && mentions == 0 && marks_muted >= marks && messages_muted >= messages;
     state
 }
 
@@ -240,6 +263,7 @@ fn me_info(store: &Storage) -> Option<MeInfo> {
     let peer = PeerKey::user(self_id);
     let row = store.peer(peer).ok().flatten()?;
     let info = describe::peer_info(&row);
+    let countries = COUNTRIES.get().map(Vec::as_slice).unwrap_or_default();
     Some(MeInfo {
         peer,
         initials: initials(&row.name),
@@ -247,7 +271,26 @@ fn me_info(store: &Storage) -> Option<MeInfo> {
         name: row.name,
         photo: info.photo,
         premium: info.premium,
+        phone: info
+            .phone
+            .filter(|p| !p.is_empty())
+            .map(|p| tdr_data::login::format_phone(&p, countries)),
+        username: row.username.filter(|u| !u.is_empty()),
     })
+}
+
+/// The countries' phone patterns, once loaded (for the own number in Settings).
+static COUNTRIES: std::sync::OnceLock<Vec<tdr_data::login::Country>> = std::sync::OnceLock::new();
+
+/// Removes what an account keeps on disk: its session, cache and files.
+pub fn remove_account_files(paths: &Paths) {
+    let _ = std::fs::remove_file(&paths.session);
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut name = paths.cache.clone().into_os_string();
+        name.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(name));
+    }
+    let _ = std::fs::remove_dir_all(&paths.files);
 }
 
 fn send_me(store: &Storage, tx: &mpsc::UnboundedSender<Update>) {
@@ -320,7 +363,7 @@ fn chat_traits(d: &DialogView, ctx: &Context) -> ChatTraits {
         kind,
         contact: info.contact,
         muted: muted(d, kind, ctx),
-        unread: d.dialog.unread_count > 0,
+        unread: d.dialog.unread_count > 0 || d.dialog.unread_mark,
         archived: d.dialog.folder_id == 1,
     }
 }
@@ -1189,6 +1232,8 @@ fn chat_info(store: &Storage, peer: PeerKey) -> Option<DialogItem> {
             read_inbox_max_id: 0,
             read_outbox_max_id: 0,
             mute_until: None,
+            unread_mentions: 0,
+            unread_mark: false,
         },
         peer: Some(row),
         top: None,
@@ -1373,6 +1418,13 @@ async fn run(
         error!("config: {e}");
     }
     save(&client);
+    if COUNTRIES.get().is_none() {
+        let list = tdr_data::login::countries(&client).await;
+        if !list.is_empty() {
+            let _ = COUNTRIES.set(list);
+            send_me(sync.store(), &tx);
+        }
+    }
     // The shown part of the cached list may be stale below what the start refreshed.
     if confirm_dialogs(&mut sync, shown_dialogs).await {
         send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
@@ -1397,10 +1449,16 @@ async fn run(
     // What chats left this session showed (`History::scrollTopItem` keeps the
     // place in tdesktop): `ReopenChat` shows it again.
     let mut remembered: HashMap<PeerKey, Shown> = HashMap::new();
+    let mut logging_out = false;
     loop {
         tokio::select! {
             cmd = commands.recv() => {
                 let Some(cmd) = cmd else { break };
+                if matches!(cmd, Command::LogOut) {
+                    tdr_data::login::log_out(&client, LOG_OUT_TIMEOUT).await;
+                    logging_out = true;
+                    break;
+                }
                 let (cmd, restore) = match cmd {
                     Command::ReopenChat(peer) => (Command::OpenChat(peer), true),
                     cmd => (cmd, false),
@@ -1508,6 +1566,8 @@ async fn run(
                             );
                         }
                     }
+                    // Handled before the match.
+                    Command::LogOut => {}
                     Command::SaveDraft { peer, text, cloud } => {
                         if sync.set_draft(peer, &text)? {
                             send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
@@ -1755,9 +1815,20 @@ async fn run(
             }
         }
     }
+    if logging_out {
+        // The cache closes before its files go.
+        drop(sync);
+        drop(client);
+        remove_account_files(&paths);
+        let _ = tx.send(Update::LoggedOut);
+        return Ok(());
+    }
     save(&client);
     Ok(())
 }
+
+/// How long "Log out" waits for the server.
+const LOG_OUT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Demo messages with formatting: (outgoing, text, entities).
 fn demo_formatted(date: i32) -> Vec<(bool, String, Vec<TextEntity>)> {
@@ -2034,6 +2105,7 @@ pub fn start_demo(
         3 => d.kind == ChatKind::Channel,
         4 => d.unread > 0,
         5 => matches!(d.peer.id, 2 | 8),
+        6 => d.kind == ChatKind::Group,
         _ => true,
     };
     let folder_items = move |list: &[DialogItem]| -> Vec<FolderItem> {
@@ -2044,6 +2116,8 @@ pub fn start_demo(
             (3, "Channels", FilterIcon::Channels),
             (4, "Unread", FilterIcon::Unread),
             (5, "Work", FilterIcon::Work),
+            // A long title wraps (up to three lines).
+            (6, "Rust and open source projects", FilterIcon::Study),
         ];
         folders
             .iter()
@@ -2074,6 +2148,10 @@ pub fn start_demo(
         color: color_index(103 + account as i64),
         photo: None,
         premium: false,
+        phone: Some(
+            ["+1 555 010 0001", "+44 7700 900123", "+49 151 2345 6789"][account % 3].into(),
+        ),
+        username: (account != 1).then(|| ["alex_morgan", "", "sam_taylor"][account % 3].into()),
     };
     let state = match account {
         0 => AccountState {
@@ -2237,6 +2315,10 @@ pub fn start_demo(
                         }),
                     });
                     continue;
+                }
+                Command::LogOut => {
+                    let _ = up_tx.send(Update::LoggedOut);
+                    break;
                 }
                 Command::OpenChat(_)
                 | Command::CloseChat

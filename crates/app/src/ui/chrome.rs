@@ -19,7 +19,7 @@ use super::{MainView, c};
 use crate::bridge::{Command, DialogItem};
 use crate::icons::{Icon, icon};
 use crate::one_line::one_line;
-use crate::scale::{self, px};
+use crate::scale::{self, lg, px};
 
 // window.style: windowFiltersWidth, windowFiltersButton, windowFiltersMainMenu.
 pub(super) const FILTERS_WIDTH: f32 = 72.;
@@ -35,6 +35,8 @@ const FILTER_BADGE_SKIP: f32 = 4.;
 const FILTER_BADGE_STROKE: f32 = 2.;
 const FILTER_BADGE_X: f32 = 3.;
 const FILTER_BADGE_Y: f32 = 7.;
+/// `SideBarButton::kMaxLabelLines`: longer titles wrap, the button grows.
+const FILTER_MAX_LINES: usize = 3;
 
 // dialogs.style: dialogsFilterPadding, dialogsFilterSkip, dialogsFilter, dialogsMenuToggle.
 const FILTER_PADDING: f32 = 7.;
@@ -344,7 +346,7 @@ impl MainView {
     /// `None`), a round ripple of `ripple_size` at `ripple_at`, the icon's color
     /// changing under the mouse. `on_click` runs on release over it.
     #[allow(clippy::too_many_arguments)]
-    fn icon_button(
+    pub(super) fn icon_button(
         &self,
         id: &'static str,
         glyph: Icon,
@@ -452,7 +454,7 @@ impl MainView {
             window,
             cx,
             |this, _, cx| {
-                this.main_menu_open = !this.main_menu_open;
+                this.toggle_main_menu();
                 cx.notify();
             },
         );
@@ -535,10 +537,11 @@ impl MainView {
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> gpui::Stateful<Div> {
         let p = self.palette();
-        let height = if title.is_some() {
-            FILTER_MIN_HEIGHT
-        } else {
-            FILTER_MENU_HEIGHT
+        let lines = title.as_deref().map(|t| Self::folder_lines(t, window));
+        // `SideBarButton::resizeGetHeight`: a line of text more, a line higher.
+        let height = match &lines {
+            Some(lines) => Self::folder_height(lines.len()),
+            None => lg(FILTER_MENU_HEIGHT),
         };
         let bg = if active {
             p.side_bar_bg_active
@@ -551,40 +554,54 @@ impl MainView {
             p.side_bar_icon_fg
         };
         let glyph_el = icon(glyph, fg, window);
-        let icon_box = if title.is_some() {
-            div()
-                .absolute()
-                .top(px(FILTER_ICON_TOP))
-                .w_full()
-                .flex()
-                .justify_center()
-                .child(glyph_el)
+        // `SideBarButton::iconLeft/iconTop`: centered in whole device pixels.
+        let scale_f = scale::get();
+        let width_dev = scale::device(FILTERS_WIDTH);
+        let icon_w_dev = (crate::icons::icon_width(glyph, window) * scale_f).round();
+        let icon_h_dev = (crate::icons::icon_height(glyph, window) * scale_f).round();
+        let icon_left = ((width_dev - icon_w_dev) / 2.).floor() / scale_f;
+        let icon_top = if lines.is_some() {
+            lg(FILTER_ICON_TOP)
         } else {
-            div()
-                .absolute()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(glyph_el)
+            (((height * scale_f).round() - icon_h_dev) / 2.).floor() / scale_f
         };
-        let text = title.map(|t| {
-            div()
+        let icon_box = div()
+            .absolute()
+            .left(gpui::px(icon_left))
+            .top(gpui::px(icon_top))
+            .child(glyph_el);
+        let text = lines.map(|lines| {
+            let font = scale::font(FILTER_FONT);
+            let count = lines.len();
+            let mut column = div()
                 .absolute()
                 .top(px(FILTER_TEXT_TOP))
                 .left(px(FILTER_TEXT_SKIP))
                 .right(px(FILTER_TEXT_SKIP))
                 .flex()
-                .justify_center()
-                .text_size(scale::font(FILTER_FONT).size)
-                .line_height(scale::font(FILTER_FONT).line_height())
+                .flex_col()
+                .items_center()
+                .text_size(font.size)
+                .line_height(font.line_height())
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(c(if active {
                     p.side_bar_text_fg_active
                 } else {
                     p.side_bar_text_fg
-                }))
-                .child(one_line(t).centered())
+                }));
+            for (i, line) in lines.into_iter().enumerate() {
+                // The last line keeps the rest of a longer title, cut with "…".
+                column = column.child(if i + 1 == count {
+                    div()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .child(one_line(line).centered())
+                } else {
+                    div().whitespace_nowrap().child(line)
+                });
+            }
+            column
         });
         // The badge, cut out of the icon by a ring of the background.
         let badge_el = badge.map(|(count, muted)| {
@@ -636,13 +653,13 @@ impl MainView {
                 )
         });
         let ripple_id = id.clone();
-        let ripple = self.ripple_layer(&id, FILTERS_WIDTH, height, p.side_bar_bg_ripple, false);
+        let ripple = self.ripple_layer(&id, lg(FILTERS_WIDTH), height, p.side_bar_bg_ripple, false);
         div()
             .id(id)
             .relative()
             .flex_none()
             .w(px(FILTERS_WIDTH))
-            .h(px(height))
+            .h(gpui::px(height))
             .overflow_hidden()
             .bg(c(bg))
             .cursor_pointer()
@@ -680,19 +697,32 @@ impl MainView {
     }
 
     /// Where a folder button starts, in window coordinates (for its ripple).
-    fn side_button_top(&self, id: &str, _window: &Window) -> f32 {
+    fn side_button_top(&self, id: &str, window: &Window) -> f32 {
         let title = crate::scale::lg(super::TITLE_HEIGHT);
         if id == "folders-menu" {
             return title;
         }
-        let mut top = title + FILTER_MENU_HEIGHT;
+        let mut top = title + lg(FILTER_MENU_HEIGHT);
         for f in &self.folders {
             if format!("folder-{}", f.id) == id {
                 return top;
             }
-            top += FILTER_MIN_HEIGHT;
+            top += Self::folder_height(Self::folder_lines(&f.title, window).len());
         }
         top
+    }
+
+    /// A folder button with `lines` lines of title (`resizeGetHeight`).
+    fn folder_height(lines: usize) -> f32 {
+        lg(FILTER_MIN_HEIGHT) + (lines.max(1) - 1) as f32 * scale::font(FILTER_FONT).height
+    }
+
+    /// A folder's title in the lines it takes (at most three).
+    fn folder_lines(title: &str, window: &Window) -> Vec<String> {
+        let width = lg(FILTERS_WIDTH) - 2. * lg(FILTER_TEXT_SKIP);
+        wrap_title(title, width, |t| {
+            super::text_width(window, t, FILTER_FONT, gpui::FontWeight::SEMIBOLD)
+        })
     }
 
     // ----- The chat list's header -----
@@ -802,7 +832,7 @@ impl MainView {
             window,
             cx,
             |this, _, cx| {
-                this.main_menu_open = !this.main_menu_open;
+                this.toggle_main_menu();
                 cx.notify();
             },
         );
@@ -1396,9 +1426,69 @@ fn paint_cross(bounds: gpui::Bounds<Pixels>, color: Color, window: &mut Window) 
     }
 }
 
+/// A folder title wrapped like `Ui::Text::String` into lines of `width`: words go
+/// to the next line whole, a word longer than a line breaks anywhere. The last
+/// allowed line keeps all the rest (it is cut with "…" when drawn).
+fn wrap_title(title: &str, width: f32, measure: impl Fn(&str) -> f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut rest = title.trim();
+    while !rest.is_empty() {
+        if lines.len() + 1 == FILTER_MAX_LINES || measure(rest) <= width {
+            lines.push(rest.to_string());
+            break;
+        }
+        let mut cut = None;
+        for (i, _) in rest.match_indices(' ') {
+            if measure(&rest[..i]) <= width {
+                cut = Some(i);
+            } else {
+                break;
+            }
+        }
+        let end = cut.unwrap_or_else(|| {
+            // The first word alone is too long: as many characters as fit.
+            let mut end = 0;
+            for (i, ch) in rest.char_indices() {
+                let next = i + ch.len_utf8();
+                if end > 0 && measure(&rest[..next]) > width {
+                    break;
+                }
+                end = next;
+            }
+            end
+        });
+        lines.push(rest[..end].trim_end().to_string());
+        rest = rest[end..].trim_start();
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_titles_wrap_like_tdesktop() {
+        let measure = |t: &str| t.chars().count() as f32;
+        assert_eq!(wrap_title("Work", 10., measure), ["Work"]);
+        assert_eq!(
+            wrap_title("Personal chats", 10., measure),
+            ["Personal", "chats"]
+        );
+        assert_eq!(
+            wrap_title("Supercalifragilistic", 10., measure),
+            ["Supercalif", "ragilistic"]
+        );
+        // The third line keeps the rest.
+        assert_eq!(
+            wrap_title("one two three four five six", 5., measure),
+            ["one", "two", "three four five six"]
+        );
+        assert_eq!(wrap_title("", 5., measure), [""]);
+    }
 
     #[test]
     fn radial_arc_like_lib_ui() {

@@ -98,6 +98,22 @@ pub fn chat_row(chat: &enums::Chat) -> Option<PeerRow> {
 
 /// Text to show for a message in lists: its text, or a marker for media and service
 /// messages (proper rendering comes with the UI).
+/// An incoming message that mentions us, not read yet (`mentioned` and
+/// `media_unread`).
+pub fn unread_mention(row: &MessageRow) -> bool {
+    use tdr_tl::Deserializable;
+    let Some((layer, bytes)) = &row.raw else {
+        return false;
+    };
+    if row.out || *layer != tdr_tl::LAYER {
+        return false;
+    }
+    matches!(
+        enums::Message::from_bytes(&tdr_tl::Bytes::copy_from_slice(bytes)),
+        Ok(enums::Message::Message(m)) if m.mentioned && m.media_unread
+    )
+}
+
 pub fn message_row(message: &enums::Message) -> Option<MessageRow> {
     match message {
         enums::Message::Message(m) => {

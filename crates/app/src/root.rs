@@ -21,15 +21,16 @@ impl Root {
         dark: bool,
         columns_path: PathBuf,
         open_on_start: Option<usize>,
-        show_intro: bool,
+        show_intro: Option<bool>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let view = Self::make_view(&accounts, dark, &columns_path, window, cx);
         view.update(cx, |v, cx| {
             v.open_on_start = open_on_start;
-            if show_intro {
-                v.show_intro(true, cx);
+            // `Some(can_back)`: the login screens over the account (demo).
+            if let Some(can_back) = show_intro {
+                v.show_intro(can_back, cx);
             }
         });
         cx.subscribe_in(&accounts, window, |this, _, _: &Activated, window, cx| {

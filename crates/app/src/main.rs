@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod accounts;
+mod anim;
 mod bridge;
 mod icons;
 #[cfg(windows)]
@@ -40,6 +41,9 @@ use gpui::{
 use tdr_api::Config;
 
 pub const APP_NAME: &str = "Unofficial Telegram Desktop Rust";
+/// The project's repository (`repository` in the workspace's Cargo.toml). Every link
+/// to it in the app is made from this (`ui::layers::repo_url`).
+pub const REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
 
 /// Process start, for startup timing logs.
 pub static STARTED: std::sync::LazyLock<std::time::Instant> =
@@ -207,7 +211,8 @@ fn main() {
         };
         Some(config)
     };
-    // Demo: `--accounts` shows three accounts, `--intro` the login screens.
+    // Demo: `--accounts` shows three accounts, `--intro` the login screens of "Add
+    // Account", `--start` those of the first launch (the start screen).
     let demo_accounts = demo.then(|| {
         if std::env::args().any(|a| a == "--accounts") {
             3
@@ -215,7 +220,13 @@ fn main() {
             1
         }
     });
-    let demo_intro = demo && std::env::args().any(|a| a == "--intro");
+    let demo_intro = if demo && std::env::args().any(|a| a == "--start") {
+        Some(false)
+    } else if demo && std::env::args().any(|a| a == "--intro") {
+        Some(true)
+    } else {
+        None
+    };
 
     Application::new().run(move |cx: &mut App| {
         tracing::info!(elapsed = ?STARTED.elapsed(), "ui: platform ready");
