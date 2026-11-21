@@ -3,9 +3,9 @@
 
 repo = "telegramdesktop/tdesktop"
 channel = "stable"
-tag = "v7.4.1"
-commit = "157f5cfc85e2dd1fa67f129a5e31a81db5ddeb19"
-published_at = "2026-11-06T19:19:58Z"
+tag = "v7.4.4"
+commit = "bf4f714036f21c750d535dab199c811b3f9bfdd4"
+published_at = "2026-11-13T20:04:42Z"
 layer = 233
 
 [[vendored]]
@@ -491,9 +491,6 @@ path = "assets/tdesktop-icons/menu__invite@3x.png"
 upstream = "Telegram/Resources/icons/menu/invite@3x.png"
 sha256 = "40fd0c3d214050a11838b70f20c1156115ecd5c7a9ef30264c51e593eb6a8a48"
 
-
-
-
 [[vendored]]
 path = "assets/tdesktop-icons/menu__pin.png"
 upstream = "Telegram/Resources/icons/menu/pin.png"
@@ -538,9 +535,6 @@ sha256 = "b657187aed5416e6973775066258092e068a8db53a31403471ed387c39fa8b87"
 path = "assets/tdesktop-icons/menu__select@3x.png"
 upstream = "Telegram/Resources/icons/menu/select@3x.png"
 sha256 = "a394b83b8de203f9ae7e6a4fed5c4fb4ab2c30c6d94d1010ae461a781813a045"
-
-
-
 
 [[vendored]]
 path = "assets/tdesktop-icons/payments__payment_card.png"
