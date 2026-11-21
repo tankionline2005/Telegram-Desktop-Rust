@@ -23,15 +23,7 @@ pub enum LoginCommand {
     ResendCode,
 }
 
-/// A country of the phone step (`help.countriesList`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Country {
-    pub iso2: String,
-    pub name: String,
-    /// Calling code without "+", and the number patterns ("XXX XXX XXXX").
-    pub code: String,
-    pub patterns: Vec<String>,
-}
+pub use crate::countries::Country;
 
 /// What the window shows.
 #[derive(Debug, Clone)]
@@ -469,12 +461,14 @@ fn base64url(data: &[u8]) -> String {
     out
 }
 
-/// The countries with their calling codes and number patterns
-/// (`help.getCountriesList`; tdesktop has the same list built in). Empty on errors.
+/// The countries with their calling codes, prefixes and number patterns, as
+/// `Countries::Manager` reads `help.getCountriesList`: hidden ones left out, the
+/// default (English) names, a code without prefixes matching any number. Empty on
+/// errors (the built-in list stays).
 pub async fn countries(client: &Client) -> Vec<Country> {
     match client
         .invoke(&functions::help::GetCountriesList {
-            lang_code: "en".into(),
+            lang_code: String::new(),
             hash: 0,
         })
         .await
@@ -482,17 +476,26 @@ pub async fn countries(client: &Client) -> Vec<Country> {
         Ok(enums::help::CountriesList::CountriesList(l)) => l
             .countries
             .iter()
+            .filter(|c| {
+                let enums::help::Country::Country(c) = c;
+                !c.hidden
+            })
             .flat_map(|c| {
                 let enums::help::Country::Country(c) = c;
-                let name = c.name.clone().unwrap_or_else(|| c.default_name.clone());
                 c.country_codes
                     .iter()
                     .map(|code| {
                         let enums::help::CountryCode::CountryCode(code) = code;
                         Country {
                             iso2: c.iso2.clone(),
-                            name: name.clone(),
+                            name: c.default_name.clone(),
+                            alternative_name: crate::countries::alternative_name(&c.default_name),
                             code: code.country_code.clone(),
+                            prefixes: code
+                                .prefixes
+                                .clone()
+                                .filter(|p| !p.is_empty())
+                                .unwrap_or_else(|| vec![String::new()]),
                             patterns: code.patterns.clone().unwrap_or_default(),
                         }
                     })
@@ -509,46 +512,10 @@ pub async fn log_out(client: &Client, timeout: std::time::Duration) {
     let _ = tokio::time::timeout(timeout, client.invoke(&functions::auth::LogOut {})).await;
 }
 
-/// The phone formatted by the country's pattern (`Ui::FormatPhone`): "+7 900 123 45 67".
+/// The phone formatted by its country's pattern (`CountriesInstance::format`):
+/// "+7 900 123 45 67".
 pub fn format_phone(digits: &str, countries: &[Country]) -> String {
-    let digits: String = digits.chars().filter(char::is_ascii_digit).collect();
-    // The longest calling code that starts the number.
-    let Some(country) = countries
-        .iter()
-        .filter(|c| !c.code.is_empty() && digits.starts_with(&c.code))
-        .max_by_key(|c| c.code.len())
-    else {
-        return format!("+{digits}");
-    };
-    let rest = &digits[country.code.len()..];
-    let mut out = format!("+{}", country.code);
-    let pattern = country
-        .patterns
-        .iter()
-        .find(|p| p.chars().filter(|c| *c != ' ').count() == rest.len())
-        .or_else(|| country.patterns.first());
-    match pattern {
-        Some(pattern) => {
-            let mut chars = rest.chars();
-            out.push(' ');
-            for p in pattern.chars() {
-                if p == ' ' {
-                    out.push(' ');
-                } else if let Some(c) = chars.next() {
-                    out.push(c);
-                } else {
-                    break;
-                }
-            }
-            out.extend(chars);
-        }
-        None if !rest.is_empty() => {
-            out.push(' ');
-            out.push_str(rest);
-        }
-        None => {}
-    }
-    out.trim_end().to_string()
+    crate::countries::format(countries, digits)
 }
 
 #[cfg(test)]
@@ -565,21 +532,8 @@ mod tests {
 
     #[test]
     fn phones_like_tdesktop() {
-        let countries = vec![
-            Country {
-                iso2: "RU".into(),
-                name: "Russian Federation".into(),
-                code: "7".into(),
-                patterns: vec!["XXX XXX XX XX".into()],
-            },
-            Country {
-                iso2: "US".into(),
-                name: "USA".into(),
-                code: "1".into(),
-                patterns: vec!["XXX XXX XXXX".into()],
-            },
-        ];
-        assert_eq!(format_phone("79001234567", &countries), "+7 900 123 45 67");
+        let countries = crate::countries::fallback();
+        assert_eq!(format_phone("79001234567", &countries), "+7 900 123 4567");
         assert_eq!(format_phone("+1 555 0100", &countries), "+1 555 010 0");
         assert_eq!(format_phone("999", &countries), "+999");
     }

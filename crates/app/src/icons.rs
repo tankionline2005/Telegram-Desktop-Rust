@@ -114,7 +114,11 @@ pub enum Icon {
     MenuFaq,
     MenuEmojiObjects,
     MenuDiscussion,
+    MenuNetwork,
     InfoClose,
+    /// `defaultCheckboxIcon`, `boxFieldSearchIcon`.
+    CheckboxCheck,
+    BoxSearch,
     // The start screen's cover (`introCoverLeft/Right`, the plane's four layers).
     IntroLeft,
     IntroRight,
@@ -241,6 +245,9 @@ impl Icon {
             Icon::MenuEmojiObjects => Source::Png(icon_bytes!("emoji__emoji_objects")),
             Icon::MenuDiscussion => Source::Png(icon_bytes!("menu__discussion")),
             Icon::InfoClose => Source::Png(icon_bytes!("info__info_close")),
+            Icon::MenuNetwork => Source::Png(icon_bytes!("menu__network")),
+            Icon::CheckboxCheck => Source::Png(icon_bytes!("default_checkbox_check")),
+            Icon::BoxSearch => Source::Png(icon_bytes!("box_search")),
             Icon::IntroLeft => Source::Png(icon_bytes!("intro_left")),
             Icon::IntroRight => Source::Png(icon_bytes!("intro_right")),
             Icon::IntroPlaneTrace => Source::Png(icon_bytes!("intro_plane_trace")),

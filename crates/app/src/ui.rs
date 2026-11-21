@@ -32,6 +32,7 @@ use crate::text_input::{FieldMenu, Submit, TagSpan, TextInput};
 pub(crate) use chrome::paint_radial;
 
 mod chrome;
+mod country_box;
 mod layers;
 mod main_menu;
 mod menus;
@@ -743,6 +744,8 @@ pub struct MainView {
     draft_dirty_since: Option<Instant>,
     /// The main menu, Settings and boxes over the window (`LayerStackWidget`).
     layers: layers::Layers,
+    /// The login's country list, while open.
+    country_box: Option<country_box::CountryBox>,
     /// The caption button under the mouse.
     title_hovered: Option<&'static str>,
     /// The "scroll down" / "scroll to top" button under the mouse.
@@ -904,6 +907,7 @@ impl MainView {
             draft_generation: 0,
             draft_dirty_since: None,
             layers: Default::default(),
+            country_box: None,
             title_hovered: None,
             jump_hovered: None,
             to_down_shown: Fade::new(0., TO_DOWN_DURATION),
@@ -2053,6 +2057,11 @@ impl MainView {
                                 ));
                             }
                         }
+                        cx.notify();
+                    }
+                    crate::intro::IntroEvent::ChooseCountry => this.open_country_box(cx),
+                    crate::intro::IntroEvent::Settings => {
+                        this.layers.show_special(layers::Special::IntroSettings);
                         cx.notify();
                     }
                     crate::intro::IntroEvent::Done => {
@@ -4033,7 +4042,7 @@ impl Render for MainView {
                         ),
                 )
             })
-            .when(self.intro.is_none(), |d| d.children(layers))
+            .children(layers)
             .children(self.render_drag_capture(cx))
             .children(self.render_menu(window, cx))
             .children(self.text_ui.toast.as_ref().and_then(|t| {

@@ -53,6 +53,8 @@ const ROW_PADDING: f32 = 24.;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Special {
     Settings,
+    /// The login's settings (`Settings::LayerWidget` over the intro).
+    IntroSettings,
 }
 
 /// A box over everything.
@@ -61,6 +63,8 @@ pub(super) enum LayerBox {
     About,
     /// "Are you sure you want to log out?" for this account.
     LogOut(u32),
+    /// The login's country list.
+    Countries,
 }
 
 /// `LayerStackWidget::BackgroundWidget::Action`.
@@ -376,7 +380,7 @@ impl MainView {
     }
 
     /// A `RoundButton` of a box (`defaultBoxButton` / `attentionBoxButton`).
-    fn box_button(
+    pub(super) fn box_button(
         &self,
         id: &'static str,
         text: &'static str,
@@ -469,7 +473,7 @@ impl MainView {
     }
 
     /// A box's frame: its background, rounding, shadow, and the buttons row.
-    fn box_frame(
+    pub(super) fn box_frame(
         &self,
         width: f32,
         body: gpui::Div,
@@ -718,7 +722,7 @@ impl MainView {
                     .child(self.render_main_menu(window, cx)),
             );
         }
-        if let Some(Special::Settings) = special {
+        if let Some(special) = special {
             let (left, top, width, max_h) = Self::settings_geometry(w, h);
             let over = layer.map(|_| layer_op * special_op).unwrap_or(0.);
             root = root.child(
@@ -728,7 +732,12 @@ impl MainView {
                     .top(gpui::px(top))
                     .w(gpui::px(width))
                     .opacity(special_op)
-                    .child(self.render_settings(width, max_h, window, cx))
+                    .child(match special {
+                        Special::Settings => self.render_settings(width, max_h, window, cx),
+                        Special::IntroSettings => {
+                            self.render_intro_settings(width, max_h, window, cx)
+                        }
+                    })
                     .when(over > 0., |d| {
                         d.child(
                             div()
@@ -748,6 +757,7 @@ impl MainView {
             let content = match b {
                 LayerBox::About => self.render_about(window, cx),
                 LayerBox::LogOut(id) => self.render_logout(id, window, cx),
+                LayerBox::Countries => self.render_country_box(window, cx),
             };
             root = root.child(
                 div()

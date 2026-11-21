@@ -7,6 +7,8 @@
 //! state it leads to, so after a crash the cache and the state always agree.
 
 pub mod convert;
+pub mod countries;
+mod countries_fallback;
 pub mod describe;
 pub mod drafts;
 pub mod filters;

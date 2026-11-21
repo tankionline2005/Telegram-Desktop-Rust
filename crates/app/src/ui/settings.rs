@@ -4,7 +4,7 @@
 
 use gpui::{
     AnyElement, Context, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
 };
 
 use super::layers::{BOX_RADIUS, TITLE_FONT, box_shadow};
@@ -54,6 +54,8 @@ const STAR_SIZE: f32 = 15.;
 /// What a row shows on its left.
 #[derive(Clone, Copy)]
 enum Lead {
+    /// `settingsButtonNoIcon`: the text at 22, padding (22, 10, 22, 8).
+    None,
     Icon(Icon),
     /// The gradient star: Premium or Stars.
     Star {
@@ -151,7 +153,12 @@ impl MainView {
             .as_ref()
             .is_some_and(|h| h.as_ref() == id);
         let font = scale::font(ROW_FONT);
+        let (text_left, row_height) = match lead {
+            Lead::None => (ROW_NO_ICON_LEFT, ROW_NO_ICON_HEIGHT),
+            _ => (ROW_TEXT_LEFT, ROW_HEIGHT),
+        };
         let lead_el = match lead {
+            Lead::None => div(),
             Lead::Icon(glyph) => div()
                 .absolute()
                 .left(px(ROW_ICON_LEFT))
@@ -210,16 +217,16 @@ impl MainView {
             .id(id)
             .relative()
             .flex_none()
-            .h(px(ROW_HEIGHT))
+            .h(px(row_height))
             .overflow_hidden()
             .bg(c(if over { p.window_bg_over } else { p.window_bg }))
             .cursor_pointer()
-            .children(self.ripple_layer(id, w, lg(ROW_HEIGHT), p.window_bg_ripple, false))
+            .children(self.ripple_layer(id, w, lg(row_height), p.window_bg_ripple, false))
             .child(lead_el)
             .child(
                 div()
                     .absolute()
-                    .left(px(ROW_TEXT_LEFT))
+                    .left(px(text_left))
                     .right(px(ROW_RIGHT + 60.))
                     .top(px(ROW_TEXT_TOP))
                     .h(px(20.))
@@ -258,7 +265,7 @@ impl MainView {
                     );
                     this.press_button(
                         id.into(),
-                        (f32::from(e.position.x) - left, lg(ROW_HEIGHT) / 2.),
+                        (f32::from(e.position.x) - left, lg(row_height) / 2.),
                     );
                     cx.notify();
                 }),
@@ -278,7 +285,7 @@ impl MainView {
 
     /// `SetupInterfaceScale`'s slider: the scale in use, among 50 %..300 % in 5 %
     /// steps, its value on the right.
-    fn scale_slider(&self, width: f32, window: &Window) -> gpui::Div {
+    fn scale_slider(&self, width: f32, big: bool, window: &Window) -> gpui::Div {
         let p = self.palette();
         let percent = (scale::get() * 100.).round();
         let label = format!("{percent}%");
@@ -290,7 +297,11 @@ impl MainView {
             label_font,
             FontWeight::NORMAL,
         ));
-        let [pl, pt, pr, pb] = SCALE_PADDING;
+        let [pl, pt, pr, pb] = if big {
+            BIG_SCALE_PADDING
+        } else {
+            SCALE_PADDING
+        };
         let row_h = lg(SEEK).max(scale::font(label_font).height);
         let slider_w = (width - lg(pl) - lg(pr) - label_w - 2. * space).max(lg(SEEK));
         let t = ((percent - 50.) / 250.).clamp(0., 1.);
@@ -496,7 +507,7 @@ impl MainView {
                 window,
                 cx,
             ))
-            .child(self.scale_slider(width, window))
+            .child(self.scale_slider(width, false, window))
             .child(skip())
             // `BuildPremiumSection`.
             .child(self.settings_divider())
@@ -563,7 +574,6 @@ impl MainView {
             ))
             .child(skip());
 
-        let title_font = scale::font(TITLE_FONT);
         let (box_left, box_top, ..) = {
             let size = window.viewport_size();
             Self::settings_geometry(
@@ -571,6 +581,59 @@ impl MainView {
                 f32::from(size.height) - lg(TITLE_HEIGHT),
             )
         };
+        let buttons = div()
+            .flex()
+            .child(self.top_bar_button(
+                "settings-search",
+                Icon::TopBarSearch,
+                48.,
+                7.,
+                window,
+                cx,
+                |_, _, _| {},
+            ))
+            .child(self.top_bar_button(
+                "settings-menu",
+                Icon::MenuDots,
+                40.,
+                16.,
+                window,
+                cx,
+                move |this, _, cx| {
+                    // The menu's top right at `infoLayerTopBarMenuPosition` from
+                    // the button.
+                    let toggle_left = box_left + width - lg(48.) - lg(40.);
+                    let at = gpui::point(
+                        gpui::px(toggle_left + lg(MENU_POSITION.0)),
+                        gpui::px(lg(TITLE_HEIGHT) + box_top + lg(MENU_POSITION.1)),
+                    );
+                    this.open_settings_menu(at, cx);
+                },
+            ))
+            .child(self.top_bar_button(
+                "settings-close",
+                Icon::InfoClose,
+                48.,
+                4.,
+                window,
+                cx,
+                |this, _, _| this.layers.hide_all(),
+            ));
+        let _ = p;
+        self.info_layer_frame(width, max_h, buttons, content)
+    }
+
+    /// `Info::LayerWidget` / `Settings::LayerWidget`: the rounded box with the top
+    /// bar ("Settings", the buttons on the right) over the scrolled content.
+    fn info_layer_frame(
+        &self,
+        width: f32,
+        max_h: f32,
+        buttons: gpui::Div,
+        content: gpui::Div,
+    ) -> AnyElement {
+        let p = self.palette();
+        let title_font = scale::font(TITLE_FONT);
         let top_bar = div()
             .flex_none()
             .relative()
@@ -586,49 +649,7 @@ impl MainView {
                     .text_color(c(p.box_title_fg))
                     .child("Settings"),
             )
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .flex()
-                    .child(self.top_bar_button(
-                        "settings-search",
-                        Icon::TopBarSearch,
-                        48.,
-                        7.,
-                        window,
-                        cx,
-                        |_, _, _| {},
-                    ))
-                    .child(self.top_bar_button(
-                        "settings-menu",
-                        Icon::MenuDots,
-                        40.,
-                        16.,
-                        window,
-                        cx,
-                        move |this, _, cx| {
-                            // The menu's top right at `infoLayerTopBarMenuPosition` from
-                            // the button.
-                            let toggle_left = box_left + width - lg(48.) - lg(40.);
-                            let at = gpui::point(
-                                gpui::px(toggle_left + lg(MENU_POSITION.0)),
-                                gpui::px(lg(TITLE_HEIGHT) + box_top + lg(MENU_POSITION.1)),
-                            );
-                            this.open_settings_menu(at, cx);
-                        },
-                    ))
-                    .child(self.top_bar_button(
-                        "settings-close",
-                        Icon::InfoClose,
-                        48.,
-                        4.,
-                        window,
-                        cx,
-                        |this, _, _| this.layers.hide_all(),
-                    )),
-            );
+            .child(div().absolute().top_0().right_0().child(buttons));
         div()
             .id("settings-layer")
             .occlude()
@@ -653,4 +674,467 @@ impl MainView {
             .child(div().flex_none().h(px(BOX_RADIUS)))
             .into_any_element()
     }
+
+    /// The login's settings (`Settings::CreateIntroSettings`): language, connection,
+    /// the tray and window options, the interface scale, the themes, the FAQ. All
+    /// of them come later; the layer only shows them.
+    pub(super) fn render_intro_settings(
+        &self,
+        width: f32,
+        max_h: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let skip = || div().flex_none().h(px(SKIP));
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .child(self.settings_divider())
+            .child(skip())
+            .child(self.settings_row(
+                "intro-language",
+                Lead::Icon(Icon::MenuTranslate),
+                "Language",
+                Some("English".into()),
+                None,
+                width,
+                window,
+                cx,
+            ))
+            // `SetupConnectionType`.
+            .child(self.settings_row(
+                "intro-connection",
+                Lead::Icon(Icon::MenuNetwork),
+                "Connection type",
+                Some("Default (TCP used)".into()),
+                None,
+                width,
+                window,
+                cx,
+            ))
+            .child(skip())
+            // `SetupSystemIntegrationContent`, `SetupWindowTitleContent` (Windows,
+            // no account yet).
+            .child(self.settings_divider())
+            .child(skip());
+        let checks = [
+            ("intro-tray", "Show tray icon", true),
+            ("intro-monochrome", "Use monochrome icon", false),
+            ("intro-taskbar", "Show taskbar icon", true),
+            ("intro-sendto", "Place Telegram in \"Send to\" menu", false),
+            ("intro-frame", "Use system window frame", false),
+        ];
+        for (id, label, checked) in checks {
+            content = content.child(self.settings_checkbox(id, label, checked, window, cx));
+        }
+        content = content
+            .child(skip())
+            // `SetupInterfaceScale` without icons and `SetupDefaultThemes`.
+            .child(self.settings_divider())
+            .child(skip())
+            .child(self.settings_row(
+                "intro-scale",
+                Lead::None,
+                "Default interface scale",
+                None,
+                Some(true),
+                width,
+                window,
+                cx,
+            ))
+            .child(self.scale_slider(width, true, window))
+            .child(div().flex_none().h(px(THUMB_SKIP)))
+            .child(self.theme_previews(width, window))
+            .child(self.accent_palette(width))
+            .child(self.settings_checkbox("intro-accent", "System accent color", false, window, cx))
+            .child(skip())
+            .child(self.settings_divider())
+            .child(skip())
+            .child(self.settings_row(
+                "intro-faq",
+                Lead::None,
+                "Telegram FAQ",
+                None,
+                None,
+                width,
+                window,
+                cx,
+            ));
+        let buttons = div().flex().child(self.top_bar_button(
+            "intro-settings-close",
+            Icon::InfoClose,
+            48.,
+            4.,
+            window,
+            cx,
+            |this, _, _| this.layers.hide_all(),
+        ));
+        self.info_layer_frame(width, max_h, buttons, content)
+    }
+
+    /// A `Ui::Checkbox` with `settingsCheckbox` (rows with `settingsCheckboxPadding`):
+    /// the rounded square, the check when on, the label. Not wired yet.
+    fn settings_checkbox(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        checked: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let p = self.palette();
+        let [pl, pt, _, pb] = CHECKBOX_PADDING;
+        let font = scale::font(13.);
+        let check = div()
+            .absolute()
+            .left(px(pl))
+            .top(px(pt))
+            .size(px(CHECK_SIZE))
+            .rounded(px(3.))
+            .border(px(2.))
+            .border_color(c(if checked {
+                p.window_bg_active
+            } else {
+                p.checkbox_fg
+            }))
+            .when(checked, |d| {
+                d.bg(c(p.window_bg_active)).child(
+                    div()
+                        .absolute()
+                        .left(px(4. - 2.))
+                        .top(px(7. - 2.))
+                        .child(icon(
+                            Icon::CheckboxCheck,
+                            p.overview_check_fg_active,
+                            window,
+                        )),
+                )
+            });
+        let ripple_size = CHECK_SIZE + 16.;
+        let ripple = div()
+            .absolute()
+            .left(px(pl - 8.))
+            .top(px(pt - 8.))
+            .size(px(ripple_size))
+            .children(self.ripple_layer(
+                id,
+                lg(ripple_size),
+                lg(ripple_size),
+                p.window_bg_over,
+                true,
+            ));
+        div()
+            .id(id)
+            .relative()
+            .flex_none()
+            .h(px(pt + CHECK_SIZE + pb))
+            .child(ripple)
+            .child(check)
+            .child(
+                div()
+                    .absolute()
+                    .left(px(pl + CHECK_SIZE + CHECK_TEXT_LEFT))
+                    .top(px(pt + CHECK_TEXT_TOP))
+                    .text_size(font.size)
+                    .line_height(font.line_height())
+                    .text_color(c(p.window_fg))
+                    .child(label),
+            )
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.press_button(id.into(), (0., 0.));
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.release_buttons();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.release_buttons();
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// `SetupDefaultThemes`: the four built-in themes (`CloudListCheck` previews
+    /// with their radio), the shown one chosen.
+    fn theme_previews(&self, width: f32, window: &Window) -> gpui::Div {
+        let p = self.palette();
+        let chosen = if self.dark { 2 } else { 0 };
+        let inner = width - 2. * lg(ROW_NO_ICON_LEFT);
+        let count = SCHEMES.len() as f32;
+        let min_skip = lg(THEME_MIN_SKIP);
+        let desired = lg(THEME_PREVIEW.0);
+        let single = if inner >= 3. * min_skip + count * desired {
+            desired
+        } else {
+            ((inner - 3. * min_skip) / count).floor()
+        };
+        let gap = (inner - count * single) / 3.;
+        let font = scale::font(13.);
+        let mut row = div()
+            .flex_none()
+            .relative()
+            .h(gpui::px(lg(THEME_TEXT_TOP) + font.height));
+        for (i, scheme) in SCHEMES.iter().enumerate() {
+            let left = (lg(ROW_NO_ICON_LEFT) + i as f32 * (single + gap)).round();
+            let on = i == chosen;
+            let radio_color = if on {
+                scheme.radio_active
+            } else {
+                scheme.radio_inactive
+            };
+            let rgb = |hex: u32| c(tdr_theme::Color((hex << 8) | 0xff));
+            let bubble = |x: f32, y: f32, color: u32| {
+                div()
+                    .absolute()
+                    .left(gpui::px(x))
+                    .top(px(y))
+                    .w(px(THEME_BUBBLE.0))
+                    .h(px(THEME_BUBBLE.1))
+                    .rounded(px(2.))
+                    .bg(rgb(color))
+            };
+            let radio = lg(RADIO_SIZE);
+            let mut radio_el = div()
+                .absolute()
+                .left(gpui::px(((single - radio) / 2.).floor()))
+                .top(px(THEME_PREVIEW.1 - RADIO_SIZE - THEME_RADIO_BOTTOM))
+                .size(gpui::px(radio))
+                .child(
+                    // `RadioView`: the ring (`outerSkip` 1 px, 2 px thick).
+                    div()
+                        .absolute()
+                        .left(px(1.))
+                        .top(px(1.))
+                        .size(px(RADIO_SIZE - 2.))
+                        .rounded_full()
+                        .border(px(2.))
+                        .border_color(rgb(radio_color)),
+                );
+            if on {
+                // The dot: 6 px in from the edge.
+                radio_el = radio_el.child(
+                    div()
+                        .absolute()
+                        .left(px(6.))
+                        .top(px(6.))
+                        .size(px(RADIO_SIZE - 12.))
+                        .rounded_full()
+                        .bg(rgb(radio_color)),
+                );
+            }
+            let preview = div()
+                .absolute()
+                .left(gpui::px(left))
+                .top_0()
+                .w(gpui::px(single))
+                .h(px(THEME_PREVIEW.1))
+                .rounded(px(6.))
+                .overflow_hidden()
+                .bg(rgb(scheme.background))
+                .child(bubble(
+                    lg(THEME_BUBBLE_POS.0),
+                    THEME_BUBBLE_POS.1,
+                    scheme.received,
+                ))
+                .child(bubble(
+                    single - lg(THEME_BUBBLE.0) - lg(THEME_BUBBLE_POS.0),
+                    THEME_BUBBLE_POS.1 + THEME_BUBBLE.1 + THEME_BUBBLE_SKIP,
+                    scheme.sent,
+                ))
+                .child(radio_el);
+            row = row.child(preview).child(
+                div()
+                    .absolute()
+                    .left(gpui::px(left))
+                    .top(px(THEME_TEXT_TOP))
+                    .w(gpui::px(single))
+                    .flex()
+                    .justify_center()
+                    .text_size(font.size)
+                    .line_height(font.line_height())
+                    .text_color(c(if on {
+                        p.window_active_text_fg
+                    } else {
+                        p.window_sub_text_fg
+                    }))
+                    .child(scheme.name),
+            );
+        }
+        let _ = window;
+        row
+    }
+
+    /// `ColorsPalette` of the chosen theme: its accent and eight more, the shown one
+    /// ringed, and the custom color button (seven dots).
+    fn accent_palette(&self, width: f32) -> gpui::Div {
+        let p = self.palette();
+        let scheme = &SCHEMES[if self.dark { 2 } else { 0 }];
+        let mut colors = vec![scheme.accent];
+        colors.extend_from_slice(scheme.accents);
+        let rgb = |hex: u32| c(tdr_theme::Color((hex << 8) | 0xff));
+        let size = lg(ACCENT_SIZE);
+        let count = colors.len() as f32 + 1.;
+        let inner = width - 2. * lg(ROW_NO_ICON_LEFT);
+        let skip = (inner - size * count) / (count - 1.);
+        let top = lg(2. * SKIP);
+        let mut row = div()
+            .flex_none()
+            .relative()
+            .h(gpui::px(top + size + lg(SKIP)));
+        for (i, color) in colors.iter().enumerate() {
+            let x = (lg(ROW_NO_ICON_LEFT) + i as f32 * (size + skip)).round();
+            let mut circle = div()
+                .absolute()
+                .left(gpui::px(x))
+                .top(gpui::px(top))
+                .size(gpui::px(size))
+                .rounded_full()
+                .bg(rgb(*color));
+            if i == 0 {
+                // `PaintRoundColorButton`, selected: a ring of the box color.
+                let line = ACCENT_LINE;
+                let inset = ACCENT_SKIP - line / 2.;
+                circle = circle.child(
+                    div()
+                        .absolute()
+                        .left(px(inset))
+                        .top(px(inset))
+                        .size(px(ACCENT_SIZE - 2. * inset))
+                        .rounded_full()
+                        .border(px(line))
+                        .border_color(c(p.box_bg)),
+                );
+            }
+            row = row.child(circle);
+        }
+        // `PaintCustomButton`: one dot in the middle, six around.
+        let x = (lg(ROW_NO_ICON_LEFT) + (count - 1.) * (size + skip)).round();
+        let dot = ACCENT_SIZE / 8.;
+        let mut custom = div()
+            .absolute()
+            .left(gpui::px(x))
+            .top(gpui::px(top))
+            .size(gpui::px(size));
+        for i in 0..7 {
+            let (dx, dy) = if i == 0 {
+                (0., 0.)
+            } else {
+                let angle = (i - 1) as f32 * std::f32::consts::PI / 3.;
+                let r = 1. - 2. * dot / ACCENT_SIZE;
+                (angle.cos() * r, angle.sin() * r)
+            };
+            let cx_ = ACCENT_SIZE * (1. + dx) / 2.;
+            let cy_ = ACCENT_SIZE * (1. + dy) / 2.;
+            custom = custom.child(
+                div()
+                    .absolute()
+                    .left(gpui::px(lg(cx_ - dot)))
+                    .top(gpui::px(lg(cy_ - dot)))
+                    .size(gpui::px(lg(2. * dot)))
+                    .rounded_full()
+                    .bg(rgb(colors[i.min(colors.len() - 1)])),
+            );
+        }
+        row.child(custom)
+    }
 }
+
+/// `settingsCheckbox` (`defaultBoxCheckbox`): the square, the label after it,
+/// `settingsCheckboxPadding`.
+const CHECKBOX_PADDING: [f32; 4] = [22., 10., 10., 10.];
+const CHECK_SIZE: f32 = 22.;
+const CHECK_TEXT_LEFT: f32 = 15.;
+const CHECK_TEXT_TOP: f32 = 1.;
+/// `settingsButtonNoIcon`: padding (22, 10, 22, 8).
+const ROW_NO_ICON_LEFT: f32 = 22.;
+const ROW_NO_ICON_HEIGHT: f32 = 38.;
+/// `settingsBigScalePadding`, `settingsThumbSkip`.
+const BIG_SCALE_PADDING: [f32; 4] = [21., 7., 21., 4.];
+const THUMB_SKIP: f32 = 16.;
+/// `settingsTheme*`.
+const THEME_PREVIEW: (f32, f32) = (80., 92.);
+const THEME_BUBBLE: (f32, f32) = (40., 14.);
+const THEME_BUBBLE_POS: (f32, f32) = (6., 8.);
+const THEME_BUBBLE_SKIP: f32 = 6.;
+const THEME_RADIO_BOTTOM: f32 = 12.;
+const THEME_MIN_SKIP: f32 = 4.;
+const THEME_TEXT_TOP: f32 = 99.;
+const RADIO_SIZE: f32 = 22.;
+/// `settingsAccentColor*`.
+const ACCENT_SIZE: f32 = 24.;
+const ACCENT_SKIP: f32 = 4.;
+const ACCENT_LINE: f32 = 3.;
+
+/// A built-in theme (`EmbeddedScheme`): preview colors, its accent and the accents
+/// offered for it (`DefaultAccentColors`).
+struct Scheme {
+    name: &'static str,
+    background: u32,
+    sent: u32,
+    received: u32,
+    radio_inactive: u32,
+    radio_active: u32,
+    accent: u32,
+    accents: &'static [u32],
+}
+
+const SCHEMES: [Scheme; 4] = [
+    Scheme {
+        name: "Classic",
+        background: 0x9bd494,
+        sent: 0xeaffdc,
+        received: 0xffffff,
+        radio_inactive: 0xeaffdc,
+        radio_active: 0xffffff,
+        accent: 0x40a7e3,
+        accents: &[
+            0x45bce7, 0x52b440, 0xd46c99, 0xdf8a49, 0x9978c8, 0xc55245, 0x687b98, 0xdea922,
+        ],
+    },
+    Scheme {
+        name: "Day",
+        background: 0x7ec4ea,
+        sent: 0xd7f0ff,
+        received: 0xffffff,
+        radio_inactive: 0xd7f0ff,
+        radio_active: 0xffffff,
+        accent: 0x40a7e3,
+        accents: &[
+            0x45bce7, 0x52b440, 0xd46c99, 0xdf8a49, 0x9978c8, 0xc55245, 0x687b98, 0xdea922,
+        ],
+    },
+    Scheme {
+        name: "Tinted",
+        background: 0x485761,
+        sent: 0x5ca7d4,
+        received: 0x6b808d,
+        radio_inactive: 0x6b808d,
+        radio_active: 0x5ca7d4,
+        accent: 0x5288c1,
+        accents: &[
+            0x58bfe8, 0x466f42, 0xaa6084, 0xa46d3c, 0x917bbd, 0xab5149, 0x697b97, 0x9b834b,
+        ],
+    },
+    Scheme {
+        name: "Night",
+        background: 0x485761,
+        sent: 0x6b808d,
+        received: 0x6b808d,
+        radio_inactive: 0x6b808d,
+        radio_active: 0x75bfb5,
+        accent: 0x3fc1b0,
+        accents: &[
+            0x60a8e7, 0x4e9c57, 0xca7896, 0xcc925c, 0xa58ed2, 0xd27570, 0x7b8799, 0xcbac67,
+        ],
+    },
+];

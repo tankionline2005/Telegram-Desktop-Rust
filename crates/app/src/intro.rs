@@ -95,11 +95,19 @@ const NEXT_SLIDE_DURATION: f32 = 240.;
 const FADE_DURATION: f32 = 200.;
 const SETTINGS_SKIP: f32 = 10.;
 
-/// The login screen asks the window to go back, or is done.
+/// The login screen asks the window to go back, is done, or wants a layer:
+/// the country list (`CountrySelectBox`) or its settings.
 pub enum IntroEvent {
     Back,
     Done,
+    ChooseCountry,
+    Settings,
 }
+
+/// `CountryCodeInput`: digits a code keeps (more go on to the number).
+const MAX_CODE_DIGITS: usize = 4;
+/// `kMaxPhoneTailLength`.
+const MAX_PHONE_DIGITS: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -240,6 +248,9 @@ pub struct IntroView {
     settings_fade: Option<Simple>,
     /// The area's height at the last frame.
     last_height: f32,
+    /// The number or code was edited: the nearest country no longer replaces it
+    /// (`PhoneWidget::_changed`).
+    phone_changed: bool,
 }
 
 impl EventEmitter<IntroEvent> for IntroView {}
@@ -282,8 +293,8 @@ impl IntroView {
         })
         .detach();
         let fields = [
-            Field::new("", false, true, 4, cx),
-            Field::new("", false, true, 15, cx),
+            Field::new("", false, true, MAX_CODE_DIGITS + 1, cx),
+            Field::new("", false, true, MAX_PHONE_DIGITS, cx),
             Field::new("Your cloud password", true, false, 256, cx),
         ];
         let mut this = Self {
@@ -320,23 +331,18 @@ impl IntroView {
             back_fade: None,
             settings_fade: None,
             last_height: 0.,
+            phone_changed: false,
         };
+        // `PhoneWidget`: the built-in countries, the USA until the nearest country is
+        // known.
+        this.countries = tdr_data::countries::fallback();
+        this.choose_country_iso("US");
         if this.commands.is_none() {
-            // The demo: a QR code that leads nowhere, a few countries.
+            // The demo: a QR code that leads nowhere, the built-in countries.
             this.qr_url = Some("tg://login?token=demo".into());
-            let country = |iso2: &str, name: &str, code: &str, pattern: &str| Country {
-                iso2: iso2.into(),
-                name: name.into(),
-                code: code.into(),
-                patterns: vec![pattern.into()],
-            };
             this.handle(
                 LoginEvent::Countries {
-                    list: vec![
-                        country("RU", "Russian Federation", "7", "XXX XXX XXXX"),
-                        country("US", "USA", "1", "XXX XXX XXXX"),
-                        country("GB", "United Kingdom", "44", "XXXX XXXXXX"),
-                    ],
+                    list: Vec::new(),
                     nearest: "RU".into(),
                 },
                 cx,
@@ -375,50 +381,51 @@ impl IntroView {
         self.handle(event, cx);
     }
 
-    /// The number grouped by the country's pattern as it is typed
-    /// (`PhonePartInput`): "900 123 4567".
+    /// The number grouped by its country's pattern as it is typed
+    /// (`PhonePartInput::correctValue`): " 900 123 4567", digits past the pattern
+    /// run on.
     fn phone_shown(&self) -> String {
-        let code: String = self.fields[FieldId::CountryCode as usize]
-            .text
-            .chars()
-            .filter(char::is_ascii_digit)
-            .collect();
         let digits = &self.fields[FieldId::Phone as usize].text;
-        let pattern = self
-            .countries
-            .iter()
-            .find(|c| c.code == code)
-            .and_then(|c| c.patterns.first());
-        let Some(pattern) = pattern else {
+        let pattern = self.phone_pattern();
+        if pattern.is_empty() {
             return digits.clone();
-        };
-        let mut out = String::new();
-        let mut chars = digits.chars().peekable();
-        for p in pattern.chars() {
-            if chars.peek().is_none() {
-                break;
-            }
-            if p == ' ' {
-                out.push(' ');
-            } else if let Some(c) = chars.next() {
-                out.push(c);
-            }
         }
-        out.extend(chars);
-        out
+        let mut out = String::new();
+        let (mut in_part, mut part, mut left) = (true, 0usize, 0usize);
+        let mut first = true;
+        for ch in digits.chars() {
+            if in_part {
+                if left > 0 {
+                    left -= 1;
+                } else {
+                    let next = if first { 0 } else { part + 1 };
+                    first = false;
+                    part = next;
+                    in_part = part < pattern.len();
+                    if in_part {
+                        out.push(' ');
+                    }
+                    left = if in_part { pattern[part] - 1 } else { 0 };
+                }
+            }
+            out.push(ch);
+        }
+        out.trim_end().to_string()
     }
 
     fn handle(&mut self, event: LoginEvent, cx: &mut Context<Self>) {
         self.busy = false;
         match event {
             LoginEvent::Countries { list, nearest } => {
-                self.countries = list;
-                if self.fields[FieldId::CountryCode as usize].text.is_empty()
-                    && let Some(country) = self.countries.iter().find(|c| c.iso2 == nearest)
-                {
-                    self.fields[FieldId::CountryCode as usize].text = format!("+{}", country.code);
+                // `Countries::Manager`: the server's list replaces the built-in one.
+                if !list.is_empty() {
+                    self.countries = list;
                 }
-                self.update_country();
+                // `PhoneWidget::countryChanged`: the nearest country, unless the
+                // number was edited.
+                if !self.phone_changed && !self.choose_country_iso(&nearest) {
+                    self.update_country();
+                }
             }
             LoginEvent::QrCode(url) => {
                 self.qr_url = Some(url);
@@ -466,21 +473,80 @@ impl IntroView {
         cx.notify();
     }
 
-    /// The country of the typed code (`CountryInput::onChooseCode`).
+    /// The country of the typed code (`CountryInput::onChooseCode`): of countries
+    /// sharing a code, the one `byCode` keeps.
     fn update_country(&mut self) {
-        let code: String = self.fields[FieldId::CountryCode as usize]
+        let code = self.code_digits();
+        self.country_name = if code.is_empty() {
+            "Country Code".into()
+        } else {
+            tdr_data::countries::by_code(&self.countries, &code)
+                .map_or_else(|| "Invalid Country Code".into(), |c| c.name.clone())
+        };
+    }
+
+    fn code_digits(&self) -> String {
+        self.fields[FieldId::CountryCode as usize]
             .text
             .chars()
             .filter(char::is_ascii_digit)
-            .collect();
-        self.country_name = if code.is_empty() {
-            "Country".into()
-        } else {
-            self.countries
-                .iter()
-                .find(|c| c.code == code)
-                .map_or_else(|| "Invalid country code".into(), |c| c.name.clone())
+            .collect()
+    }
+
+    /// `CountryInput::chooseCountry(iso)`: its first code, its name.
+    fn choose_country_iso(&mut self, iso2: &str) -> bool {
+        let Some(country) = tdr_data::countries::by_iso2(&self.countries, iso2).cloned() else {
+            return false;
         };
+        self.country_chosen(&country);
+        true
+    }
+
+    /// A country from the list (`CountryInput::chooseCountry`): its name stays even
+    /// when another country has the same code (`CountryCodeInput::codeSelected`
+    /// changes the code without a signal).
+    pub fn country_chosen(&mut self, country: &Country) {
+        self.fields[FieldId::CountryCode as usize].text = format!("+{}", country.code);
+        self.country_name = country.name.clone();
+    }
+
+    /// The list the country box shows.
+    pub fn countries(&self) -> &[Country] {
+        &self.countries
+    }
+
+    /// The country was picked in the box: the number field takes the focus.
+    pub fn country_picked(&mut self, country: &Country, cx: &mut Context<Self>) {
+        self.phone_changed = true;
+        self.country_chosen(country);
+        self.fields[FieldId::Phone as usize].error = false;
+        self.error = None;
+        self.focus_pending = true;
+        cx.notify();
+    }
+
+    /// `PhonePartInput::updatePattern`: the groups of the number after the code, when
+    /// a pattern of its country fits (`Countries::Groups`).
+    fn phone_pattern(&self) -> Vec<usize> {
+        let code = self.code_digits();
+        let digits = &self.fields[FieldId::Phone as usize].text;
+        let groups = tdr_data::countries::groups(&self.countries, &format!("{code}{digits}"));
+        match groups.split_first() {
+            Some((first, rest)) if *first == code.len() && !code.is_empty() => rest.to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The rest of the pattern after what is typed, as minus signs
+    /// (`PhonePartInput::paintAdditionalPlaceholder`).
+    fn phone_placeholder(&self, shown: &str) -> String {
+        let pattern = self.phone_pattern();
+        let mut full = String::new();
+        for part in pattern {
+            full.push(' ');
+            full.extend(std::iter::repeat_n('\u{2212}', part));
+        }
+        full.chars().skip(shown.chars().count()).collect()
     }
 
     /// To `step` (`back`: the animation goes the other way). Nothing while a step
@@ -646,15 +712,23 @@ impl IntroView {
         self.blink = Instant::now();
         match ks.key.as_str() {
             "backspace" => {
-                if ks.modifiers.control {
+                if id == FieldId::Phone && field.text.is_empty() {
+                    // `PhonePartInput::frontBackspaceEvent`: at the number's start
+                    // the code is erased (`CountryCodeInput::startErasing`).
+                    let code = &mut self.fields[FieldId::CountryCode as usize];
+                    if code.text.len() > 1 {
+                        code.text.pop();
+                    }
+                    window.focus(&code.focus);
+                } else if ks.modifiers.control {
                     field.text.clear();
                 } else {
                     field.text.pop();
                 }
-                // `PhonePartInput::frontBackspaceEvent`: erasing on into the code.
-                if id == FieldId::Phone && field.text.is_empty() && ks.modifiers.control {
-                    window.focus(&self.fields[FieldId::CountryCode as usize].focus);
+                if id != FieldId::Password {
+                    self.phone_changed = true;
                 }
+                self.update_country();
             }
             "enter" => {
                 self.submit(window, cx);
@@ -687,7 +761,9 @@ impl IntroView {
     fn insert(&mut self, id: FieldId, text: &str, window: &mut Window) {
         let field = &mut self.fields[id as usize];
         for ch in text.chars() {
-            if field.text.chars().count() >= field.max {
+            // The code takes every digit for a moment: the ones past four go on to
+            // the number below.
+            if id != FieldId::CountryCode && field.text.chars().count() >= field.max {
                 break;
             }
             if field.digits {
@@ -701,17 +777,25 @@ impl IntroView {
             }
         }
         if id == FieldId::CountryCode {
-            // The code always starts with "+"; a known code moves on to the number.
+            // `CountryCodeInput::correctValue`: "+" and four digits; a fifth moves
+            // what follows the longest valid code on to the number.
             let digits: String = field.text.chars().filter(char::is_ascii_digit).collect();
-            field.text = format!("+{digits}");
-            if self.countries.iter().any(|c| c.code == digits)
-                && !self
-                    .countries
-                    .iter()
-                    .any(|c| c.code.len() > digits.len() && c.code.starts_with(&digits))
-            {
+            if digits.len() > MAX_CODE_DIGITS {
+                let kept = &digits[..MAX_CODE_DIGITS];
+                let valid = tdr_data::countries::valid_phone_code(&self.countries, kept);
+                let moved = digits[valid.len()..].to_string();
+                self.fields[FieldId::CountryCode as usize].text = format!("+{valid}");
+                // `PhonePartInput::addedToNumber`.
+                let phone = &mut self.fields[FieldId::Phone as usize];
+                phone.text = format!("{moved}{}", phone.text);
+                phone.text.truncate(MAX_PHONE_DIGITS);
                 window.focus(&self.fields[FieldId::Phone as usize].focus);
+            } else {
+                field.text = format!("+{digits}");
             }
+        }
+        if id != FieldId::Password {
+            self.phone_changed = true;
         }
     }
 
@@ -785,6 +869,11 @@ impl IntroView {
         let focused = [FieldId::CountryCode, FieldId::Phone, FieldId::Password]
             .into_iter()
             .find(|id| self.fields[*id as usize].focus.is_focused(window));
+        // `CountryCodeInput::spacePressed`: a space in the code submits.
+        if focused == Some(FieldId::CountryCode) && text == " " {
+            self.submit(window, cx);
+            return;
+        }
         if let Some(id) = focused {
             self.fields[id as usize].error = false;
             self.blink = Instant::now();
@@ -897,11 +986,27 @@ impl IntroView {
         } else {
             side
         };
+        // The number's pattern still to type, as minus signs.
+        let pattern_rest = (id == FieldId::Phone)
+            .then(|| self.phone_placeholder(&shown))
+            .filter(|rest| !rest.is_empty())
+            .map(|rest| {
+                div()
+                    .absolute()
+                    .left(px(text_left + text_w))
+                    .top(px(FIELD_TEXT_TOP))
+                    .text_size(font.size)
+                    .line_height(font.line_height())
+                    .whitespace_nowrap()
+                    .text_color(c(p.placeholder_fg))
+                    .child(rest)
+            });
         let focus = field.focus.clone();
         div()
             .relative()
             .w(px(width))
             .h(px(FIELD_HEIGHT))
+            .children(pattern_rest)
             .track_focus(&field.focus)
             .cursor(gpui::CursorStyle::IBeam)
             .on_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
@@ -1558,8 +1663,8 @@ impl Render for IntroView {
                     .on_click(cx.listener(|this, _, window, cx| this.back(window, cx))),
             );
         }
-        // "Settings" (`defaultBoxButton`, upper case), not on the start screen:
-        // settings come later.
+        // "Settings" (`defaultBoxButton`, upper case), not on the start screen: the
+        // settings layer (`Settings::LayerWidget`).
         let settings_opacity = anim::value(&self.settings_fade, f32::from(!step.has_cover()));
         if settings_opacity > 0. {
             let over = self.hovered == Some("intro-settings");
@@ -1580,6 +1685,7 @@ impl Render for IntroView {
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(c(p.light_button_fg))
                     .child("SETTINGS")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(IntroEvent::Settings)))
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                         this.hovered = if *hovered {
                             Some("intro-settings")
@@ -1858,11 +1964,18 @@ impl IntroView {
                     ));
                 // The country (`CountryInput`): its name and the drop-down arrow.
                 let country = div()
+                    .id("intro-country")
                     .absolute()
                     .left(px(left))
                     .top(px(top + FIELD_TOP))
                     .w(px(STEP_WIDTH))
                     .h(px(FIELD_HEIGHT))
+                    .cursor_pointer()
+                    // `CountryInput::mousePressEvent`: the country list.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.emit(IntroEvent::ChooseCountry)),
+                    )
                     .child(
                         div()
                             .absolute()

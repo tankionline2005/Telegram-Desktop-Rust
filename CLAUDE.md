@@ -84,6 +84,11 @@
   with the stack's animations; they are drawn at the view's root, below the title
   bar. Animation helpers: `anim.rs` (`Simple`, easings). Demo: `--start` (the first
   launch's start screen), `--intro` (the login of "Add Account").
+- Countries and phone numbers: `tdr_data::countries` (tdesktop's built-in list in
+  `countries_fallback.rs`, generated from `countries_instance.cpp`; `by_code` keeps
+  the last country of a shared code like `QHash`). The login's country list and
+  settings are layers of `MainView` (`ui/country_box.rs`, `render_intro_settings`),
+  asked for through `IntroEvent`.
 - Links to the repository come only from `REPO_URL` (`main.rs`, from Cargo.toml's
   `repository`) through `ui::layers::repo_url`.
 - Demo click coordinates are logical: screenshots are device pixels (divide by the

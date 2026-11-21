@@ -1814,3 +1814,54 @@ sha256 = "a51803e3a345802577e0ad9e1d50560abfe347fcadc798415c109298151d2285"
 path = "assets/tdesktop-icons/settings__star.svg"
 upstream = "Telegram/Resources/icons/settings/star.svg"
 sha256 = "ec2da61d5a5cddfd4a4b641cda8c84e908a3cf2a44ad2ca87fd63b94d1064d3a"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__network.png"
+upstream = "Telegram/Resources/icons/menu/network.png"
+sha256 = "b478a6c67b20f981e8e15e68acbcc6be2616e4ebbe05a0308b2999160d4e0b04"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__network@2x.png"
+upstream = "Telegram/Resources/icons/menu/network@2x.png"
+sha256 = "fb129b29d2e49fac2e8bc3b7d0fd0dfcb1eb30b9c18b5825a5bc2a5cf3f63492"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__network@3x.png"
+upstream = "Telegram/Resources/icons/menu/network@3x.png"
+sha256 = "7d72dfd1b5bc0bbce2a86bc701211e7b3a0a552019c0ab328695ba4951f2d5eb"
+
+[[vendored]]
+path = "assets/tdesktop-icons/box_search.png"
+upstream = "icons/box_search.png"
+submodule = "Telegram/lib_ui"
+sha256 = "caf2a17e260e974355f19232a896ce542a516486d88bb0da84d244c771440721"
+
+[[vendored]]
+path = "assets/tdesktop-icons/box_search@2x.png"
+upstream = "icons/box_search@2x.png"
+submodule = "Telegram/lib_ui"
+sha256 = "fbd0509529e19d75f256e9c513a27852e420ea818c633d7990ea0326d946c156"
+
+[[vendored]]
+path = "assets/tdesktop-icons/box_search@3x.png"
+upstream = "icons/box_search@3x.png"
+submodule = "Telegram/lib_ui"
+sha256 = "e0761e7ebe993ba6d0e44f3c9aea28b5b67d1321dd33ce5053d3e0a2a8342ceb"
+
+[[vendored]]
+path = "assets/tdesktop-icons/default_checkbox_check.png"
+upstream = "icons/default_checkbox_check.png"
+submodule = "Telegram/lib_ui"
+sha256 = "b5b465857bcfe6a03212b7e183d679fa75550dd05d819b118becbf3e4638ee7f"
+
+[[vendored]]
+path = "assets/tdesktop-icons/default_checkbox_check@2x.png"
+upstream = "icons/default_checkbox_check@2x.png"
+submodule = "Telegram/lib_ui"
+sha256 = "cb3ad5d41c36dcfbad45e2c415367b1defd0464760ce490acbf5984d5b5a330c"
+
+[[vendored]]
+path = "assets/tdesktop-icons/default_checkbox_check@3x.png"
+upstream = "icons/default_checkbox_check@3x.png"
+submodule = "Telegram/lib_ui"
+sha256 = "e5a82124cc0c0f955848cb235099cc576d7bdf97489302661f2bc9d4e7101ae8"
