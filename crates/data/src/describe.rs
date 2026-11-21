@@ -480,6 +480,8 @@ pub struct PeerInfo {
     /// Small userpic: photo id and the DC that stores it.
     pub photo: Option<(i64, i32)>,
     pub verified: bool,
+    /// An emoji status is set (drawn instead of the Premium star).
+    pub emoji_status: bool,
     /// A Telegram Premium user.
     pub premium: bool,
     pub first_name: Option<String>,
@@ -522,6 +524,10 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
                     _ => None,
                 },
                 verified: u.verified,
+                emoji_status: u
+                    .emoji_status
+                    .as_ref()
+                    .is_some_and(|s| !matches!(s, enums::EmojiStatus::Empty)),
                 premium: u.premium,
                 first_name: u.first_name.clone(),
                 contact: u.contact,
@@ -548,6 +554,10 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
                 members: c.participants_count,
                 photo: chat_photo(&c.photo),
                 verified: c.verified,
+                emoji_status: c
+                    .emoji_status
+                    .as_ref()
+                    .is_some_and(|s| !matches!(s, enums::EmojiStatus::Empty)),
                 ..Default::default()
             },
             _ => PeerInfo {
@@ -563,6 +573,51 @@ fn chat_photo(p: &enums::ChatPhoto) -> Option<(i64, i32)> {
         enums::ChatPhoto::ChatPhoto(p) => Some((p.photo_id, p.dc_id)),
         enums::ChatPhoto::Empty => None,
     }
+}
+
+/// `SpoilerLoginCode`'s pattern: the first code of digits and dashes in `text`,
+/// `min_length` to 8 characters long, starting and ending with a digit, not inside a
+/// word (`(?<![\w\-#])(\d[\d\-]{min-2,6}\d)(?!\w\-)`). Its byte range.
+pub fn login_code(text: &str, min_length: usize) -> Option<std::ops::Range<usize>> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let inner_min = min_length.saturating_sub(2);
+    for start in 0..chars.len() {
+        let (_, first) = chars[start];
+        if !first.is_ascii_digit() {
+            continue;
+        }
+        if start > 0 {
+            let prev = chars[start - 1].1;
+            if word(prev) || prev == '-' || prev == '#' {
+                continue;
+            }
+        }
+        // Greedy: the longest run of digits and dashes first.
+        let mut run = 0;
+        while run < 6
+            && start + 1 + run < chars.len()
+            && (chars[start + 1 + run].1.is_ascii_digit() || chars[start + 1 + run].1 == '-')
+        {
+            run += 1;
+        }
+        for inner in (inner_min..=run).rev() {
+            let last = start + 1 + inner;
+            if last >= chars.len() || !chars[last].1.is_ascii_digit() {
+                continue;
+            }
+            // `(?!\w\-)`: not followed by a word character and a dash.
+            let after = (chars.get(last + 1), chars.get(last + 2));
+            if let (Some((_, a)), Some((_, '-'))) = after
+                && word(*a)
+            {
+                continue;
+            }
+            let end = chars.get(last + 1).map_or(text.len(), |(i, _)| *i);
+            return Some(chars[start].0..end);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -706,5 +761,22 @@ mod tests {
             ttl_period: None,
         }
         .into()
+    }
+
+    #[test]
+    fn login_codes_like_tdesktop() {
+        let code = |t: &str| login_code(t, 5).map(|r| t[r].to_string());
+        assert_eq!(
+            code("Login code: 12345. Do not give it"),
+            Some("12345".into())
+        );
+        assert_eq!(code("Код: 52-118"), Some("52-118".into()));
+        // Too short, inside words, after a hash.
+        assert_eq!(code("Code 1234"), None);
+        assert_eq!(code("id a12345"), None);
+        assert_eq!(code("#12345"), None);
+        // A longer run is cut at eight characters ending with a digit.
+        assert_eq!(code("123456789012"), Some("12345678".into()));
+        assert_eq!(code("7xeY_4JeM-k"), None);
     }
 }

@@ -657,7 +657,7 @@ impl MainView {
         &self,
         key: TextKey,
         text_top: f32,
-        bubble_w: f32,
+        (bubble_left, bubble_w, chat_width): (f32, f32, f32),
         gap: f32,
         left: bool,
         window: &Window,
@@ -687,9 +687,23 @@ impl MainView {
             .opacity(level)
             .child(icon(Icon::MiniCopy, p.msg_service_fg, window))
             .child("Click to copy");
+        // Beside the bubble on the free side (left of outgoing ones), else on the
+        // other side; not at all when it fits on neither.
+        let pill_w = lg(8.)
+            + crate::icons::icon_width(Icon::MiniCopy, window)
+            + lg(4.)
+            + super::text_width(window, "Click to copy", 13., gpui::FontWeight::NORMAL)
+            + lg(10.);
+        let fits_left = bubble_left - gap - pill_w >= 0.;
+        let fits_right = bubble_left + bubble_w + gap + pill_w <= chat_width;
+        let on_left = match (left, fits_left, fits_right) {
+            (true, true, _) | (false, true, false) => true,
+            (false, _, true) | (true, false, true) => false,
+            _ => return None,
+        };
         let side = gpui::px(bubble_w + gap);
         Some(
-            if left {
+            if on_left {
                 pill.right(side)
             } else {
                 pill.left(side)

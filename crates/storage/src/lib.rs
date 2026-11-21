@@ -359,6 +359,13 @@ impl Storage {
             .map(|v| i64::from_le_bytes(v.try_into().unwrap())))
     }
 
+    /// The chat is in the cached chat list (tdesktop's `folderKnown`).
+    pub fn has_dialog(&self, key: PeerKey) -> Result<bool> {
+        self.conn
+            .prepare_cached("SELECT EXISTS (SELECT 1 FROM dialogs WHERE kind = ?1 AND id = ?2)")?
+            .query_row(params![key.kind as i64, key.id], |r| r.get(0))
+    }
+
     pub fn peer(&self, key: PeerKey) -> Result<Option<PeerRow>> {
         self.conn
             .prepare_cached(
@@ -789,6 +796,16 @@ impl Writer<'_> {
                 params![peer.kind as i64, peer.id, SERVER_MAX_MESSAGE_ID, date, text],
                 |r| r.get(0),
             )
+    }
+
+    /// The peer has its object with a name (tdesktop's `isLoaded`).
+    pub fn peer_loaded(&self, p: PeerKey) -> Result<bool> {
+        self.tx
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM peers WHERE kind = ?1 AND id = ?2
+                                AND raw IS NOT NULL AND name <> '')",
+            )?
+            .query_row(params![p.kind as i64, p.id], |r| r.get(0))
     }
 
     /// Stores a peer unless one is already known (e.g. the "Telegram" service account

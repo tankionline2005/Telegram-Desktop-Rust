@@ -1865,3 +1865,53 @@ path = "assets/tdesktop-icons/default_checkbox_check@3x.png"
 upstream = "icons/default_checkbox_check@3x.png"
 submodule = "Telegram/lib_ui"
 sha256 = "e5a82124cc0c0f955848cb235099cc576d7bdf97489302661f2bc9d4e7101ae8"
+
+[[vendored]]
+path = "assets/tdesktop-art/logo_256_no_margin.png"
+upstream = "Telegram/Resources/art/logo_256_no_margin.png"
+sha256 = "44af9a76a532559ef8cb450b48096713be819103ab79a19d7e4abb9b32ff4cb7"
+
+[[vendored]]
+path = "assets/tdesktop-icons/dialogs__dialogs_verified_star.png"
+upstream = "Telegram/Resources/icons/dialogs/dialogs_verified_star.png"
+sha256 = "2f9df6f10db25cbeb184e6719f1c405562d954fbd8e3b268eea924f29056c0b8"
+
+[[vendored]]
+path = "assets/tdesktop-icons/dialogs__dialogs_verified_star@2x.png"
+upstream = "Telegram/Resources/icons/dialogs/dialogs_verified_star@2x.png"
+sha256 = "5ba5c5226a598dba19a766c1bb07dad5108c616444be356ca514f6f29b87bbc7"
+
+[[vendored]]
+path = "assets/tdesktop-icons/dialogs__dialogs_verified_star@3x.png"
+upstream = "Telegram/Resources/icons/dialogs/dialogs_verified_star@3x.png"
+sha256 = "09a2ab02325883d011e4f2f22959e97c5256ef5b99a5142b293df53f77022ee8"
+
+[[vendored]]
+path = "assets/tdesktop-icons/dialogs__dialogs_verified_check.png"
+upstream = "Telegram/Resources/icons/dialogs/dialogs_verified_check.png"
+sha256 = "5f344c57dac6d53d6a88805240f2e7257379fb9f84d6dea2c46fb5100fe0c8c4"
+
+[[vendored]]
+path = "assets/tdesktop-icons/dialogs__dialogs_verified_check@2x.png"
+upstream = "Telegram/Resources/icons/dialogs/dialogs_verified_check@2x.png"
+sha256 = "6e613d039eb992284feee62984bf6738efe5d5c7f26420d3a60a033b1a7033df"
+
+[[vendored]]
+path = "assets/tdesktop-icons/dialogs__dialogs_verified_check@3x.png"
+upstream = "Telegram/Resources/icons/dialogs/dialogs_verified_check@3x.png"
+sha256 = "c24de54266128c5355cb05c35ec44965401776c73c646ecd71e811d334b114d5"
+
+[[vendored]]
+path = "assets/tdesktop-icons/dialogs__dialogs_premium.png"
+upstream = "Telegram/Resources/icons/dialogs/dialogs_premium.png"
+sha256 = "d2ba9796d962639d2e451dca4f32561cea2987f46ff7164e8f54df1bb54bf73d"
+
+[[vendored]]
+path = "assets/tdesktop-icons/dialogs__dialogs_premium@2x.png"
+upstream = "Telegram/Resources/icons/dialogs/dialogs_premium@2x.png"
+sha256 = "07aa2d4ffbcf60ccbbe6cb6acb75de08f8308b2e0ed567628adad7af54703779"
+
+[[vendored]]
+path = "assets/tdesktop-icons/dialogs__dialogs_premium@3x.png"
+upstream = "Telegram/Resources/icons/dialogs/dialogs_premium@3x.png"
+sha256 = "a7f35751a15fc71f2ad35581026e55a4739635ee4c8b8a8420d686c73b655564"

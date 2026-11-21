@@ -35,6 +35,20 @@ const FILTER_BADGE_SKIP: f32 = 4.;
 const FILTER_BADGE_STROKE: f32 = 2.;
 const FILTER_BADGE_X: f32 = 3.;
 const FILTER_BADGE_Y: f32 = 7.;
+/// `chatsFiltersTabs` (`dialogsSearchTabs`): height, padding, `strictSkip`, the
+/// label's top and font, the bar, the unread count's skip (`lineWidth * 5`) and
+/// the selection's duration (`defaultSettingsSlider.duration`).
+const TABS_HEIGHT: f32 = 33.;
+const TABS_PADDING: f32 = 9.;
+const TABS_STRICT_SKIP: f32 = 18.;
+const TABS_LABEL_TOP: f32 = 7.;
+const TABS_FONT: f32 = 13.;
+const TABS_BAR_TOP: f32 = 30.;
+const TABS_BAR_STROKE: f32 = 6.;
+const TABS_BAR_RADIUS: f32 = 2.;
+const TABS_UNREAD_SKIP: f32 = 5.;
+const TABS_DURATION: f32 = 150.;
+
 /// `SideBarButton::kMaxLabelLines`: longer titles wrap, the button grows.
 const FILTER_MAX_LINES: usize = 3;
 
@@ -435,7 +449,7 @@ impl MainView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement + use<>> {
-        if self.folders.is_empty() {
+        if !self.filters_vertical() {
             return None;
         }
         let p = self.palette();
@@ -512,6 +526,274 @@ impl MainView {
                         .child(list),
                 ),
         )
+    }
+
+    /// `Ui::UnreadBadge` with the default style (`dialogsUnread*`): a count in a pill.
+    pub(super) fn count_badge(&self, text: &str, muted: bool, window: &Window) -> Div {
+        let p = self.palette();
+        let font = scale::font(super::UNREAD_FONT_SIZE);
+        let w = (super::text_width(
+            window,
+            text,
+            super::UNREAD_FONT_SIZE,
+            gpui::FontWeight::BOLD,
+        ) + 2. * lg(super::UNREAD_PADDING))
+        .max(lg(super::UNREAD_HEIGHT));
+        div()
+            .flex_none()
+            .w(gpui::px(w.round()))
+            .h(px(super::UNREAD_HEIGHT))
+            .rounded(px(super::UNREAD_HEIGHT / 2.))
+            .bg(c(if muted {
+                p.dialogs_unread_bg_muted
+            } else {
+                p.dialogs_unread_bg
+            }))
+            .text_color(c(p.dialogs_unread_fg))
+            .text_size(font.size)
+            .line_height(font.line_height())
+            .font_weight(gpui::FontWeight::BOLD)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(text.to_string())
+    }
+
+    /// The folders as tabs over the chat list when the folder column does not fit
+    /// (`ChatsFiltersTabs` with `chatsFiltersTabs`): labels with unread counts, the
+    /// rounded bar under the chosen one moving to a new choice (150 ms), the folder
+    /// switching once the bar is there.
+    pub(super) fn render_folder_tabs(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.folders.is_empty() || self.filters_vertical() {
+            return None;
+        }
+        let p = self.palette();
+        let font = scale::font(TABS_FONT);
+        let chosen = self.tabs_chosen.unwrap_or(self.active_folder);
+        // `SettingsSlider::countSectionsWidths` with `strictSkip`: each tab its
+        // content and 9 px on both sides, after the 9 px padding.
+        struct Tab {
+            id: i32,
+            left: f32,
+            width: f32,
+            content: f32,
+            label: String,
+            badge: Option<(String, bool)>,
+        }
+        let mut tabs = Vec::new();
+        let mut x = lg(TABS_PADDING);
+        for folder in &self.folders {
+            let label = if folder.id == 0 {
+                "All".to_string()
+            } else {
+                folder.title.clone()
+            };
+            let badge = folder.badge.map(|(n, muted)| {
+                let text = if n > 999 {
+                    "99+".to_string()
+                } else {
+                    n.to_string()
+                };
+                (text, muted)
+            });
+            let badge_w = badge.as_ref().map_or(0., |(t, _)| {
+                lg(TABS_UNREAD_SKIP)
+                    + (super::text_width(
+                        window,
+                        t,
+                        super::UNREAD_FONT_SIZE,
+                        gpui::FontWeight::BOLD,
+                    ) + 2. * lg(super::UNREAD_PADDING))
+                    .max(lg(super::UNREAD_HEIGHT))
+                    .round()
+            });
+            let content =
+                super::text_width(window, &label, TABS_FONT, gpui::FontWeight::SEMIBOLD) + badge_w;
+            let width = lg(TABS_STRICT_SKIP) + content;
+            tabs.push(Tab {
+                id: folder.id,
+                left: x.floor(),
+                width: width.round(),
+                content,
+                label,
+                badge,
+            });
+            x += width;
+        }
+        let total = x + lg(TABS_PADDING);
+        // `getFinalActiveRange` with `barSnapToLabel`, animated from where it was.
+        let target = tabs.iter().find(|t| t.id == chosen).map_or((0., 0.), |t| {
+            (t.left + (t.width - t.content) / 2., t.content)
+        });
+        let range = match self.tabs_anim {
+            Some((start, from_left, from_width)) => {
+                let t = (start.elapsed().as_secs_f32() * 1000. / TABS_DURATION).min(1.);
+                if t >= 1. {
+                    self.tabs_anim = None;
+                } else {
+                    window.request_animation_frame();
+                }
+                (
+                    crate::anim::mix(from_left, target.0, t),
+                    crate::anim::mix(from_width, target.1, t),
+                )
+            }
+            None => target,
+        };
+        self.tabs_bar.set(range);
+        let height = lg(TABS_HEIGHT);
+        let mut strip = div()
+            .relative()
+            .w(gpui::px(total.max(1.)))
+            .h(gpui::px(height));
+        for (i, tab) in tabs.iter().enumerate() {
+            let id = tab.id;
+            let active = id == chosen;
+            let ripple_id: SharedString = format!("folder-tab-{id}").into();
+            let press_id = ripple_id.clone();
+            let label_left = (tab.width - tab.content) / 2.;
+            let mut content = div()
+                .absolute()
+                .left(gpui::px(label_left))
+                .top(px(TABS_LABEL_TOP))
+                .flex()
+                .items_start()
+                .child(
+                    div()
+                        .text_size(font.size)
+                        .line_height(font.line_height())
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(c(if active {
+                            p.light_button_fg
+                        } else {
+                            p.window_sub_text_fg
+                        }))
+                        .whitespace_nowrap()
+                        .child(tab.label.clone()),
+                );
+            if let Some((text, muted)) = &tab.badge {
+                content = content.child(
+                    div()
+                        .pl(px(TABS_UNREAD_SKIP))
+                        .child(self.count_badge(text, *muted, window)),
+                );
+            }
+            let width = tab.width;
+            strip = strip.child(
+                div()
+                    .id(("folder-tab", i))
+                    .absolute()
+                    .left(gpui::px(tab.left))
+                    .top_0()
+                    .w(gpui::px(width))
+                    .h(gpui::px(height))
+                    .overflow_hidden()
+                    .cursor_pointer()
+                    .children(self.ripple_layer(
+                        &ripple_id,
+                        width,
+                        height,
+                        if active {
+                            p.light_button_bg_over
+                        } else {
+                            p.window_bg_over
+                        },
+                        false,
+                    ))
+                    .child(content)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.press_button(press_id.clone(), (width / 2., height / 2.));
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.release_buttons();
+                            cx.notify();
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.release_buttons();
+                        this.folder_tab_clicked(id, cx);
+                    })),
+            );
+        }
+        // The bar: `barStroke` high from `barTop`, its lower half cut by the strip.
+        let add = lg(TABS_BAR_STROKE) / 2.;
+        strip = strip.child(
+            div()
+                .absolute()
+                .left(gpui::px((range.0 - add).max(0.)))
+                .top(px(TABS_BAR_TOP))
+                .w(gpui::px(range.1 + 2. * add))
+                .h(px(TABS_BAR_STROKE))
+                .rounded(px(TABS_BAR_RADIUS))
+                .bg(c(p.slider_bg_active)),
+        );
+        Some(
+            div()
+                .id("folder-tabs")
+                .relative()
+                .flex_none()
+                .w_full()
+                .h(gpui::px(height))
+                .overflow_hidden()
+                .bg(c(p.dialogs_bg))
+                .child(
+                    div()
+                        .id("folder-tabs-scroll")
+                        .size_full()
+                        .overflow_x_scroll()
+                        .child(strip),
+                )
+                // `PlainShadow` along the bottom.
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .h(gpui::px(lg(1.)))
+                        .bg(c(p.shadow_fg)),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// A tab clicked: the bar moves there and the folder opens after it
+    /// (`DiscreteSlider::_callbackAfterMs`); the open one scrolls the list up.
+    fn folder_tab_clicked(&mut self, id: i32, cx: &mut Context<Self>) {
+        let chosen = self.tabs_chosen.unwrap_or(self.active_folder);
+        if id == chosen {
+            if self.tabs_chosen.is_none() {
+                self.start_scroll_anim(super::Area::Dialogs, 0.);
+            }
+            cx.notify();
+            return;
+        }
+        let (left, width) = self.tabs_bar.get();
+        self.tabs_anim = Some((Instant::now(), left, width));
+        self.tabs_chosen = Some(id);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(TABS_DURATION as u64))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.tabs_chosen == Some(id) {
+                    this.tabs_chosen = None;
+                    this.select_folder(id, cx);
+                }
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn select_folder(&mut self, id: i32, cx: &mut Context<Self>) {
@@ -737,7 +1019,8 @@ impl MainView {
         cx: &mut Context<Self>,
     ) -> Div {
         let p = self.palette();
-        let filters = !self.folders.is_empty();
+        // The folder column holds the menu button; as tabs, the header keeps it.
+        let filters = self.filters_vertical();
         let header = div()
             .relative()
             .h(px(super::TOP_BAR_HEIGHT))

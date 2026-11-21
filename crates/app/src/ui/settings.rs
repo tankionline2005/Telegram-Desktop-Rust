@@ -257,12 +257,8 @@ impl MainView {
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
-                    let size = window.viewport_size();
-                    let (left, ..) = Self::settings_geometry(
-                        f32::from(size.width),
-                        f32::from(size.height) - lg(TITLE_HEIGHT),
-                    );
+                cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
+                    let left = this.layers.settings_left.get();
                     this.press_button(
                         id.into(),
                         (f32::from(e.position.x) - left, lg(row_height) / 2.),
@@ -445,14 +441,8 @@ impl MainView {
     }
 
     /// The Settings layer, `width` wide and at most `max_h` tall.
-    pub(super) fn render_settings(
-        &self,
-        width: f32,
-        max_h: f32,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let p = self.palette();
+    /// `Settings::Main`'s content, `width` wide.
+    fn settings_content(&self, width: f32, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let skip = || div().flex_none().h(px(SKIP));
         let row = |this: &Self, id, lead, text, label: Option<String>, cx: &mut Context<Self>| {
             this.settings_row(id, lead, text, label, None, width, window, cx)
@@ -573,7 +563,18 @@ impl MainView {
                 cx,
             ))
             .child(skip());
+        content
+    }
 
+    pub(super) fn render_settings(
+        &self,
+        width: f32,
+        max_h: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = self.palette();
+        let content = self.settings_content(width, window, cx);
         let (box_left, box_top, ..) = {
             let size = window.viewport_size();
             Self::settings_geometry(
@@ -620,7 +621,110 @@ impl MainView {
                 |this, _, _| this.layers.hide_all(),
             ));
         let _ = p;
+        self.layers.settings_left.set(box_left);
         self.info_layer_frame(width, max_h, buttons, content)
+    }
+
+    /// Settings as a section (`Info::WrapWidget` in one column): the top bar with the
+    /// back arrow, "Settings", search and "⋮"; the content under it, `width` wide.
+    pub(super) fn render_settings_section(
+        &self,
+        left: f32,
+        width: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = self.palette();
+        self.layers.settings_left.set(left);
+        let content = self.settings_content(width, window, cx);
+        let title_font = scale::font(SECTION_TITLE_FONT);
+        let back_y = ((SECTION_TOP_BAR - icons::style_size(Icon::Back).1) / 2.).floor();
+        let top_bar = div()
+            .flex_none()
+            .relative()
+            .h(px(SECTION_TOP_BAR))
+            .bg(c(p.window_bg))
+            .child(self.icon_button(
+                "settings-section-back",
+                Icon::Back,
+                (SECTION_BACK_WIDTH, SECTION_TOP_BAR),
+                Some((SECTION_BACK_ICON_LEFT, back_y)),
+                ((6., 6.), 42.),
+                (p.box_title_close_fg, p.box_title_close_fg_over),
+                window,
+                cx,
+                |this, _, _| this.layers.hide_all(),
+            ))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(SECTION_BACK_WIDTH))
+                    .top_0()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .text_size(title_font.size)
+                    .line_height(title_font.line_height())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(c(p.window_bold_fg))
+                    .child("Settings"),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .flex()
+                    .child(self.icon_button(
+                        "settings-section-search",
+                        Icon::TopBarSearch,
+                        (56., SECTION_TOP_BAR),
+                        None,
+                        ((6., 6.), 42.),
+                        (p.box_title_close_fg, p.box_title_close_fg_over),
+                        window,
+                        cx,
+                        |_, _, _| {},
+                    ))
+                    .child(self.icon_button(
+                        "settings-section-menu",
+                        Icon::MenuDots,
+                        (48., SECTION_TOP_BAR),
+                        None,
+                        ((1., 6.), 42.),
+                        (p.box_title_close_fg, p.box_title_close_fg_over),
+                        window,
+                        cx,
+                        move |this, _, cx| {
+                            // Under the button, its top right at the bar's right.
+                            let at = gpui::point(
+                                gpui::px(left + width),
+                                gpui::px(lg(TITLE_HEIGHT) + lg(SECTION_TOP_BAR)),
+                            );
+                            this.open_settings_menu(at, cx);
+                        },
+                    )),
+            );
+        div()
+            .id("settings-section")
+            .occlude()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(c(p.window_bg))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(top_bar)
+            .child(div().flex_none().h(gpui::px(lg(1.))).bg(c(p.shadow_fg)))
+            .child(
+                div()
+                    .id("settings-section-scroll")
+                    .flex_1()
+                    .min_h(gpui::px(0.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.layers.settings_scroll)
+                    .child(content),
+            )
+            .into_any_element()
     }
 
     /// `Info::LayerWidget` / `Settings::LayerWidget`: the rounded box with the top
@@ -1048,6 +1152,13 @@ impl MainView {
         row.child(custom)
     }
 }
+
+/// `infoTopBar` of a section: its height, the back arrow (`infoTopBarBack`: 60 px,
+/// the icon at 11), the 14 px semibold title.
+const SECTION_TOP_BAR: f32 = 54.;
+const SECTION_BACK_WIDTH: f32 = 60.;
+const SECTION_BACK_ICON_LEFT: f32 = 11.;
+const SECTION_TITLE_FONT: f32 = 14.;
 
 /// `settingsCheckbox` (`defaultBoxCheckbox`): the square, the label after it,
 /// `settingsCheckboxPadding`.

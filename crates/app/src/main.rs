@@ -269,7 +269,8 @@ fn main() {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(window_bounds),
-                    window_min_size: Some(size(px(640.), px(420.))),
+                    // `windowMinWidth`, `windowMinHeight`: narrower, the window goes one-column.
+                    window_min_size: Some(size(px(380.), px(480.))),
                     titlebar: Some(TitlebarOptions {
                         // The title is shown in the taskbar only: the window draws tdesktop's
                         // custom title bar itself.

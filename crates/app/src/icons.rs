@@ -116,6 +116,10 @@ pub enum Icon {
     MenuDiscussion,
     MenuNetwork,
     InfoClose,
+    /// `dialogsVerifiedIcon` (two layers), `dialogsPremiumIcon`.
+    VerifiedStar,
+    VerifiedCheck,
+    PremiumStar,
     /// `defaultCheckboxIcon`, `boxFieldSearchIcon`.
     CheckboxCheck,
     BoxSearch,
@@ -248,6 +252,9 @@ impl Icon {
             Icon::MenuNetwork => Source::Png(icon_bytes!("menu__network")),
             Icon::CheckboxCheck => Source::Png(icon_bytes!("default_checkbox_check")),
             Icon::BoxSearch => Source::Png(icon_bytes!("box_search")),
+            Icon::VerifiedStar => Source::Png(icon_bytes!("dialogs__dialogs_verified_star")),
+            Icon::VerifiedCheck => Source::Png(icon_bytes!("dialogs__dialogs_verified_check")),
+            Icon::PremiumStar => Source::Png(icon_bytes!("dialogs__dialogs_premium")),
             Icon::IntroLeft => Source::Png(icon_bytes!("intro_left")),
             Icon::IntroRight => Source::Png(icon_bytes!("intro_right")),
             Icon::IntroPlaneTrace => Source::Png(icon_bytes!("intro_plane_trace")),
@@ -580,4 +587,25 @@ pub fn premium_star(colors: &[(f32, Color)], size: f32, window: &Window) -> Div 
             .top(px(-pad))
             .size(px(side + 2. * pad)),
     )
+}
+
+/// tdesktop's logo without margins (`Window::LogoNoMargin`, `art/logo_256_no_margin`):
+/// the userpic of "Telegram" while it has no photo of its own.
+pub fn telegram_logo() -> Arc<RenderImage> {
+    static LOGO: LazyLock<Arc<RenderImage>> = LazyLock::new(|| {
+        let mut image = image::load_from_memory_with_format(
+            include_bytes!("../../../assets/tdesktop-art/logo_256_no_margin.png"),
+            image::ImageFormat::Png,
+        )
+        .expect("bundled logo")
+        .to_rgba8();
+        // GPUI expects BGRA.
+        for px in image.pixels_mut() {
+            px.0.swap(0, 2);
+        }
+        Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+            image
+        )]))
+    });
+    LOGO.clone()
 }

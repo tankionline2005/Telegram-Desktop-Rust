@@ -141,6 +141,8 @@ pub struct Applied {
     pub filters_changed: bool,
     /// Users went online or offline.
     pub statuses_changed: bool,
+    /// A service notification was added (`updateServiceNotification`).
+    pub service_notification: bool,
     /// Local drafts changed by the server (another device): the input field of an
     /// open chat should show the new text (`None`: cleared).
     pub draft_changes: Vec<drafts::Change>,
@@ -157,6 +159,7 @@ impl Applied {
         self.marks_changed |= other.marks_changed;
         self.pinned_changed |= other.pinned_changed;
         self.statuses_changed |= other.statuses_changed;
+        self.service_notification |= other.service_notification;
         self.draft_changes.extend(other.draft_changes);
         self.cloud_drafts.extend(other.cloud_drafts);
     }
@@ -843,6 +846,8 @@ impl Sync {
     /// The `InputPeer` of a cached chat (needs its access hash).
     pub fn input_peer(&self, peer: PeerKey) -> Option<enums::InputPeer> {
         let hash = self.store.access_hash(peer).ok().flatten();
+        // The made-up "Telegram" account has no access hash: tdesktop sends 0.
+        let hash = hash.or((peer == PeerKey::user(SERVICE_NOTIFICATIONS_ID)).then_some(0));
         convert::input_peer(peer, hash)
     }
 
@@ -1118,6 +1123,15 @@ impl Sync {
             }
             applied.merge(self.commit(next)?);
         }
+        // `Session::serviceNotification`: a chat not in the list yet is asked for
+        // (`requestDialogEntry`), which brings the real "Telegram" account.
+        let service = PeerKey::user(SERVICE_NOTIFICATIONS_ID);
+        if applied.service_notification
+            && !self.store.has_dialog(service)?
+            && let Err(e) = self.request_dialog_entry(service).await
+        {
+            debug!("service notifications chat: {e}");
+        }
         // After `differenceTooLong` the cached chat list is stale: reload it.
         if self.reload_if_stale().await? {
             applied.reloaded = true;
@@ -1376,25 +1390,19 @@ fn apply_update(
             let peer = PeerKey::user(SERVICE_NOTIFICATIONS_ID);
             let date = x.inbox_date.unwrap_or_else(unix_now);
             if !w.has_local_message(peer, date, &x.message)? {
-                w.put_peer_if_missing(&tdr_storage::PeerRow {
-                    key: peer,
-                    access_hash: None,
-                    is_min: false,
-                    is_megagroup: false,
-                    name: "Telegram".into(),
-                    username: None,
-                    raw: None,
-                })?;
-                let row = MessageRow {
-                    peer,
-                    id: w.next_local_message_id()?,
-                    date,
-                    from: Some(peer),
-                    out: false,
-                    text: x.message.clone(),
-                    raw: None,
-                };
-                new_message(w, row, applied)?;
+                // `Session::serviceNotification`: the account made up while it is
+                // not loaded (no object, or no name).
+                if !w.peer_loaded(peer)?
+                    && let Some(row) =
+                        convert::user_row(&convert::service_user(SERVICE_NOTIFICATIONS_ID))
+                {
+                    w.put_peer(&row)?;
+                }
+                let id = w.next_local_message_id()?;
+                if let Some(row) = convert::service_message(SERVICE_NOTIFICATIONS_ID, id, date, x) {
+                    new_message(w, row, applied)?;
+                    applied.service_notification = true;
+                }
             }
         }
         U::DraftMessage(x) if x.top_msg_id.is_none() && x.saved_peer_id.is_none() => {
@@ -1712,7 +1720,10 @@ mod tests {
             r#type: kind.into(),
             message: "New login.".into(),
             media: enums::MessageMedia::Empty,
-            entities: vec![],
+            entities: vec![enums::MessageEntity::Bold(types::MessageEntityBold {
+                offset: 0,
+                length: 10,
+            })],
         }))
     }
 
@@ -1720,8 +1731,20 @@ mod tests {
     fn service_notifications_become_telegram_messages() {
         let mut store = Storage::open_in_memory().unwrap();
         let mut applied = Applied::default();
+        let tg = PeerKey::user(SERVICE_NOTIFICATIONS_ID);
         store
             .write(|w| {
+                // A nameless row of the account (seen before without its object) is
+                // not "loaded": the made-up account replaces it.
+                w.put_peer(&tdr_storage::PeerRow {
+                    key: tg,
+                    access_hash: None,
+                    is_min: true,
+                    is_megagroup: false,
+                    name: String::new(),
+                    username: None,
+                    raw: None,
+                })?;
                 apply_update(w, &notification(false, "auth123_1", 5000), &mut applied)?;
                 // The same one again (difference and live): no duplicate.
                 apply_update(w, &notification(false, "auth123_1", 5000), &mut applied)?;
@@ -1735,7 +1758,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(applied.new_messages.len(), 1);
-        let tg = PeerKey::user(SERVICE_NOTIFICATIONS_ID);
+        assert!(applied.service_notification);
         let history = store.history(tg, 10).unwrap();
         assert_eq!(history.messages.len(), 1);
         assert_eq!(history.messages[0].text, "New login.");
@@ -1744,5 +1767,21 @@ mod tests {
         assert_eq!(list[0].dialog.peer, tg);
         assert_eq!(list[0].dialog.unread_count, 1);
         assert_eq!(list[0].peer.as_ref().unwrap().name, "Telegram");
+        // As `Session::serviceNotification` makes them: the account verified with
+        // its number, the message with its entities.
+        let info = describe::peer_info(list[0].peer.as_ref().unwrap());
+        assert!(info.verified);
+        assert_eq!(info.phone.as_deref(), Some("42777"));
+        match &history.messages[0].raw {
+            Some((_, bytes)) => {
+                use tdr_tl::Deserializable;
+                let m = enums::Message::from_bytes(&tdr_tl::Bytes::copy_from_slice(bytes)).unwrap();
+                let enums::Message::Message(m) = m else {
+                    panic!("not a message")
+                };
+                assert_eq!(m.entities.map(|e| e.len()), Some(1));
+            }
+            None => panic!("no object"),
+        }
     }
 }

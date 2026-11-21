@@ -89,6 +89,12 @@
   the last country of a shared code like `QHash`). The login's country list and
   settings are layers of `MainView` (`ui/country_box.rs`, `render_intro_settings`),
   asked for through `IntroEvent`.
+- Adaptive layout (`Window::Adaptive`): `MainView::one_column` (body under 640 px
+  without the folder column), `filters_vertical` (window from 452 px, else folder
+  tabs `render_folder_tabs`), `column_slide` (list <-> chat in one column);
+  Settings is a section in one column (`render_settings_section`). The window's
+  width at the last frame is `window_w`. Demo checks resize the window with
+  `MoveWindow` (see the scratchpad's `ad1.ps1`).
 - Links to the repository come only from `REPO_URL` (`main.rs`, from Cargo.toml's
   `repository`) through `ui::layers::repo_url`.
 - Demo click coordinates are logical: screenshots are device pixels (divide by the

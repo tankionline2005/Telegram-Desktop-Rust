@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use crate::bridge::{Command, DialogItem, FolderItem, MessageItem, Update};
 use crate::icons::{Icon, icon, icon_width};
 use crate::one_line::one_line;
-use crate::placement::{COLUMN_MIN_LEFT, Columns};
+use crate::placement::{COLUMN_MIN_LEFT, COLUMN_MIN_MAIN, Columns};
 use crate::present;
 use crate::scale::{self, dpx, lg, px};
 use crate::text_input::{FieldMenu, Submit, TagSpan, TextInput};
@@ -377,6 +377,20 @@ struct Slide {
     forward: bool,
     start: Instant,
 }
+
+/// One column: the chat coming over the chat list, or going back
+/// (`Window::SlideAnimation`, as `MainWidget` shows a chat in one column).
+#[derive(Clone, Copy)]
+struct ColumnSlide {
+    start: Instant,
+    to_chat: bool,
+}
+
+/// `windowMinWidth`: the folder column shows from this plus its own width
+/// (`enoughSpaceForFilters`), else the folders are tabs over the chat list.
+const WINDOW_MIN_WIDTH: f32 = 380.;
+/// `titleUnreadCounterTop`: the unread count over the back arrow in one column.
+const BACK_UNREAD_TOP: f32 = 6.;
 
 /// What a message list is drawn from: the open chat or a set-aside one.
 #[derive(Clone, Copy)]
@@ -746,6 +760,14 @@ pub struct MainView {
     layers: layers::Layers,
     /// The login's country list, while open.
     country_box: Option<country_box::CountryBox>,
+    /// The window's width at the last frame (the layout follows it).
+    window_w: f32,
+    column_slide: Option<ColumnSlide>,
+    /// The folder tabs (`ChatsFiltersTabs`): the bar's move to the chosen tab, the
+    /// tab chosen before the switch happens, the bar's range at the last frame.
+    tabs_anim: Option<(Instant, f32, f32)>,
+    tabs_chosen: Option<i32>,
+    tabs_bar: std::cell::Cell<(f32, f32)>,
     /// The caption button under the mouse.
     title_hovered: Option<&'static str>,
     /// The "scroll down" / "scroll to top" button under the mouse.
@@ -908,6 +930,11 @@ impl MainView {
             draft_dirty_since: None,
             layers: Default::default(),
             country_box: None,
+            window_w: 0.,
+            column_slide: None,
+            tabs_anim: None,
+            tabs_chosen: None,
+            tabs_bar: std::cell::Cell::new((0., 0.)),
             title_hovered: None,
             jump_hovered: None,
             to_down_shown: Fade::new(0., TO_DOWN_DURATION),
@@ -1167,29 +1194,151 @@ impl MainView {
 
     /// The chat list's width in this window.
     /// The folder column's width (0 without folders).
+    /// The folder column fits (`enoughSpaceForFilters`); else the folders are tabs.
+    fn filters_vertical(&self) -> bool {
+        !self.folders.is_empty() && self.window_w >= lg(WINDOW_MIN_WIDTH + chrome::FILTERS_WIDTH)
+    }
+
     fn filters_width(&self) -> f32 {
-        if self.folders.is_empty() {
-            0.
-        } else {
+        if self.filters_vertical() {
             lg(chrome::FILTERS_WIDTH)
+        } else {
+            0.
         }
     }
 
-    fn dialogs_width(&self, window: &Window) -> f32 {
-        self.columns.width(
-            self.selected.is_none(),
-            f32::from(window.viewport_size().width) - self.filters_width(),
-        )
+    /// `computeColumnLayout`: narrower than the two columns' minimums, the window
+    /// shows the chat list or a chat (`Adaptive::WindowLayout::OneColumn`).
+    fn one_column(&self) -> bool {
+        self.window_w - self.filters_width() < lg(COLUMN_MIN_LEFT) + lg(COLUMN_MIN_MAIN)
     }
 
-    /// The chat list shows userpics only (tdesktop's `narrow` row context).
+    fn dialogs_width(&self, window: &Window) -> f32 {
+        let body = f32::from(window.viewport_size().width) - self.filters_width();
+        if self.one_column() {
+            return body;
+        }
+        self.columns.width(self.selected.is_none(), body)
+    }
+
+    /// The chat list shows userpics only (tdesktop's `narrow` row context; never in
+    /// one column).
     fn narrow(&self, window: &Window) -> bool {
-        self.dialogs_width(window) < COLUMN_MIN_LEFT / 2.
+        !self.one_column() && self.dialogs_width(window) < COLUMN_MIN_LEFT / 2.
     }
 
     /// The open chat's width.
     fn chat_width(&self, window: &Window) -> f32 {
-        f32::from(window.viewport_size().width) - self.filters_width() - self.dialogs_width(window)
+        let body = f32::from(window.viewport_size().width) - self.filters_width();
+        if self.one_column() {
+            return body;
+        }
+        body - self.dialogs_width(window)
+    }
+
+    /// In one column, the chat goes back to the list with the slide; the chat closes
+    /// when it is done.
+    fn start_column_back(&mut self) {
+        if self.column_slide.is_some_and(|s| !s.to_chat) {
+            return;
+        }
+        self.column_slide = Some(ColumnSlide {
+            start: Instant::now(),
+            to_chat: false,
+        });
+    }
+
+    /// The back arrow over the chat: the previous chat, else (one column) the list.
+    fn header_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.back_stack.is_empty() {
+            self.go_back(window, cx);
+        } else if self.one_column() {
+            self.start_column_back();
+            cx.notify();
+        }
+    }
+
+    /// `unreadBadgeIgnoreOne`: the unread count of the other chats on the back arrow,
+    /// and whether they are all muted.
+    fn others_unread_badge(&self, chat: &DialogItem, cx: &gpui::App) -> Option<(u32, bool)> {
+        let state = self.accounts.read(cx).active().map(|s| s.state)?;
+        let own = chat.unread.max(0) as u32;
+        let count = state.unread.saturating_sub(own);
+        (count > 0).then_some((count, state.unread_muted))
+    }
+
+    /// The list under, the chat over it sliding in from the right or out
+    /// (`Window::SlideAnimation` without fade: the list shifts `slideShift` and
+    /// darkens, the chat casts its shadow).
+    fn column_slide_view(
+        &self,
+        under: gpui::Div,
+        over: gpui::Div,
+        slide: ColumnSlide,
+        window: &mut Window,
+    ) -> gpui::Div {
+        let p = self.palette();
+        let t = (slide.start.elapsed().as_secs_f32() / SLIDE_DURATION.as_secs_f32()).min(1.);
+        let progress = if slide.to_chat {
+            ease_out_circ(t)
+        } else {
+            1. - ease_out_circ(t)
+        };
+        let width = f32::from(window.viewport_size().width) - self.filters_width();
+        let coord_over = width * (1. - progress);
+        let coord_under = -lg(SLIDE_SHIFT) * progress;
+        window.request_animation_frame();
+        div()
+            .relative()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .overflow_hidden()
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(gpui::px(coord_under))
+                    .w(gpui::px(width))
+                    .h_full()
+                    .flex()
+                    .child(under),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(gpui::px(coord_over))
+                    .h_full()
+                    .bg(c(p.slide_fade_out_bg))
+                    .opacity(progress),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(gpui::px(coord_over))
+                    .w(gpui::px(width))
+                    .h_full()
+                    .flex()
+                    .child(over),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(gpui::px(
+                        coord_over - crate::icons::icon_width(Icon::SlideShadow, window),
+                    ))
+                    .h_full()
+                    .opacity(progress)
+                    .child(crate::icons::stretched(
+                        Icon::SlideShadow,
+                        p.slide_fade_out_shadow_fg,
+                        window,
+                    )),
+            )
     }
 
     fn dragging(&self) -> bool {
@@ -1212,7 +1361,8 @@ impl MainView {
         }
         if let Some(drag) = &self.column_drag {
             let width = drag.start_width + f32::from(e.position.x - drag.start_mouse_x);
-            let body = f32::from(window.viewport_size().width);
+            // The width the column is shown in: without the folders (`MainWidget`).
+            let body = f32::from(window.viewport_size().width) - self.filters_width();
             self.columns.drag_to(width, self.selected.is_none(), body);
             cx.notify();
         }
@@ -1224,7 +1374,7 @@ impl MainView {
         self.row_press = None;
         self.finish_pin_drag(cx);
         if self.column_drag.take().is_some() {
-            let body = f32::from(window.viewport_size().width);
+            let body = f32::from(window.viewport_size().width) - self.filters_width();
             self.columns.drag_finished(self.selected.is_none(), body);
             if let Some(path) = &self.columns_path {
                 self.columns.save(path);
@@ -1971,21 +2121,36 @@ impl MainView {
             self.go_back(window, cx);
             return;
         } else if self.selected.is_some() {
-            self.save_draft(cx);
-            self.set_input_text(String::new(), cx);
-            self.leave_current(cx);
-            self.history_bar.drag = None;
-            self.unread_target = None;
-            let _ = self.commands.send(Command::CloseChat);
-            window.focus(&self.focus);
+            if self.one_column() {
+                self.start_column_back();
+            } else {
+                self.close_chat(window, cx);
+            }
         } else {
             return;
         }
         cx.notify();
     }
 
+    /// No chat open any more ("Select a chat", or the list in one column).
+    fn close_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_draft(cx);
+        self.set_input_text(String::new(), cx);
+        self.leave_current(cx);
+        self.history_bar.drag = None;
+        self.unread_target = None;
+        let _ = self.commands.send(Command::CloseChat);
+        window.focus(&self.focus);
+    }
+
     /// Selects a chat and asks for its history.
     fn start_opening(&mut self, peer: PeerKey) {
+        if self.one_column() && self.selected.is_none() {
+            self.column_slide = Some(ColumnSlide {
+                start: Instant::now(),
+                to_chat: true,
+            });
+        }
         let dialog = self.dialogs.iter().find(|d| d.peer == peer);
         let read_till = dialog.map_or(0, |d| d.read_inbox_max_id);
         self.unread_target = dialog.filter(|d| d.unread > 0).map(|_| read_till);
@@ -2176,7 +2341,62 @@ impl MainView {
                 });
             }
         }
+        // `PeerData::userpicCloudImage`: "Telegram" without a loaded photo shows the
+        // app's logo (`Window::LogoNoMargin`).
+        if !saved && peer == Some(PeerKey::user(tdr_data::SERVICE_NOTIFICATIONS_ID)) {
+            return img(crate::icons::telegram_logo())
+                .flex_none()
+                .size(px(size))
+                .rounded_full()
+                .into_any_element();
+        }
         empty_userpic(p, size, initials, color, saved).into_any_element()
+    }
+
+    /// A name cut to leave room for its badge, the badge right after it
+    /// (`PeerBadge::drawGetWidth`: the icon at `min(nameWidth, width - iconWidth)`).
+    fn name_with_badge(
+        &self,
+        name: &str,
+        badge: crate::bridge::PeerBadge,
+        active: bool,
+        window: &Window,
+    ) -> AnyElement {
+        let p = self.palette();
+        let (bg, fg) = if active {
+            (
+                p.dialogs_verified_icon_bg_active,
+                p.dialogs_verified_icon_fg_active,
+            )
+        } else {
+            (p.dialogs_verified_icon_bg, p.dialogs_verified_icon_fg)
+        };
+        let icon_el = match badge {
+            crate::bridge::PeerBadge::None => return one_line(name.to_string()).into_any_element(),
+            crate::bridge::PeerBadge::Verified => div()
+                .relative()
+                .child(icon(Icon::VerifiedStar, bg, window))
+                .child(div().absolute().left_0().top_0().child(icon(
+                    Icon::VerifiedCheck,
+                    fg,
+                    window,
+                ))),
+            crate::bridge::PeerBadge::Premium => div().child(icon(Icon::PremiumStar, bg, window)),
+        };
+        let name_w = text_width(window, name, FONT_SIZE, FontWeight::SEMIBOLD);
+        div()
+            .w_full()
+            .flex()
+            .items_start()
+            .child(
+                div()
+                    .flex_shrink()
+                    .min_w(gpui::px(0.))
+                    .w(gpui::px(name_w.ceil() + 1.))
+                    .child(one_line(name.to_string())),
+            )
+            .child(icon_el.flex_none())
+            .into_any_element()
     }
 
     /// The custom title bar of tdesktop on Windows: no text, caption buttons on the right.
@@ -2546,11 +2766,9 @@ impl MainView {
                         .min_w(px(0.))
                         .text_color(c(service_fg))
                         .child(one_line(accent.clone())),
-                    None => div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .text_color(c(text_fg))
-                        .child(one_line(last.text.clone())),
+                    None => div().flex_1().min_w(px(0.)).text_color(c(text_fg)).child(
+                        one_line(last.text.clone()).spoilers(last.spoilers.clone(), text_fg),
+                    ),
                 };
                 div()
                     .flex()
@@ -2579,7 +2797,7 @@ impl MainView {
                     .h(text_font.line_height())
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(c(name_fg))
-                    .child(one_line(item.name.clone())),
+                    .child(self.name_with_badge(&item.name, item.badge, active, window)),
             )
             .children(send_state)
             .child(
@@ -3074,10 +3292,18 @@ impl MainView {
                     } else {
                         0.
                     };
+                // Where the bubble stands in the chat (the row's padding, the
+                // userpic column, the right side for outgoing).
+                let bubble_w = inner + 2. * pad_x;
+                let bubble_left = if right_side {
+                    chat_width - lg(MSG_SIDE) - bubble_w
+                } else {
+                    lg(MSG_SIDE) + if with_userpic { lg(MSG_PHOTO_SKIP) } else { 0. }
+                };
                 self.code_hint_pill(
                     text_key,
                     text_top,
-                    inner + 2. * pad_x,
+                    (bubble_left, bubble_w, chat_width),
                     gap,
                     right_side,
                     window,
@@ -3560,10 +3786,24 @@ impl MainView {
         } else {
             p.window_sub_text_fg
         };
-        // The back arrow (`TopBarWidget::_back`) when there is a chat to go back to.
+        // The back arrow (`TopBarWidget::_back`) when there is a chat to go back to,
+        // and always in one column, with the other chats' unread count over it.
+        let back = back || self.one_column();
+        let unread = self
+            .one_column()
+            .then(|| self.others_unread_badge(chat, cx))
+            .flatten()
+            .map(|(count, muted)| {
+                div()
+                    .absolute()
+                    .right_0()
+                    .top(px(BACK_UNREAD_TOP))
+                    .child(self.count_badge(&main_menu::short_count(count), muted, window))
+            });
         let back_button = back.then(|| {
             div()
                 .id("chat-back")
+                .relative()
                 .flex_none()
                 .w(px(BACK_WIDTH))
                 .h_full()
@@ -3572,7 +3812,8 @@ impl MainView {
                 .pl(px(BACK_ICON_LEFT))
                 .cursor_pointer()
                 .child(icon(Icon::Back, p.box_title_close_fg, window))
-                .on_click(cx.listener(|this, _, window, cx| this.go_back(window, cx)))
+                .children(unread)
+                .on_click(cx.listener(|this, _, window, cx| this.header_back(window, cx)))
         });
         div()
             .h(px(TOP_BAR_HEIGHT))
@@ -3596,7 +3837,7 @@ impl MainView {
                         div()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(c(p.window_bold_fg))
-                            .child(one_line(chat.name.clone())),
+                            .child(self.name_with_badge(&chat.name, chat.badge, false, window)),
                     )
                     .when(!status.is_empty(), |d| {
                         d.child(div().text_color(c(status_fg)).child(one_line(status)))
@@ -3624,6 +3865,17 @@ impl Render for MainView {
                 chats = self.dialogs.len(),
                 "first frame with the chat list"
             );
+        }
+        self.window_w = f32::from(window.viewport_size().width);
+        // The one-column slide: back to the list closes the chat when done; out of
+        // one column there is nothing to slide.
+        if let Some(slide) = self.column_slide
+            && (slide.start.elapsed() >= SLIDE_DURATION || !self.one_column())
+        {
+            self.column_slide = None;
+            if !slide.to_chat && self.selected.is_some() {
+                self.close_chat(window, cx);
+            }
         }
         self.tick_scroll_anim(window, cx);
         if let Some((peer, msg_id)) = self.text_ui.pending_open.take() {
@@ -3818,16 +4070,18 @@ impl Render for MainView {
             .children(to_up)
             .children(self.render_connecting(window, cx));
 
+        let one_column = self.one_column();
+        let tabs = self.render_folder_tabs(window, cx);
         let left = div()
-            .w(px(dialogs_width))
+            .w(gpui::px(dialogs_width))
             .flex_none()
             .h_full()
             .flex()
             .flex_col()
             .bg(c(p.dialogs_bg))
-            .border_r_1()
-            .border_color(border)
+            .when(!one_column, |d| d.border_r_1().border_color(border))
             .child(top_bar)
+            .children(tabs)
             .child(dialogs_area);
 
         let day = {
@@ -3983,6 +4237,22 @@ impl Render for MainView {
                 self.with_slide(live, border, window, cx)
             }
         };
+        // One column: the list or the chat, or both while one slides over the other.
+        let main_columns: Vec<AnyElement> = if one_column {
+            match self.column_slide {
+                Some(slide) => {
+                    let over = div().size_full().flex().child(right);
+                    vec![
+                        self.column_slide_view(div().size_full().child(left), over, slide, window)
+                            .into_any_element(),
+                    ]
+                }
+                None if self.selected.is_some() => vec![right.into_any_element()],
+                None => vec![left.into_any_element()],
+            }
+        } else {
+            vec![left.into_any_element(), right.into_any_element()]
+        };
         let layers = self.render_layers(window, cx);
 
         div()
@@ -4016,30 +4286,33 @@ impl Render for MainView {
                         .flex()
                         .track_focus(&self.focus)
                         .children(self.render_folders(window, cx))
-                        .child(left)
-                        .child(right)
+                        .children(main_columns)
                         // The column edge (`_firstColumnResizeArea`): at the chat's left side.
-                        .child(
-                            div()
-                                .id("column-resize")
-                                .absolute()
-                                .top_0()
-                                .left(px(dialogs_width + self.filters_width()))
-                                .w(px(RESIZE_WIDTH))
-                                .h_full()
-                                .cursor(gpui::CursorStyle::ResizeLeftRight)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
-                                        this.column_drag = Some(ColumnDrag {
-                                            start_mouse_x: e.position.x,
-                                            start_width: dialogs_width,
-                                        });
-                                        cx.stop_propagation();
-                                        cx.notify();
-                                    }),
-                                ),
-                        ),
+                        .when(!one_column, |d| {
+                            d.child(
+                                div()
+                                    .id("column-resize")
+                                    .absolute()
+                                    .top_0()
+                                    .left(px(dialogs_width + self.filters_width()))
+                                    .w(px(RESIZE_WIDTH))
+                                    .h_full()
+                                    .cursor(gpui::CursorStyle::ResizeLeftRight)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(
+                                            move |this, e: &gpui::MouseDownEvent, _, cx| {
+                                                this.column_drag = Some(ColumnDrag {
+                                                    start_mouse_x: e.position.x,
+                                                    start_width: dialogs_width,
+                                                });
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            },
+                                        ),
+                                    ),
+                            )
+                        }),
                 )
             })
             .children(layers)

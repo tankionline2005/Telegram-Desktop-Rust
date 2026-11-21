@@ -19,6 +19,9 @@ const ELLIPSIS: &str = "…";
 pub struct OneLine {
     text: SharedString,
     centered: bool,
+    /// Byte ranges hidden under spoiler particles, in this color.
+    spoilers: Vec<std::ops::Range<usize>>,
+    spoiler_color: Option<tdr_theme::Color>,
 }
 
 /// One line of `text` in the current text style, as wide as its parent, cut with "…".
@@ -26,6 +29,8 @@ pub fn one_line(text: impl Into<SharedString>) -> OneLine {
     OneLine {
         text: text.into(),
         centered: false,
+        spoilers: Vec::new(),
+        spoiler_color: None,
     }
 }
 
@@ -33,6 +38,18 @@ impl OneLine {
     /// Centered in its width (`style::al_top` labels).
     pub fn centered(mut self) -> Self {
         self.centered = true;
+        self
+    }
+
+    /// Hides these byte ranges under spoiler particles of `color` (a chat list's
+    /// last message, `Ui::Text::String` with `SpoilerLoginCode`).
+    pub fn spoilers(
+        mut self,
+        ranges: Vec<std::ops::Range<usize>>,
+        color: tdr_theme::Color,
+    ) -> Self {
+        self.spoilers = ranges;
+        self.spoiler_color = Some(color);
         self
     }
 }
@@ -48,6 +65,8 @@ impl IntoElement for OneLine {
 pub struct Prepaint {
     line: ShapedLine,
     line_height: Pixels,
+    /// The spoilers' x ranges in the shaped line.
+    spoilers: Vec<(Pixels, Pixels)>,
 }
 
 impl Element for OneLine {
@@ -95,18 +114,51 @@ impl Element for OneLine {
         } else {
             self.text.clone()
         };
+        // Spoiler text is shaped transparent: the particles take its place.
+        let spoilers: Vec<std::ops::Range<usize>> = self
+            .spoilers
+            .iter()
+            .filter(|r| r.start < r.end && r.end <= text.len())
+            .filter(|r| text.is_char_boundary(r.start) && text.is_char_boundary(r.end))
+            .cloned()
+            .collect();
         let shape = |window: &mut Window, text: SharedString| {
-            let run = style.to_run(text.len());
+            let mut runs = Vec::new();
+            let mut at = 0;
+            for r in spoilers.iter().filter(|r| r.end <= text.len()) {
+                if r.start > at {
+                    runs.push(style.to_run(r.start - at));
+                }
+                let mut hidden = style.to_run(r.end - r.start.max(at));
+                hidden.color.a = 0.;
+                runs.push(hidden);
+                at = r.end;
+            }
+            if text.len() > at {
+                runs.push(style.to_run(text.len() - at));
+            }
+            if runs.is_empty() {
+                runs.push(style.to_run(text.len()));
+            }
             window
                 .text_system()
-                .shape_line(text, font_size, &[run], None)
+                .shape_line(text, font_size, &runs, None)
+        };
+        let ranges = |line: &ShapedLine, len: usize| -> Vec<(Pixels, Pixels)> {
+            spoilers
+                .iter()
+                .filter(|r| r.start < len)
+                .map(|r| (line.x_for_index(r.start), line.x_for_index(r.end.min(len))))
+                .collect()
         };
         let full = shape(window, text.clone());
         let width = bounds.size.width;
         if full.width <= width {
+            let spoilers = ranges(&full, text.len());
             return Prepaint {
                 line: full,
                 line_height,
+                spoilers,
             };
         }
         let ellipsis_width = shape(window, ELLIPSIS.into()).width;
@@ -115,10 +167,14 @@ impl Element for OneLine {
         while cut > 0 && (!text.is_char_boundary(cut) || full.x_for_index(cut) > room) {
             cut -= 1;
         }
-        let cut_text: SharedString = format!("{}{ELLIPSIS}", text[..cut].trim_end()).into();
+        let kept = text[..cut].trim_end().len();
+        let cut_text: SharedString = format!("{}{ELLIPSIS}", &text[..kept]).into();
+        let line = shape(window, cut_text);
+        let spoilers = ranges(&line, kept);
         Prepaint {
-            line: shape(window, cut_text),
+            line,
             line_height,
+            spoilers,
         }
     }
 
@@ -142,6 +198,19 @@ impl Element for OneLine {
             let _ = prepaint
                 .line
                 .paint(origin, prepaint.line_height, window, cx);
+            if let Some(color) = self.spoiler_color
+                && !prepaint.spoilers.is_empty()
+            {
+                let frame = crate::spoiler::current_frame();
+                for (x0, x1) in &prepaint.spoilers {
+                    let rect = Bounds::new(
+                        gpui::point(origin.x + *x0, origin.y),
+                        gpui::size(*x1 - *x0, prepaint.line_height),
+                    );
+                    crate::spoiler::fill(rect, origin, color, frame, window);
+                }
+                window.request_animation_frame();
+            }
         });
     }
 }

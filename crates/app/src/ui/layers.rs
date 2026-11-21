@@ -17,6 +17,7 @@ use tdr_theme::Color;
 
 use super::{MainView, TITLE_HEIGHT, c, main_menu::MENU_WIDTH, text_width};
 use crate::anim::{self, Simple};
+use crate::icons::Icon;
 use crate::scale::{self, lg, px};
 
 /// `boxDuration`.
@@ -92,6 +93,8 @@ pub(super) struct Layers {
     /// The link under the mouse in a label: (label, link index).
     pub link_hover: Option<(&'static str, usize)>,
     pub settings_scroll: gpui::ScrollHandle,
+    /// Where the Settings rows start in the window (for their ripples).
+    pub settings_left: std::cell::Cell<f32>,
 }
 
 impl Layers {
@@ -681,6 +684,14 @@ impl MainView {
         };
         let special_op = self.layers.special_opacity();
         let layer_op = self.layers.layer_opacity();
+        // In one column Settings is a section over the content, not a layer
+        // (`Info::LayerWidget::parentResized` moves it into one): no dim under it.
+        let section = special == Some(Special::Settings) && self.one_column();
+        let bg = if section && layer.is_none() {
+            bg * (1. - special_op)
+        } else {
+            bg
+        };
 
         // Below the title bar, over the whole window body.
         let mut root = div()
@@ -722,7 +733,62 @@ impl MainView {
                     .child(self.render_main_menu(window, cx)),
             );
         }
-        if let Some(special) = special {
+        if section {
+            // `Window::SlideAnimation`: the section comes from the right over the
+            // darkening content, its shadow on its left edge.
+            let left = self.filters_width();
+            let width = w - left;
+            let progress = anim::ease_out_circ(special_op);
+            let coord = width * (1. - progress);
+            let over = layer.map(|_| layer_op).unwrap_or(0.);
+            root = root
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(gpui::px(left))
+                        .w(gpui::px(coord))
+                        .h_full()
+                        .bg(c(p.slide_fade_out_bg))
+                        .opacity(progress),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(gpui::px(left + coord))
+                        .w(gpui::px(width))
+                        .h_full()
+                        .child(self.render_settings_section(left, width, window, cx))
+                        .when(over > 0., |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
+                                    .bg(c(p.layer_bg))
+                                    .opacity(over),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(gpui::px(
+                            left + coord - crate::icons::icon_width(Icon::SlideShadow, window),
+                        ))
+                        .h_full()
+                        .opacity(progress)
+                        .child(crate::icons::stretched(
+                            Icon::SlideShadow,
+                            p.slide_fade_out_shadow_fg,
+                            window,
+                        )),
+                );
+        } else if let Some(special) = special {
             let (left, top, width, max_h) = Self::settings_geometry(w, h);
             let over = layer.map(|_| layer_op * special_op).unwrap_or(0.);
             root = root.child(

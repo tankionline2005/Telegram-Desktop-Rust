@@ -163,6 +163,8 @@ pub struct DialogItem {
     pub kind: ChatKind,
     /// The chat with yourself: "Saved Messages" with the bookmark userpic.
     pub is_saved: bool,
+    /// After the name (`Ui::PeerBadge`).
+    pub badge: PeerBadge,
     pub last: LastLine,
     /// Our last message: `Some(false)` sent (✓), `Some(true)` read (✓✓).
     pub last_read: Option<bool>,
@@ -185,6 +187,28 @@ pub struct DialogItem {
 impl DialogItem {
     pub fn is_group(&self) -> bool {
         self.kind == ChatKind::Group
+    }
+}
+
+/// What `Ui::PeerBadge` draws after a name: the verified check, else the Premium
+/// star of a user without an emoji status (emoji statuses come with custom emoji).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PeerBadge {
+    #[default]
+    None,
+    Verified,
+    Premium,
+}
+
+impl PeerBadge {
+    pub fn of(info: &describe::PeerInfo) -> Self {
+        if info.verified {
+            PeerBadge::Verified
+        } else if info.premium && !info.emoji_status {
+            PeerBadge::Premium
+        } else {
+            PeerBadge::None
+        }
     }
 }
 
@@ -392,6 +416,9 @@ pub struct LastLine {
     pub prefix: Option<String>,
     pub accent: Option<String>,
     pub text: String,
+    /// Byte ranges of `text` under spoilers: its spoiler entities, and the login code
+    /// of a "Telegram" notification (`SpoilerLoginCode`).
+    pub spoilers: Vec<std::ops::Range<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -643,6 +670,9 @@ fn syntax_colors(code: &str, language: &str) -> Vec<(std::ops::Range<usize>, u8)
     runs
 }
 
+/// `kMinLoginCode`: codes of "Telegram" are hidden from five characters on.
+const LOGIN_CODE_MIN: usize = 5;
+
 fn row_text(m: &MessageRow) -> String {
     match m.text.as_str() {
         "[media]" | "[service message]" => String::new(),
@@ -667,8 +697,31 @@ fn dialog_item(store: &Storage, d: &DialogView, ctx: &Context) -> DialogItem {
     };
     let is_channel = kind == ChatKind::Channel;
     let last = d.top.as_ref().map(|m| {
-        let (media, service, _) = message_content(store, m, is_channel);
-        let text = row_text(m).lines().next().unwrap_or("").to_string();
+        let (media, service, info) = message_content(store, m, is_channel);
+        let full = row_text(m);
+        let text = full.lines().next().unwrap_or("").to_string();
+        let mut spoilers: Vec<std::ops::Range<usize>> = info
+            .entities
+            .iter()
+            .filter(|e| e.kind == describe::EntityKind::Spoiler)
+            .filter_map(|e| e.byte_range(&full))
+            .filter(|r| r.start < text.len())
+            .map(|r| r.start..r.end.min(text.len()))
+            .collect();
+        // `HistoryItem::toPreview` with `spoilerLoginCode`: a login code from
+        // "Telegram" is hidden, unless an entity runs into it.
+        if peer == PeerKey::user(tdr_data::SERVICE_NOTIFICATIONS_ID)
+            && !m.out
+            && let Some(code) = describe::login_code(&text, LOGIN_CODE_MIN)
+            && !info
+                .entities
+                .iter()
+                .filter_map(|e| e.byte_range(&full))
+                .any(|r| r.start < code.start && r.end > code.start)
+        {
+            spoilers.push(code);
+            spoilers.sort_by_key(|r| r.start);
+        }
         let prefix = (kind == ChatKind::Group && service.is_none())
             .then(|| {
                 if m.out {
@@ -683,16 +736,19 @@ fn dialog_item(store: &Storage, d: &DialogView, ctx: &Context) -> DialogItem {
                 prefix: None,
                 accent: Some(s),
                 text: String::new(),
+                spoilers: Vec::new(),
             },
             (None, Some(label)) if text.is_empty() => LastLine {
                 prefix,
                 accent: Some(label),
                 text: String::new(),
+                spoilers: Vec::new(),
             },
             _ => LastLine {
                 prefix,
                 accent: None,
                 text,
+                spoilers,
             },
         }
     });
@@ -731,6 +787,11 @@ fn dialog_item(store: &Storage, d: &DialogView, ctx: &Context) -> DialogItem {
         photo: info.photo,
         kind,
         is_saved,
+        badge: if is_saved {
+            PeerBadge::None
+        } else {
+            PeerBadge::of(&info)
+        },
         name,
         last: last.unwrap_or_default(),
         last_read,
@@ -1942,6 +2003,7 @@ pub fn start_demo(
         prefix: prefix.map(Into::into),
         accent: accent.map(Into::into),
         text: text.into(),
+        spoilers: Vec::new(),
     };
     // name, kind, last line, unread, muted, pinned, our last message read
     let rows = [
@@ -2048,6 +2110,12 @@ pub fn start_demo(
                 photo: None,
                 kind: *kind,
                 is_saved: *name == "Saved Messages",
+                // The demo shows both badges.
+                badge: match *name {
+                    "Telegram Tips" => PeerBadge::Verified,
+                    "Alice Johnson" => PeerBadge::Premium,
+                    _ => PeerBadge::None,
+                },
                 last: last.clone(),
                 last_read: *read,
                 time: present::dialogs_date(*date, now),
@@ -2083,6 +2151,7 @@ pub fn start_demo(
             color: color_index(id),
             photo: None,
             kind: ChatKind::User,
+            badge: PeerBadge::None,
             is_saved: false,
             last: line(None, None, "ok"),
             last_read: None,
