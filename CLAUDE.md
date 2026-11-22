@@ -149,3 +149,9 @@
   (`Storage::peer_full`, `describe::full_info`), loaded by `Sync::load_full` on open.
   A chat's loaded history hangs on its `dialogs` row: a chat without one gets it before
   (or, failing that, from) its first history page.
+- The chat's "⋮" menu is `open_chat_menu` (`ui/menus.rs`, `fillHistoryActions`'s
+  rules) from `DialogItem.rights`; `popup_menu` actions can have a submenu and a grey
+  text at the right. The login screens and the account slide over each other through
+  `MainView::intro_slide` (`Root::rebuild` hands over the leaving login view).
+- Demo test scripts: `uilib.ps1`'s `Click` waits 350 ms after the press; to catch an
+  animation mid-way, press without the wait and shoot at once.

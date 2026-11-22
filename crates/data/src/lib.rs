@@ -479,6 +479,60 @@ impl Sync {
         Ok(())
     }
 
+    /// Leaves a group or channel ("Leave group", "Leave channel", "Delete and
+    /// leave" of a basic group; `ApiWrap::deleteConversation`): `channels.leaveChannel`,
+    /// or `messages.deleteChatUser` for ourselves and the history deleted.
+    pub async fn leave(&mut self, peer: PeerKey) -> Result<Applied> {
+        let access_hash = self.store.access_hash(peer)?;
+        let updates = match peer.kind {
+            PeerKind::Channel => {
+                let Some(access_hash) = access_hash else {
+                    return Ok(Applied::default());
+                };
+                self.client
+                    .invoke(&functions::channels::LeaveChannel {
+                        channel: types::InputChannel {
+                            channel_id: peer.id,
+                            access_hash,
+                        }
+                        .into(),
+                    })
+                    .await?
+            }
+            PeerKind::Chat => {
+                let updates = self
+                    .client
+                    .invoke(&functions::messages::DeleteChatUser {
+                        revoke_history: false,
+                        chat_id: peer.id,
+                        user_id: enums::InputUser::InputUserSelf,
+                    })
+                    .await?;
+                let mut applied = self.feed(updates).await?;
+                if let Some(input) = convert::input_peer(peer, None) {
+                    let _ = self
+                        .client
+                        .invoke(&functions::messages::DeleteHistory {
+                            just_clear: false,
+                            revoke: false,
+                            peer: input,
+                            max_id: 0,
+                            min_date: None,
+                            max_date: None,
+                        })
+                        .await?;
+                }
+                self.store.write(|w| w.delete_dialog(peer))?;
+                applied.pinned_changed = true;
+                return Ok(applied);
+            }
+            PeerKind::User => return Ok(Applied::default()),
+        };
+        let mut applied = self.feed(updates).await?;
+        applied.pinned_changed = true;
+        Ok(applied)
+    }
+
     /// The archive was loaded to its end in this session.
     pub fn archive_complete(&self) -> bool {
         self.archive_complete

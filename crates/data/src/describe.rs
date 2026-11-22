@@ -514,6 +514,15 @@ pub struct PeerInfo {
     /// A channel taking direct messages (`broadcast_messages_allowed` with a linked
     /// monoforum): the "Direct Messages" button under its feed.
     pub direct_messages: bool,
+    /// We made the group or channel (`amCreator`), or are its admin.
+    pub creator: bool,
+    pub admin: bool,
+    /// `canDeleteMessages`: the creator, or an admin with `delete_messages`.
+    pub delete_messages: bool,
+    /// It has a username (`isPublic`).
+    pub public: bool,
+    /// Its content can't be forwarded or saved (`noforwards`).
+    pub noforwards: bool,
 }
 
 fn color(c: &Option<enums::PeerColor>) -> Option<u8> {
@@ -558,6 +567,11 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
                 migrated: false,
                 can_post: true,
                 direct_messages: false,
+                creator: false,
+                admin: false,
+                delete_messages: false,
+                public: u.username.is_some() || u.usernames.as_ref().is_some_and(|l| !l.is_empty()),
+                noforwards: false,
             },
             _ => PeerInfo::default(),
         },
@@ -569,6 +583,14 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
                 photo: chat_photo(&c.photo),
                 migrated: c.migrated_to.is_some(),
                 can_post: true,
+                creator: c.creator,
+                admin: c.creator || c.admin_rights.is_some(),
+                delete_messages: c.creator
+                    || c.admin_rights.as_ref().is_some_and(|r| {
+                        let enums::ChatAdminRights::ChatAdminRights(r) = r;
+                        r.delete_messages
+                    }),
+                noforwards: c.noforwards,
                 ..Default::default()
             },
             Some(enums::Chat::Channel(c)) => PeerInfo {
@@ -588,6 +610,15 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
                 direct_messages: c.broadcast
                     && c.broadcast_messages_allowed
                     && c.linked_monoforum_id.is_some(),
+                creator: c.creator,
+                admin: c.creator || c.admin_rights.is_some(),
+                delete_messages: c.creator
+                    || c.admin_rights.as_ref().is_some_and(|r| {
+                        let enums::ChatAdminRights::ChatAdminRights(r) = r;
+                        r.delete_messages
+                    }),
+                public: c.username.is_some() || c.usernames.as_ref().is_some_and(|u| !u.is_empty()),
+                noforwards: c.noforwards,
                 members: c.participants_count,
                 photo: chat_photo(&c.photo),
                 verified: c.verified,

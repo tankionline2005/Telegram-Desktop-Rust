@@ -100,6 +100,8 @@ pub enum Command {
     ArchiveInMenu(bool),
     /// "Hide with Spoiler" of the own number in Settings.
     SetPhoneHidden(bool),
+    /// "Leave group" / "Leave channel" / "Delete and leave" (confirmed).
+    Leave(PeerKey),
 }
 
 /// The list id of the archive in `Update::Dialogs` (folders have positive ids).
@@ -220,6 +222,29 @@ pub struct DialogItem {
     pub lastseen: Option<describe::Lastseen>,
     /// What the bottom of the chat shows instead of the message field, if anything.
     pub compose: Compose,
+    /// Muted until this time (`None`: not muted by its own setting).
+    pub mute_until: Option<i32>,
+    /// What the chat's "⋮" menu needs to know.
+    pub rights: ChatRights,
+}
+
+/// Our place in a chat, for its menu (`Window::Filler`'s checks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChatRights {
+    /// A group or channel we are not in (`!amIn`).
+    pub left: bool,
+    pub creator: bool,
+    pub admin: bool,
+    /// `canDeleteMessages`.
+    pub delete_messages: bool,
+    /// It has a username.
+    pub public: bool,
+    /// `!allowsForwarding`.
+    pub noforwards: bool,
+    /// A channel with a discussion group (its full info): "View discussion".
+    pub discussion: bool,
+    /// A channel we may post to: "Create poll".
+    pub can_post: bool,
 }
 
 /// The bottom of a chat (`HistoryWidget::updateControlsVisibility`): the message
@@ -866,6 +891,11 @@ fn dialog_item(store: &Storage, d: &DialogView, ctx: &Context) -> DialogItem {
         .filter(|m| m.out && !is_saved && !is_channel)
         .map(|m| m.id <= d.dialog.read_outbox_max_id);
     let muted = muted(d, kind, ctx);
+    // The full info of a supergroup or channel, when loaded (gifts, discussion).
+    let full = (peer.kind == PeerKind::Channel)
+        .then(|| store.peer_full(peer).ok().flatten())
+        .flatten()
+        .and_then(|raw| describe::full_info(&Some(raw)));
     let now = Local::now();
     let status = if is_saved {
         String::new()
@@ -924,15 +954,19 @@ fn dialog_item(store: &Storage, d: &DialogView, ctx: &Context) -> DialogItem {
         }),
         compose: if is_saved {
             Compose::Field
-        } else if kind == ChatKind::Channel {
-            let full = store
-                .peer_full(peer)
-                .ok()
-                .flatten()
-                .and_then(|raw| describe::full_info(&Some(raw)));
-            Compose::of(peer, &info, full.as_ref())
         } else {
-            Compose::of(peer, &info, None)
+            Compose::of(peer, &info, full.as_ref())
+        },
+        mute_until: d.dialog.mute_until.filter(|_| muted),
+        rights: ChatRights {
+            left: peer.kind != PeerKind::User && info.left,
+            creator: info.creator,
+            admin: info.admin,
+            delete_messages: info.delete_messages,
+            public: info.public,
+            noforwards: info.noforwards,
+            discussion: full.as_ref().is_some_and(|f| f.linked_chat.is_some()),
+            can_post: info.can_post,
         },
     }
 }
@@ -1808,6 +1842,16 @@ async fn run(
                         }
                     }
                     Command::CloseArchive => folders.archive_open = false,
+                    Command::Leave(peer) => {
+                        match sync.leave(peer).await {
+                            Ok(applied) => send_draft_changes(&applied, &tx),
+                            Err(e) => {
+                                error!("leave: {e}");
+                                let _ = tx.send(Update::Toast(format!("Couldn't leave: {e}")));
+                            }
+                        }
+                        send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
+                    }
                     Command::SetPhoneHidden(hidden) => {
                         if let Err(e) = sync.set_phone_hidden(hidden) {
                             error!("phone setting: {e}");
@@ -2414,6 +2458,8 @@ pub fn start_demo(
                 } else {
                     Compose::Field
                 },
+                mute_until: None,
+                rights: ChatRights::default(),
                 status: match kind {
                     ChatKind::Group => "906 members".into(),
                     ChatKind::Channel => "8 subscribers".into(),
@@ -2451,6 +2497,8 @@ pub fn start_demo(
             status: "last seen a long time ago".into(),
             lastseen: None,
             compose: Compose::Field,
+            mute_until: None,
+            rights: ChatRights::default(),
         });
     }
     let _ = up_tx.send(Update::Dialogs {
@@ -2500,6 +2548,8 @@ pub fn start_demo(
             status: "last seen a long time ago".into(),
             lastseen: None,
             compose: Compose::Field,
+            mute_until: Some(i32::MAX),
+            rights: ChatRights::default(),
         }
     })
     .collect();
@@ -2763,6 +2813,18 @@ pub fn start_demo(
                     continue;
                 }
                 Command::CloseArchive => continue,
+                Command::Leave(peer) => {
+                    dialogs.retain(|d| d.peer != peer);
+                    let _ = up_tx.send(Update::Dialogs {
+                        folder: demo_folder,
+                        list: dialogs
+                            .iter()
+                            .filter(|d| folder_of(demo_folder, d))
+                            .cloned()
+                            .collect(),
+                    });
+                    continue;
+                }
                 Command::SetPhoneHidden(hidden) => {
                     me.phone_hidden = hidden;
                     let _ = up_tx.send(Update::Me(me.clone()));

@@ -30,6 +30,11 @@ const BOX_PADDING: [f32; 4] = [24., 14., 24., 8.];
 const BOX_LABEL_LINE: f32 = 22.;
 /// `defaultBox`: margin top, the buttons' padding (left, top, right, bottom) and height.
 const BOX_MARGIN_TOP: f32 = 10.;
+/// `DeleteChatBox`: `mainMenuUserpic`, `defaultBoxCheckbox.textPosition.x` between
+/// it and the name, `defaultVerticalListSkip`.
+const LEAVE_USERPIC: f32 = 48.;
+const LEAVE_TITLE_SKIP: f32 = 12.;
+const LIST_SKIP: f32 = 6.;
 const BUTTON_PADDING: [f32; 4] = [6., 10., 10., 10.];
 const BUTTON_HEIGHT: f32 = 34.;
 /// `defaultBoxButton`: `width: -30px` (text plus 30), `textTop`, 14 px semibold.
@@ -66,6 +71,8 @@ pub(super) enum LayerBox {
     LogOut(u32),
     /// The login's country list.
     Countries,
+    /// "Are you sure you want to leave this group?" (`DeleteChatBox`).
+    Leave(tdr_data::tdr_storage::PeerKey),
 }
 
 /// `LayerStackWidget::BackgroundWidget::Action`.
@@ -672,6 +679,93 @@ impl MainView {
             .into_any_element()
     }
 
+    /// `DeleteChatBox` for a group or channel: its userpic and name
+    /// (`IconWithTitle`), the question, "Leave" in red and "Cancel". Leaving closes
+    /// the chat (`closeChatFromWindows`).
+    fn render_leave(
+        &self,
+        peer: tdr_data::tdr_storage::PeerKey,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = self.palette();
+        let chat = self.chat_item(peer).cloned();
+        let (name, question) = match &chat {
+            Some(c) => (
+                c.name.clone(),
+                if c.kind == tdr_data::describe::PeerKind::Channel {
+                    "Are you sure you want to leave\nthis channel?"
+                } else {
+                    "Are you sure you want to leave this group?"
+                },
+            ),
+            None => (String::new(), "Are you sure you want to leave this group?"),
+        };
+        let font = scale::font(14.);
+        let title_font = scale::font(TITLE_FONT);
+        let [pl, pt, pr, pb] = BOX_PADDING;
+        let userpic = chat.as_ref().map(|c| {
+            self.userpic(
+                LEAVE_USERPIC,
+                Some(c.peer),
+                c.photo,
+                &c.initials,
+                c.color,
+                false,
+            )
+        });
+        // `AddSkip` twice around the userpic line (`defaultVerticalListSkip`).
+        let head = div()
+            .flex()
+            .items_center()
+            .pl(px(pl))
+            .pr(px(pr))
+            .pt(px(BOX_MARGIN_TOP + 2. * LIST_SKIP))
+            .pb(px(2. * LIST_SKIP))
+            .children(userpic.map(|u| div().flex_none().child(u)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .pl(px(LEAVE_TITLE_SKIP))
+                    .text_size(title_font.size)
+                    .line_height(title_font.line_height())
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(c(p.box_title_fg))
+                    .child(crate::one_line::one_line(name)),
+            );
+        let body = div().flex().flex_col().child(head).child(
+            div()
+                .pl(px(pl))
+                .pr(px(pr))
+                .pb(px(LIST_SKIP + pb))
+                .text_size(font.size)
+                .line_height(px(BOX_LABEL_LINE))
+                .text_color(c(p.box_text_fg))
+                .children(question.split('\n').map(|l| div().child(l.to_string()))),
+        );
+        let _ = pt;
+        let confirm = self.box_button(
+            "leave-confirm",
+            "Leave",
+            true,
+            window,
+            cx,
+            move |this, window, cx| {
+                this.layers.hide_all();
+                if this.selected == Some(peer) {
+                    this.close_chat(window, cx);
+                }
+                let _ = this.commands.send(crate::bridge::Command::Leave(peer));
+            },
+        );
+        let cancel = self.box_button("leave-cancel", "Cancel", false, window, cx, |this, _, _| {
+            this.layers.hide_layer();
+        });
+        self.box_frame(BOX_WIDTH, body, vec![confirm, cancel])
+            .into_any_element()
+    }
+
     /// The layers over the window's body (below the title bar).
     pub(super) fn render_layers(
         &mut self,
@@ -844,6 +938,7 @@ impl MainView {
             let content = match b {
                 LayerBox::About => self.render_about(window, cx),
                 LayerBox::LogOut(id) => self.render_logout(id, window, cx),
+                LayerBox::Leave(peer) => self.render_leave(peer, window, cx),
                 LayerBox::Countries => self.render_country_box(window, cx),
             };
             root = root.child(

@@ -2140,3 +2140,173 @@ sha256 = "226f5336c64fdbec1d170436e2285e48f86a5d0f6134d023b5753aa635eee58f"
 path = "assets/tdesktop-icons/player__player_check@3x.png"
 upstream = "Telegram/Resources/icons/player/player_check@3x.png"
 sha256 = "9f0d2f5ef36ca3fd578d240122c38d3e74c7aefbcab667cbf8ef1b6bda629013"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__report.png"
+upstream = "Telegram/Resources/icons/menu/report.png"
+sha256 = "5bd1d3f9ba68e49a6937c0169cff4f078ef2d832bb205a94d5504a3f4874a141"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__report@2x.png"
+upstream = "Telegram/Resources/icons/menu/report@2x.png"
+sha256 = "c19e18063c026baf5bbb9d1dc13bb883acc2f28b92904674cbebd853961b456c"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__report@3x.png"
+upstream = "Telegram/Resources/icons/menu/report@3x.png"
+sha256 = "bc2e063055113f2887902ff046dcc16f481f46896f3bb4bdcb0c96f9a9530906"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__info.png"
+upstream = "Telegram/Resources/icons/menu/info.png"
+sha256 = "80a8cd3d5190159faa1f7f17cf129f67d0085ae9f98eb66ea05f9628b33335b5"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__info@2x.png"
+upstream = "Telegram/Resources/icons/menu/info@2x.png"
+sha256 = "1f70859b5d85dca5c1eca43338b3b8c99495d0a7b09b466282c06b60095c3b88"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__info@3x.png"
+upstream = "Telegram/Resources/icons/menu/info@3x.png"
+sha256 = "71e5e93c0bc6b69aff9c30b2492a03373b6ee638f06838cc912d75006895a832"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__colors.png"
+upstream = "Telegram/Resources/icons/menu/colors.png"
+sha256 = "87de9ba1350c1354bacf17d5302508996b041dba28320521f097e0d85f3b2fdd"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__colors@2x.png"
+upstream = "Telegram/Resources/icons/menu/colors@2x.png"
+sha256 = "1900c1f99732d48bf71e14347b769caee5e846d264140b538f62616d494414d5"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__colors@3x.png"
+upstream = "Telegram/Resources/icons/menu/colors@3x.png"
+sha256 = "19c58fd325158c20a539b9e2caeb0ca49ca905f3b4d378f0cc766adb622de50f"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__export.png"
+upstream = "Telegram/Resources/icons/menu/export.png"
+sha256 = "a5a864f792f883e248d04f7fdd30a3b0afb87209b34d8f205200fae97a772a56"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__export@2x.png"
+upstream = "Telegram/Resources/icons/menu/export@2x.png"
+sha256 = "2651afd54dc5cd48de9ce15203ff6997ec62f786c60e083f78340256d480e391"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__export@3x.png"
+upstream = "Telegram/Resources/icons/menu/export@3x.png"
+sha256 = "0e940033ce4072100e6a86087223786300fa8aa452e1261013a527459beb71e2"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__clear.png"
+upstream = "Telegram/Resources/icons/menu/clear.png"
+sha256 = "3d44c1b2ba26d944e3086899152b022bd53fc8c3453556d01b490ca9d734f654"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__clear@2x.png"
+upstream = "Telegram/Resources/icons/menu/clear@2x.png"
+sha256 = "a5d3d161d58551247e69663ca4d98cb603667fcc45e13156963001b1827d8b48"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__clear@3x.png"
+upstream = "Telegram/Resources/icons/menu/clear@3x.png"
+sha256 = "d7fe57f4c1e4221741b114b82082d0def572e1c3875add227e1c0ac3be3694c9"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__boosts.png"
+upstream = "Telegram/Resources/icons/menu/boosts.png"
+sha256 = "c6f5bca2c031033d73f21ba396c98b01d40a5e5d340262fc2ef0c0978553c1fd"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__boosts@2x.png"
+upstream = "Telegram/Resources/icons/menu/boosts@2x.png"
+sha256 = "ecd215cfe75a5b431bd31890b7cb186aca094b0b1e7aec28aaa52b85bd4136e7"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__boosts@3x.png"
+upstream = "Telegram/Resources/icons/menu/boosts@3x.png"
+sha256 = "a9f431cfbf68c5c49362dd62be118150b634f35b13b201d55bdbeadcefbaad9c"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__create_poll.png"
+upstream = "Telegram/Resources/icons/menu/create_poll.png"
+sha256 = "46a35d8ffccaf75604af65acc087091ed92feeb6231d981acabecb03bfe0a79b"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__create_poll@2x.png"
+upstream = "Telegram/Resources/icons/menu/create_poll@2x.png"
+sha256 = "b816abe89ce103e6a4154cf1b9a658178ba2c34b819444dce70027a0f943ff5a"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__create_poll@3x.png"
+upstream = "Telegram/Resources/icons/menu/create_poll@3x.png"
+sha256 = "9202646b47505851dd7495ce48ed3b572373fff6dc1229c435497f55751f2b91"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__mute.png"
+upstream = "Telegram/Resources/icons/menu/mute.png"
+sha256 = "cf56e8670c99cd828a32e69de220bcdb66126676c62097675495f333dbde6ade"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__mute@2x.png"
+upstream = "Telegram/Resources/icons/menu/mute@2x.png"
+sha256 = "7bc01c664bfd6c3c665237933facaa0201d72d233136aaddfa6d68eda5091026"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__mute@3x.png"
+upstream = "Telegram/Resources/icons/menu/mute@3x.png"
+sha256 = "6aac926f3bbe99706357fc9f8ef80f45edd802ab9e1330daef668cf14ae53f1a"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__mute_for.png"
+upstream = "Telegram/Resources/icons/menu/mute_for.png"
+sha256 = "75aed07e36847bca60a78974d563e1dbcb431bb0c2b7162da5c1249276a2aab2"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__mute_for@2x.png"
+upstream = "Telegram/Resources/icons/menu/mute_for@2x.png"
+sha256 = "8d7c83ddfe4881a95c0270859b4d8390f13f633b6cba9667c591c4627845c32d"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__mute_for@3x.png"
+upstream = "Telegram/Resources/icons/menu/mute_for@3x.png"
+sha256 = "d67ac392db19a1c8752439aa7eecb90f95a97acb984a40325e49e0feabf11095"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__sound_disable.png"
+upstream = "Telegram/Resources/icons/menu/sound_disable.png"
+sha256 = "786674b0d9cb07b16f4c4e3c304458fb44a96fa99c842c3dafcffb295045cbd5"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__sound_disable@2x.png"
+upstream = "Telegram/Resources/icons/menu/sound_disable@2x.png"
+sha256 = "15aae613d7c9247f8cc452e6e4e026d7b51a29cd307691110f06f13bbf7c8f84"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__sound_disable@3x.png"
+upstream = "Telegram/Resources/icons/menu/sound_disable@3x.png"
+sha256 = "af315c67c06d83d3b9e77b993a67e60a8acd927c105e5fb562f3f7086aa2a364"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__sound_select.png"
+upstream = "Telegram/Resources/icons/menu/sound_select.png"
+sha256 = "628fcb71cf492df372ac8eafa6da022da6ff806821a8ed7f8fc530e52c9ff7c0"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__sound_select@2x.png"
+upstream = "Telegram/Resources/icons/menu/sound_select@2x.png"
+sha256 = "c89b9273dc3d7bbd0381df1a7b35da8d98a54f3673e12204b158f349ec961bda"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__sound_select@3x.png"
+upstream = "Telegram/Resources/icons/menu/sound_select@3x.png"
+sha256 = "7ca7289a0548f00c41215b0dedbd467e3fbcc3ee29a59ba83f49d5b14f3bd07b"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__share_off.svg"
+upstream = "Telegram/Resources/icons/menu/share_off.svg"
+sha256 = "30c500efeb311f654f4325e2bec45e2c07efc9abb28a43ecb2746178c5b00ee1"

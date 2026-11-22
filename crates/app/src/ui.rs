@@ -389,6 +389,14 @@ struct Slide {
     start: Instant,
 }
 
+/// `MainWindow::setupIntro` / `setupMain` with an animation: the login screens
+/// arrive over the account ("Add Account"), or the account over the leaving ones
+/// (back, logged in).
+pub(crate) struct IntroSlide {
+    pub start: Instant,
+    pub leaving: Option<Entity<crate::intro::IntroView>>,
+}
+
 /// One column: the chat coming over the chat list, or going back
 /// (`Window::SlideAnimation`, as `MainWidget` shows a chat in one column).
 #[derive(Clone, Copy)]
@@ -807,6 +815,9 @@ pub struct MainView {
     /// The login screens (no account yet, or "Add Account"), with the id the new
     /// account gets.
     intro: Option<(Entity<crate::intro::IntroView>, u32)>,
+    /// The login screens sliding in over the account or out under it, with the
+    /// leaving login view while it goes.
+    pub(crate) intro_slide: Option<IntroSlide>,
     /// The folder column (empty: the account has no folders) and the open folder.
     folders: Vec<FolderItem>,
     active_folder: i32,
@@ -972,6 +983,7 @@ impl MainView {
             search,
             accounts,
             intro: None,
+            intro_slide: None,
             folders: Vec::new(),
             active_folder: 0,
             connection: chrome::Connection::new(),
@@ -2269,7 +2281,11 @@ impl MainView {
             |this: &mut Self, _, event: &crate::intro::IntroEvent, cx| {
                 match event {
                     crate::intro::IntroEvent::Back => {
-                        if let Some((_, id)) = this.intro.take() {
+                        if let Some((view, id)) = this.intro.take() {
+                            this.intro_slide = Some(IntroSlide {
+                                start: Instant::now(),
+                                leaving: Some(view),
+                            });
                             // A login left halfway leaves nothing behind.
                             let base = this.accounts.read(cx).base().to_path_buf();
                             if id != 1 && !crate::accounts::logged_in(&base, id) {
@@ -2302,6 +2318,15 @@ impl MainView {
     fn start_add_account(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.layers.reset();
         self.show_intro(true, cx);
+        self.intro_slide = Some(IntroSlide {
+            start: Instant::now(),
+            leaving: None,
+        });
+    }
+
+    /// The login view shown now (taken over by the next view of the window).
+    pub(crate) fn intro_view(&self) -> Option<Entity<crate::intro::IntroView>> {
+        self.intro.as_ref().map(|(i, _)| i.clone())
     }
 
     /// "Add Account" (the main menu, Settings' menu): the login, or the toast about
@@ -4497,6 +4522,103 @@ impl Render for MainView {
             vec![left.into_any_element(), right.into_any_element()]
         };
         let layers = self.render_layers(window, cx);
+        // The login screens and the account slide over each other
+        // (`Window::SlideAnimation` from the right, `MainWindow::setupIntro` /
+        // `setupMain`): the arriving one over, the other shifting under it.
+        let slide = self
+            .intro_slide
+            .take()
+            .filter(|s| s.start.elapsed() < SLIDE_DURATION);
+        let intro_view = self.intro.as_ref().map(|(i, _)| i.clone());
+        let leaving_intro = slide.as_ref().and_then(|s| s.leaving.clone());
+        let show_main = intro_view.is_none() || slide.is_some();
+        // Focus tracking stays below the title bar: a focusable element swallows mouse
+        // downs (prevent_default), and GPUI then skips the native caption-button
+        // handling (minimize / maximize / close / drag would do nothing).
+        let main_body = if show_main {
+            Some(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .track_focus(&self.focus)
+                    .children(self.render_folders(window, cx))
+                    .children(main_columns)
+                    // The column edge (`_firstColumnResizeArea`): at the chat's left side.
+                    .when(!one_column, |d| {
+                        d.child(
+                            div()
+                                .id("column-resize")
+                                .absolute()
+                                .top_0()
+                                .left(px(dialogs_width + self.filters_width()))
+                                .w(px(RESIZE_WIDTH))
+                                .h_full()
+                                .cursor(gpui::CursorStyle::ResizeLeftRight)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
+                                        this.column_drag = Some(ColumnDrag {
+                                            start_mouse_x: e.position.x,
+                                            start_width: dialogs_width,
+                                        });
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                    }),
+            )
+        } else {
+            None
+        };
+        let intro_body = |intro: Entity<crate::intro::IntroView>| {
+            div()
+                .relative()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .child(div().size_full().child(intro))
+        };
+        let width = f32::from(window.viewport_size().width);
+        let body: AnyElement = match (intro_view, main_body, slide.as_ref()) {
+            // "Add Account": the login over the account.
+            (Some(intro), Some(main), Some(s)) => {
+                let start = s.start;
+                self.column_slide_view(
+                    main,
+                    intro_body(intro),
+                    ColumnSlide {
+                        start,
+                        to_chat: true,
+                    },
+                    width,
+                    window,
+                )
+                .into_any_element()
+            }
+            (Some(intro), _, _) => intro_body(intro).into_any_element(),
+            // Back, or logged in: the account over the login screens.
+            (None, Some(main), Some(s)) => match &leaving_intro {
+                Some(old) => self
+                    .column_slide_view(
+                        intro_body(old.clone()),
+                        main,
+                        ColumnSlide {
+                            start: s.start,
+                            to_chat: true,
+                        },
+                        width,
+                        window,
+                    )
+                    .into_any_element(),
+                None => main.into_any_element(),
+            },
+            (None, Some(main), None) => main.into_any_element(),
+            (None, None, _) => div().into_any_element(),
+        };
+        self.intro_slide = slide;
 
         div()
             .relative()
@@ -4514,50 +4636,7 @@ impl Render for MainView {
                 this.copy_selected_text(cx);
             }))
             .child(self.render_title_bar(window, cx))
-            .when_some(self.intro.as_ref().map(|(i, _)| i.clone()), |d, intro| {
-                d.child(div().relative().flex_1().min_h(px(0.)).child(intro))
-            })
-            // Focus tracking stays below the title bar: a focusable element swallows mouse
-            // downs (prevent_default), and GPUI then skips the native caption-button
-            // handling (minimize / maximize / close / drag would do nothing).
-            .when(self.intro.is_none(), |d| {
-                d.child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_h(px(0.))
-                        .flex()
-                        .track_focus(&self.focus)
-                        .children(self.render_folders(window, cx))
-                        .children(main_columns)
-                        // The column edge (`_firstColumnResizeArea`): at the chat's left side.
-                        .when(!one_column, |d| {
-                            d.child(
-                                div()
-                                    .id("column-resize")
-                                    .absolute()
-                                    .top_0()
-                                    .left(px(dialogs_width + self.filters_width()))
-                                    .w(px(RESIZE_WIDTH))
-                                    .h_full()
-                                    .cursor(gpui::CursorStyle::ResizeLeftRight)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(
-                                            move |this, e: &gpui::MouseDownEvent, _, cx| {
-                                                this.column_drag = Some(ColumnDrag {
-                                                    start_mouse_x: e.position.x,
-                                                    start_width: dialogs_width,
-                                                });
-                                                cx.stop_propagation();
-                                                cx.notify();
-                                            },
-                                        ),
-                                    ),
-                            )
-                        }),
-                )
-            })
+            .child(body)
             .children(layers)
             .children(self.render_drag_capture(cx))
             .children(self.render_menu(window, cx))

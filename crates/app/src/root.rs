@@ -82,7 +82,18 @@ impl Root {
     /// Another account is shown: a fresh view, and its data thread sends all again.
     fn rebuild(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let dark = self.view.read(cx).is_dark();
+        // Logged in from the login screens: the account slides in over them
+        // (`MainWindow::setupMain` animated), as after "back".
+        let leaving = self.view.read(cx).intro_view();
         self.view = Self::make_view(&self.accounts, dark, &self.columns_path, window, cx);
+        if let Some(old) = leaving {
+            self.view.update(cx, |v, _| {
+                v.intro_slide = Some(crate::ui::IntroSlide {
+                    start: std::time::Instant::now(),
+                    leaving: Some(old),
+                });
+            });
+        }
         if let Some(slot) = self.accounts.read(cx).active() {
             let _ = slot.commands.send(Command::Refresh);
         }

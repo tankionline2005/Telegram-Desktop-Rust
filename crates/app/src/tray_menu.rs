@@ -149,6 +149,8 @@ pub fn open(
         action,
         attention: false,
         check: None,
+        shortcut: None,
+        submenu: None,
     };
     let entries = vec![
         // The window on screen: it goes to the tray; in the tray: it comes back.

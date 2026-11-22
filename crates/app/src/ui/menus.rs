@@ -75,8 +75,8 @@ impl CodeHint {
 
 impl MainView {
     /// A selectable label's menu in Settings' cover. The name (`FlatLabel` with
-    /// `setContextCopyText`, a menu without icons): "Copy Selected Text" with a
-    /// selection, else "Copy Name". The phone (`popupMenuWithIcons` and its hook):
+    /// `setContextCopyText`): "Copy Selected Text" with a selection, else "Copy
+    /// Name" (with the copy icon, unlike tdesktop: the user's choice). The phone (`popupMenuWithIcons` and its hook):
     /// the selection or "Copy Phone Number", then "Hide with Spoiler", checked
     /// while the number is hidden (`AddPhoneSpoilerMenu`).
     pub(super) fn open_label_menu(
@@ -89,16 +89,24 @@ impl MainView {
         use super::settings::CoverLabel;
         let entries = match label {
             CoverLabel::Name => vec![if selected {
-                Entry::item("Copy Selected Text", None, true, MenuAction::CopySelected)
+                Entry::action(
+                    "Copy Selected Text",
+                    Icon::MenuCopy,
+                    MenuAction::CopySelected,
+                )
             } else {
-                Entry::item("Copy Name", None, true, MenuAction::Copy(text, None))
+                Entry::action("Copy Name", Icon::MenuCopy, MenuAction::Copy(text, None))
             }],
             CoverLabel::Phone { hidden } => {
                 // `CopyPhoneToClipboard`: the digits without spaces and dashes.
                 let digits: String = text.chars().filter(|c| *c != ' ' && *c != '-').collect();
                 vec![
                     if selected {
-                        Entry::text_action("Copy Selected Text", MenuAction::CopySelected)
+                        Entry::action(
+                            "Copy Selected Text",
+                            Icon::MenuCopy,
+                            MenuAction::CopySelected,
+                        )
                     } else {
                         Entry::action(
                             "Copy Phone Number",
@@ -116,6 +124,156 @@ impl MainView {
             }
         };
         self.open_menu(entries, at, MenuTag::Other);
+    }
+
+    /// The chat's "⋮" menu (`Window::FillDialogsEntryMenu` with `Section::History`,
+    /// `Filler::fillHistoryActions`), its top right at `at`. Muting, unmuting and
+    /// leaving work; the other items come later.
+    pub(super) fn open_chat_menu(&mut self, at: Point<Pixels>, peer: PeerKey) {
+        use tdr_data::describe::PeerKind as K;
+        let Some(chat) = self.chat_item(peer).cloned() else {
+            return;
+        };
+        let r = chat.rights;
+        let user = matches!(chat.kind, K::User | K::Bot);
+        let channel = chat.kind == K::Channel;
+        let supergroup = peer.kind == tdr_data::tdr_storage::PeerKind::Channel && !channel;
+        let basic_group = peer.kind == tdr_data::tdr_storage::PeerKind::Chat;
+        let service = peer == PeerKey::user(tdr_data::SERVICE_NOTIFICATIONS_ID);
+        let stub = |label: &str, icon: Icon| Entry::action(label, icon, MenuAction::ChatStub);
+        let mut entries = Vec::new();
+        // `addToggleMuteSubmenu`: not in Saved Messages.
+        if !chat.is_saved {
+            if chat.muted {
+                let left = chat
+                    .mute_until
+                    .map_or(0, |until| i64::from(until) - chrono::Utc::now().timestamp());
+                entries.push(
+                    Entry::action(
+                        "Unmute",
+                        Icon::MenuUnmute,
+                        MenuAction::ChatMute(peer, false),
+                    )
+                    .with_shortcut(&crate::present::mute_for_tiny(left)),
+                );
+            } else {
+                // `MuteMenu::FillMuteMenu`: the recent periods are not kept yet.
+                entries.push(Entry::action_submenu(
+                    "Mute notifications",
+                    Icon::MenuMute,
+                    vec![
+                        stub("Select tone", Icon::MenuSoundSelect),
+                        stub("Disable sound", Icon::MenuSoundOff),
+                        stub("Mute for...", Icon::MenuMuteFor),
+                        Entry::attention(
+                            "Mute forever",
+                            Icon::MenuMute,
+                            MenuAction::ChatMute(peer, true),
+                        ),
+                    ],
+                ));
+            }
+            entries.push(Entry::WideSeparator);
+        }
+        // `addInfo`.
+        if !chat.is_saved {
+            entries.push(if user {
+                stub("View profile", Icon::MenuProfile)
+            } else if channel {
+                stub("View channel info", Icon::MenuInfo)
+            } else {
+                stub("View group info", Icon::MenuInfo)
+            });
+        }
+        // `addManageChat`: admins.
+        if !user && r.admin && !r.left {
+            entries.push(stub(
+                if channel {
+                    "Manage Channel"
+                } else {
+                    "Manage group"
+                },
+                Icon::MenuManage,
+            ));
+        }
+        // `addBoostChat`.
+        if peer.kind == tdr_data::tdr_storage::PeerKind::Channel {
+            entries.push(stub(
+                if channel {
+                    "Boost Channel"
+                } else {
+                    "Boost Group"
+                },
+                Icon::MenuBoosts,
+            ));
+        }
+        // `addCreatePoll`: groups we are in, channels we post to, bots.
+        let polls = match chat.kind {
+            K::Bot => true,
+            K::Group => !r.left,
+            K::Channel => r.can_post && !r.left,
+            K::User => false,
+        };
+        if polls {
+            entries.push(stub("Create poll", Icon::MenuCreatePoll));
+        }
+        // `addThemeEdit`, `addToggleNoForwards`: private chats.
+        if user && !service {
+            entries.push(stub("Set Wallpaper", Icon::MenuColors));
+            if chat.kind == K::User && !chat.is_saved {
+                entries.push(stub("Disable Sharing", Icon::MenuShareOff));
+            }
+        }
+        // `addViewDiscussion`.
+        if channel && r.discussion {
+            entries.push(stub("View discussion", Icon::MenuDiscussion));
+        }
+        // `addExportChat` (`canExportChatHistory`): forwarding allowed and some
+        // message loaded.
+        let has_messages =
+            self.selected == Some(peer) && self.messages.iter().any(|m| m.service.is_none());
+        if !r.noforwards && has_messages {
+            entries.push(stub("Export chat history", Icon::MenuExport));
+        }
+        // `addReport`: groups and channels we did not make.
+        if !user && !r.creator {
+            entries.push(stub("Report", Icon::MenuReport));
+        }
+        // `addClearHistory`.
+        let clear = if peer.kind == tdr_data::tdr_storage::PeerKind::Channel {
+            !r.left && (r.delete_messages || (supergroup && !r.public))
+        } else {
+            true
+        };
+        if clear {
+            entries.push(stub("Clear history", Icon::MenuClear));
+        }
+        // `addDeleteChat`: private chats and basic groups.
+        if user || basic_group {
+            entries.push(if basic_group {
+                Entry::attention(
+                    "Delete and leave",
+                    Icon::MenuDelete,
+                    MenuAction::ChatLeave(peer),
+                )
+            } else {
+                // Deleting a conversation comes later.
+                Entry::attention("Delete chat", Icon::MenuDelete, MenuAction::ChatStub)
+            });
+        }
+        // `addLeaveChat`: supergroups and channels we are in.
+        if peer.kind == tdr_data::tdr_storage::PeerKind::Channel && !r.left {
+            entries.push(Entry::attention(
+                if channel {
+                    "Leave channel"
+                } else {
+                    "Leave group"
+                },
+                Icon::MenuLeave,
+                MenuAction::ChatLeave(peer),
+            ));
+        }
+        self.open_popup(PopupMenu::new(entries, true, at).top_right_origin());
     }
 
     /// Settings' "⋮" menu (`Settings::Main::fillTopBarMenu`), its top right at `at`.
@@ -575,6 +733,13 @@ impl MainView {
             MenuAction::OpenUrl(url) => cx.open_url(&url),
             MenuAction::AddAccount => self.add_account_clicked(window, cx),
             MenuAction::ArchiveInMenu(in_menu) => self.set_archive_in_menu(in_menu),
+            MenuAction::ChatMute(peer, mute) => {
+                self.set_chat_muted(peer, mute);
+                let _ = self.commands.send(Command::SetMuted { peer, mute });
+            }
+            MenuAction::ChatLeave(peer) => {
+                self.layers.show_layer(super::layers::LayerBox::Leave(peer));
+            }
             MenuAction::TogglePhoneSpoiler => {
                 let hidden = self
                     .accounts
@@ -606,6 +771,7 @@ impl MainView {
             | MenuAction::TrayQuit
             | MenuAction::SetReminder
             | MenuAction::ArchiveStub
+            | MenuAction::ChatStub
             // "Edit profile" comes with the profile section.
             | MenuAction::EditProfile => {}
         }

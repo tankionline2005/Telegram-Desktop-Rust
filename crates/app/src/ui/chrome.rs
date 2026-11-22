@@ -413,15 +413,20 @@ impl MainView {
 
     /// The mute state shown at once, before the server's answer.
     pub(super) fn set_chat_muted(&mut self, peer: tdr_data::tdr_storage::PeerKey, muted: bool) {
-        if let Some(d) = self.dialogs.iter_mut().find(|d| d.peer == peer) {
+        let until = muted.then_some(i32::MAX);
+        let set = |d: &mut DialogItem| {
             d.muted = muted;
+            d.mute_until = until;
+        };
+        if let Some(d) = self.dialogs.iter_mut().find(|d| d.peer == peer) {
+            set(d);
         }
         if let Some(d) = self.extra_chats.get_mut(&peer) {
-            d.muted = muted;
+            set(d);
         }
         for list in self.folder_lists.values_mut() {
             if let Some(d) = list.iter_mut().find(|d| d.peer == peer) {
-                d.muted = muted;
+                set(d);
             }
         }
     }
@@ -1622,6 +1627,7 @@ impl MainView {
             ));
         }
         row = row.child(div().w(px(TOP_BAR_SKIP)));
+        let peer = chat.peer;
         row.child(self.icon_button(
             "top-menu",
             Icon::MenuDots,
@@ -1631,7 +1637,14 @@ impl MainView {
             colors,
             window,
             cx,
-            |_, _, _| {},
+            move |this, window, _| {
+                // Its top right under the button (`TopBarWidget::showPeerMenu`).
+                let at = gpui::point(
+                    window.viewport_size().width,
+                    gpui::px(lg(super::TITLE_HEIGHT) + lg(super::TOP_BAR_HEIGHT) - lg(8.)),
+                );
+                this.open_chat_menu(at, peer);
+            },
         ))
     }
 

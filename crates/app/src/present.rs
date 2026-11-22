@@ -454,6 +454,31 @@ pub fn count_short(count: i32) -> String {
     }
 }
 
+/// `Ui::FormatMuteForTiny`: how long a chat stays muted, "45m", "8h", "3d", "2w",
+/// "5m" (months), "1y"; nothing for a minute or less, or for longer than a year
+/// (muted forever).
+pub fn mute_for_tiny(seconds: i64) -> String {
+    let sec = seconds as f64;
+    let n = |div: f64| (sec / div).round() as i64;
+    if sec <= 60. {
+        String::new()
+    } else if sec <= 60. * 59. {
+        format!("{}m", n(60.))
+    } else if sec <= 3600. * 23. {
+        format!("{}h", n(3600.))
+    } else if sec <= 86400. * 6. {
+        format!("{}d", n(86400.))
+    } else if sec <= 86400. * 7. * 3. {
+        format!("{}w", n(86400. * 7.))
+    } else if sec <= 86400. * 31. * 11. {
+        format!("{}m", n(86400. * 31.))
+    } else if sec <= 86400. * 366. {
+        format!("{}y", n(86400. * 365.))
+    } else {
+        String::new()
+    }
+}
+
 /// The comments button's text: `lng_comments_open_count` or `lng_comments_open_none`.
 pub fn comments_text(count: i32) -> String {
     if count > 0 {
@@ -466,6 +491,15 @@ pub fn comments_text(count: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mute_times_like_tdesktop() {
+        assert_eq!(mute_for_tiny(30), "");
+        assert_eq!(mute_for_tiny(45 * 60), "45m");
+        assert_eq!(mute_for_tiny(8 * 3600), "8h");
+        assert_eq!(mute_for_tiny(3 * 86400), "3d");
+        assert_eq!(mute_for_tiny(i64::from(i32::MAX)), "");
+    }
 
     #[test]
     fn short_counts_like_tdesktop() {

@@ -116,6 +116,11 @@ pub enum MenuAction {
     ArchiveInMenu(bool),
     /// The phone number's "Hide with Spoiler" in Settings.
     TogglePhoneSpoiler,
+    /// The chat's "⋮" menu: "Mute forever" (`true`) / "Unmute", leaving it, and
+    /// the items that come later.
+    ChatMute(PeerKey, bool),
+    ChatLeave(PeerKey),
+    ChatStub,
     /// The archive menu's other items (a new window, collapsing, marking read, its
     /// settings and the hint box come later).
     ArchiveStub,
@@ -148,6 +153,10 @@ pub enum Entry {
         /// `Menu::AddCheckedAction`: room for the check at the right, drawn when
         /// `Some(true)`.
         check: Option<bool>,
+        /// Grey text at the right (after `\t` in tdesktop: "Unmute  8h").
+        shortcut: Option<SharedString>,
+        /// A submenu with icons (an arrow at the right, opens on hover).
+        submenu: Option<Vec<Entry>>,
     },
     /// A plain item (`defaultMenu`): its shortcut on the right, greyed out when
     /// disabled, or a submenu (an arrow on the right, opens on hover).
@@ -185,17 +194,8 @@ impl Entry {
             action,
             attention: false,
             check: None,
-        }
-    }
-
-    /// An action without an icon in a menu with icons (its text where theirs is).
-    pub fn text_action(label: &str, action: MenuAction) -> Self {
-        Entry::Action {
-            label: label.to_string().into(),
-            icon: None,
-            action,
-            attention: false,
-            check: None,
+            shortcut: None,
+            submenu: None,
         }
     }
 
@@ -208,6 +208,8 @@ impl Entry {
             action,
             attention: false,
             check: Some(checked),
+            shortcut: None,
+            submenu: None,
         }
     }
 
@@ -219,6 +221,8 @@ impl Entry {
             action,
             attention: true,
             check: None,
+            shortcut: None,
+            submenu: None,
         }
     }
 
@@ -230,6 +234,27 @@ impl Entry {
             action,
             submenu: None,
         }
+    }
+
+    /// An action with an icon opening a submenu with icons (`fillSubmenu`).
+    pub fn action_submenu(label: &str, icon: Icon, entries: Vec<Entry>) -> Self {
+        Entry::Action {
+            label: label.to_string().into(),
+            icon: Some(icon),
+            action: MenuAction::None,
+            attention: false,
+            check: None,
+            shortcut: None,
+            submenu: Some(entries),
+        }
+    }
+
+    /// The same action with grey text at its right.
+    pub fn with_shortcut(mut self, text: &str) -> Self {
+        if let Entry::Action { shortcut, .. } = &mut self {
+            *shortcut = (!text.is_empty()).then(|| text.to_string().into());
+        }
+        self
     }
 
     pub fn submenu(label: &str, enabled: bool, entries: Vec<Entry>) -> Self {
@@ -258,6 +283,9 @@ impl Entry {
                 submenu: Some(s),
                 enabled: true,
                 ..
+            }
+            | Entry::Action {
+                submenu: Some(s), ..
             } => Some(s),
             _ => None,
         }
@@ -448,9 +476,12 @@ impl PopupMenu {
                         if let Some(entries) = self.entries[row].submenu_entries() {
                             let (top, _) = geometry.rows[row];
                             let pad = lg(PLAIN.scroll_padding);
+                            let icons = entries
+                                .iter()
+                                .any(|e| matches!(e, Entry::Action { icon: Some(_), .. }));
                             let mut child = PopupMenu::new(
                                 entries.clone(),
-                                false,
+                                icons,
                                 point(gpx(geometry.x + geometry.w), gpx(geometry.y + top - pad)),
                             );
                             child.parent = Some((geometry.x, geometry.w));
@@ -534,13 +565,26 @@ impl PopupMenu {
                     )
                 }
                 Entry::Separator => (0., lg(5.) + lg(1.) + lg(5.)),
-                Entry::Action { label, check, .. } => (
+                Entry::Action {
+                    label,
+                    check,
+                    shortcut,
+                    submenu,
+                    ..
+                } => (
                     pl + text_width(window, label, FONT_SIZE)
                         + pr
                         + if check.is_some() {
                             lg(ITEM_RIGHT_SKIP) + icon_width(Icon::PlayerCheck, window)
                         } else {
                             0.
+                        }
+                        + match (shortcut, submenu) {
+                            (_, Some(_)) => lg(ITEM_RIGHT_SKIP) + lg(ARROW_SIZE),
+                            (Some(t), None) => {
+                                lg(ITEM_RIGHT_SKIP) + text_width(window, t, FONT_SIZE)
+                            }
+                            _ => 0.,
                         },
                     pt + font_h + pb,
                 ),
@@ -884,8 +928,27 @@ fn render_frame(
                 icon: kind,
                 attention,
                 check,
+                shortcut,
+                submenu,
                 ..
             } => row
+                .children(shortcut.clone().filter(|_| submenu.is_none()).map(|t| {
+                    div()
+                        .absolute()
+                        .right(px(st.item_padding[2]))
+                        .top(gpx(pt))
+                        .h(font_h.line_height())
+                        .whitespace_nowrap()
+                        .text_color(hsla(if hovered { colors.sub_over } else { colors.sub }))
+                        .child(t)
+                }))
+                .children(submenu.as_ref().map(|_| {
+                    div()
+                        .absolute()
+                        .right(px(ITEM_RIGHT_SKIP))
+                        .top(gpx(((h - lg(ARROW_SIZE)) / 2.).round()))
+                        .child(icon(Icon::MenuSubmenuArrow, colors.icon, window))
+                }))
                 .when(*check == Some(true), |row| {
                     let w = icon_width(Icon::PlayerCheck, window);
                     let ch = crate::icons::icon_height(Icon::PlayerCheck, window);
