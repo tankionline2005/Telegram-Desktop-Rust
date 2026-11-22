@@ -4,3 +4,4 @@ schema/** -text
 assets/theme/** -text
 assets/fonts/** -text
 assets/tdesktop-icons/** -text
+assets/emoji/** -text
