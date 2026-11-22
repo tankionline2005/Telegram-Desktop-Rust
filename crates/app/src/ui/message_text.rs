@@ -182,6 +182,18 @@ impl MainView {
         entities: &[TextEntity],
         window: &Window,
     ) -> Rc<Measured> {
+        self.rich_measured_sized(key, text, entities, 13., window)
+    }
+
+    /// [`Self::rich_measured`] at another font size (selectable labels).
+    pub(super) fn rich_measured_sized(
+        &self,
+        key: TextKey,
+        text: &str,
+        entities: &[TextEntity],
+        size: f32,
+        window: &Window,
+    ) -> Rc<Measured> {
         let scale = window.scale_factor().to_bits();
         let mut cache = self.text_ui.cache.borrow_mut();
         if let Some(e) = cache.get(&key)
@@ -195,7 +207,7 @@ impl MainView {
             cache.clear();
         }
         let rich = Rc::new(crate::rich_text::prepare(text, entities));
-        let measured = Rc::new(Measured::new(rich, window));
+        let measured = Rc::new(Measured::with_size(rich, size, window));
         cache.insert(
             key,
             RichEntry {
@@ -515,8 +527,22 @@ impl MainView {
         }
     }
 
+    /// The text selected now (its key), if any.
+    pub(super) fn text_ui_selection_key(&self) -> Option<TextKey> {
+        self.text_ui
+            .selection
+            .as_ref()
+            .filter(|s| !s.range.is_empty())
+            .map(|s| s.key)
+    }
+
     pub(super) fn show_toast(&mut self, text: &str, icon: Option<ToastIcon>) {
         self.text_ui.toast = Some(Toast::new(text.to_string(), icon));
+    }
+
+    /// A wide toast of several lines (`windowArchiveToast`) for `duration_ms`.
+    pub(super) fn show_long_toast(&mut self, text: &str, duration_ms: f32) {
+        self.text_ui.toast = Some(Toast::wide(text.to_string(), duration_ms));
     }
 
     /// Ctrl+C with selected message text. `false` when nothing is selected.

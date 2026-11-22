@@ -22,6 +22,10 @@ pub struct OneLine {
     /// Byte ranges hidden under spoiler particles, in this color.
     spoilers: Vec<std::ops::Range<usize>>,
     spoiler_color: Option<tdr_theme::Color>,
+    /// Byte ranges in semibold and this color (`EntityType::Semibold` with
+    /// `Colorized`: the archive row's unread chats).
+    marked: Vec<std::ops::Range<usize>>,
+    marked_color: Option<tdr_theme::Color>,
 }
 
 /// One line of `text` in the current text style, as wide as its parent, cut with "…".
@@ -31,6 +35,8 @@ pub fn one_line(text: impl Into<SharedString>) -> OneLine {
         centered: false,
         spoilers: Vec::new(),
         spoiler_color: None,
+        marked: Vec::new(),
+        marked_color: None,
     }
 }
 
@@ -50,6 +56,13 @@ impl OneLine {
     ) -> Self {
         self.spoilers = ranges;
         self.spoiler_color = Some(color);
+        self
+    }
+
+    /// Draws these byte ranges in semibold and `color`.
+    pub fn marked(mut self, ranges: Vec<std::ops::Range<usize>>, color: tdr_theme::Color) -> Self {
+        self.marked = ranges;
+        self.marked_color = Some(color);
         self
     }
 }
@@ -122,20 +135,49 @@ impl Element for OneLine {
             .filter(|r| text.is_char_boundary(r.start) && text.is_char_boundary(r.end))
             .cloned()
             .collect();
-        let shape = |window: &mut Window, text: SharedString| {
-            let mut runs = Vec::new();
-            let mut at = 0;
-            for r in spoilers.iter().filter(|r| r.end <= text.len()) {
-                if r.start > at {
-                    runs.push(style.to_run(r.start - at));
-                }
-                let mut hidden = style.to_run(r.end - r.start.max(at));
-                hidden.color.a = 0.;
-                runs.push(hidden);
-                at = r.end;
+        let marked: Vec<std::ops::Range<usize>> = self
+            .marked
+            .iter()
+            .filter(|r| r.start < r.end && r.end <= text.len())
+            .filter(|r| text.is_char_boundary(r.start) && text.is_char_boundary(r.end))
+            .cloned()
+            .collect();
+        // A marked run in another font needs another color too (`layout_line` keeps
+        // the previous run's font otherwise, see `rich_text::separate_fonts`).
+        let marked_color = self.marked_color.map(|m| {
+            let mut color: gpui::Hsla = gpui::rgba(m.rgba()).into();
+            if color == style.color {
+                color.a = (color.a - 1. / 512.).max(0.);
             }
-            if text.len() > at {
-                runs.push(style.to_run(text.len() - at));
+            color
+        });
+        // Runs split at every spoiler and marked range inside `limit` (the kept
+        // text of a cut line, its "…" after it in the plain style).
+        let shape = |window: &mut Window, text: SharedString, limit: usize| {
+            let mut cuts = vec![0, text.len(), limit.min(text.len())];
+            for r in spoilers.iter().chain(&marked) {
+                cuts.push(r.start.min(limit));
+                cuts.push(r.end.min(limit));
+            }
+            cuts.sort_unstable();
+            cuts.dedup();
+            let mut runs = Vec::new();
+            for pair in cuts.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                if a >= b {
+                    continue;
+                }
+                let mut run = style.to_run(b - a);
+                if a < limit && marked.iter().any(|r| r.start <= a && b <= r.end) {
+                    run.font.weight = gpui::FontWeight::SEMIBOLD;
+                    if let Some(color) = marked_color {
+                        run.color = color;
+                    }
+                }
+                if a < limit && spoilers.iter().any(|r| r.start <= a && b <= r.end) {
+                    run.color.a = 0.;
+                }
+                runs.push(run);
             }
             if runs.is_empty() {
                 runs.push(style.to_run(text.len()));
@@ -151,7 +193,7 @@ impl Element for OneLine {
                 .map(|r| (line.x_for_index(r.start), line.x_for_index(r.end.min(len))))
                 .collect()
         };
-        let full = shape(window, text.clone());
+        let full = shape(window, text.clone(), text.len());
         let width = bounds.size.width;
         if full.width <= width {
             let spoilers = ranges(&full, text.len());
@@ -161,7 +203,7 @@ impl Element for OneLine {
                 spoilers,
             };
         }
-        let ellipsis_width = shape(window, ELLIPSIS.into()).width;
+        let ellipsis_width = shape(window, ELLIPSIS.into(), 0).width;
         let room = (width - ellipsis_width).max(px(0.));
         let mut cut = full.closest_index_for_x(room).min(text.len());
         while cut > 0 && (!text.is_char_boundary(cut) || full.x_for_index(cut) > room) {
@@ -169,7 +211,7 @@ impl Element for OneLine {
         }
         let kept = text[..cut].trim_end().len();
         let cut_text: SharedString = format!("{}{ELLIPSIS}", &text[..kept]).into();
-        let line = shape(window, cut_text);
+        let line = shape(window, cut_text, kept);
         let spoilers = ranges(&line, kept);
         Prepaint {
             line,

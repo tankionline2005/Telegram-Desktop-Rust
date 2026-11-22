@@ -93,8 +93,9 @@ pub(super) struct Layers {
     /// The link under the mouse in a label: (label, link index).
     pub link_hover: Option<(&'static str, usize)>,
     pub settings_scroll: gpui::ScrollHandle,
-    /// Where the Settings rows start in the window (for their ripples).
+    /// Where the Settings rows start in the window (for their ripples), and their width.
     pub settings_left: std::cell::Cell<f32>,
+    pub settings_width: std::cell::Cell<f32>,
 }
 
 impl Layers {
@@ -257,6 +258,10 @@ pub(super) enum Part {
 pub(super) enum LinkTarget {
     Url(String),
     About,
+    /// Copies the link with "Link copied to clipboard." (`lng_username_copied`).
+    CopyLink(String),
+    /// Looks like a link, does nothing yet (its box comes later).
+    None,
 }
 
 /// The repository's pages (every link to the repository is made here).
@@ -360,12 +365,20 @@ impl MainView {
             });
         let font = scale::font(size);
         div()
+            .id(gpui::SharedString::from(format!("{id}-label")))
             .when_some(width, |d, w| d.w(gpui::px(w)))
             .text_size(font.size)
             .line_height(line.map_or(font.line_height(), px))
             .font_weight(weight)
             .text_color(c(fg))
             .child(label)
+            // The text reports no hover when the mouse leaves it: the label does.
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if !*hovered && this.layers.link_hover.is_some_and(|(l, _)| l == id) {
+                    this.layers.link_hover = None;
+                    cx.notify();
+                }
+            }))
             .into_any_element()
     }
 
@@ -378,6 +391,14 @@ impl MainView {
         match target {
             LinkTarget::Url(url) => cx.open_url(&url),
             LinkTarget::About => self.layers.show_layer(LayerBox::About),
+            LinkTarget::CopyLink(link) => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(link));
+                self.show_toast(
+                    "Link copied to clipboard.",
+                    Some(crate::toast::ToastIcon::Copy),
+                );
+            }
+            LinkTarget::None => {}
         }
         cx.notify();
     }

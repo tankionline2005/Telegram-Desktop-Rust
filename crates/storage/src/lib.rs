@@ -359,6 +359,26 @@ impl Storage {
             .map(|v| i64::from_le_bytes(v.try_into().unwrap())))
     }
 
+    /// The chats kept in the list though the server's list leaves them out.
+    pub fn kept_dialogs(&self) -> Result<Vec<PeerKey>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT kind, id FROM dialogs WHERE kept = 1")?;
+        let rows = stmt.query_map([], |r| {
+            let kind: i64 = r.get(0)?;
+            Ok((kind, r.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (kind, id) = row?;
+            out.push(PeerKey {
+                kind: PeerKind::from_i64(kind),
+                id,
+            });
+        }
+        Ok(out)
+    }
+
     /// The chat is in the cached chat list (tdesktop's `folderKnown`).
     pub fn has_dialog(&self, key: PeerKey) -> Result<bool> {
         self.conn
@@ -919,6 +939,18 @@ impl Writer<'_> {
                  WHERE kind = ?1 AND id = ?2",
             )?
             .execute(params![peer.kind as i64, peer.id, max_id])?;
+        Ok(())
+    }
+
+    /// `updateFolderPeers`: the chat goes to the archive (1) or the main list (0),
+    /// unpinned.
+    pub fn set_dialog_folder(&self, peer: PeerKey, folder_id: i32) -> Result<()> {
+        self.tx
+            .prepare_cached(
+                "UPDATE dialogs SET folder_id = ?3, pinned = 0, pinned_order = 0
+                 WHERE kind = ?1 AND id = ?2",
+            )?
+            .execute(params![peer.kind as i64, peer.id, folder_id])?;
         Ok(())
     }
 

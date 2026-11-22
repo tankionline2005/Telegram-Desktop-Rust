@@ -29,6 +29,24 @@ pub enum Icon {
     /// The round "go to original" button of forwarded messages
     /// (`historyGoToOriginalIcon`).
     GoToOriginal,
+    /// The round "share" button beside channel posts (`historyFastShareIcon`).
+    FastShare,
+    /// The eye before a post's view count (`historyViewsInIcon`).
+    HistoryViews,
+    /// The comments button of posts (`historyCommentsIn`, `historyCommentsOpenIn`).
+    HistoryComments,
+    HistoryCommentsOpen,
+    /// The channel's "Direct Messages" button (`historyDirectMessage`).
+    MenuChatDiscuss,
+    /// The archive's userpic (`dialogsArchiveUserpic`) and its menus' icons.
+    ArchiveUserpic,
+    MenuArchiveOpen,
+    MenuNewWindow,
+    MenuCollapse,
+    MenuToMainMenu,
+    MenuFromMainMenu,
+    MenuMarkRead,
+    MenuSearch,
     /// The chat header's back arrow (`infoTopBarBackIcon`).
     Back,
     /// The shadow at the edge of a chat sliding in (`slideShadow`), stretched.
@@ -89,7 +107,6 @@ pub enum Icon {
     MenuPhone,
     MenuSaved,
     MenuSettings,
-    MenuArchive,
     SettingsAdd,
     DialogsMenuUnread,
     DialogsMenuUnreadDot,
@@ -223,7 +240,6 @@ impl Icon {
             Icon::MenuPhone => Source::Png(icon_bytes!("menu__phone")),
             Icon::MenuSaved => Source::Png(icon_bytes!("menu__saved_messages")),
             Icon::MenuSettings => Source::Png(icon_bytes!("menu__settings")),
-            Icon::MenuArchive => Source::Png(icon_bytes!("menu__archive_open")),
             Icon::SettingsAdd => Source::Png(icon_bytes!("settings__add")),
             Icon::DialogsMenuUnread => Source::Png(icon_bytes!("dialogs__dialogs_menu_unread")),
             Icon::DialogsMenuUnreadDot => {
@@ -246,6 +262,13 @@ impl Icon {
             Icon::MenuShop => Source::Png(icon_bytes!("menu__shop")),
             Icon::MenuGiftPremium => Source::Png(icon_bytes!("menu__gift_premium")),
             Icon::MenuFaq => Source::Png(icon_bytes!("menu__faq")),
+            Icon::MenuArchiveOpen => Source::Png(icon_bytes!("menu__archive_open")),
+            Icon::MenuNewWindow => Source::Png(icon_bytes!("menu__new_window")),
+            Icon::MenuCollapse => Source::Png(icon_bytes!("menu__collapse")),
+            Icon::MenuToMainMenu => Source::Png(icon_bytes!("menu__move_to_menu")),
+            Icon::MenuFromMainMenu => Source::Png(icon_bytes!("menu__move_from_menu")),
+            Icon::MenuMarkRead => Source::Png(icon_bytes!("menu__read")),
+            Icon::MenuSearch => Source::Png(icon_bytes!("menu__search")),
             Icon::MenuEmojiObjects => Source::Png(icon_bytes!("emoji__emoji_objects")),
             Icon::MenuDiscussion => Source::Png(icon_bytes!("menu__discussion")),
             Icon::InfoClose => Source::Png(icon_bytes!("info__info_close")),
@@ -282,6 +305,12 @@ impl Icon {
             Icon::HistorySent => icon_bytes!("history_sent"),
             Icon::HistoryReceived => icon_bytes!("history_received"),
             Icon::GoToOriginal => icon_bytes!("filled_go_to_message"),
+            Icon::FastShare => icon_bytes!("fast_share"),
+            Icon::HistoryViews => icon_bytes!("history_views"),
+            Icon::HistoryComments => icon_bytes!("history_comments"),
+            Icon::HistoryCommentsOpen => icon_bytes!("history_comments_open"),
+            Icon::MenuChatDiscuss => icon_bytes!("menu__chat_discuss"),
+            Icon::ArchiveUserpic => icon_bytes!("archive_userpic"),
             Icon::Back => icon_bytes!("info__info_back"),
             Icon::SlideShadow => icon_bytes!("slide_shadow"),
             Icon::MiniQuote => icon_bytes!("chat__mini_quote"),

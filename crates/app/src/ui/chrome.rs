@@ -49,6 +49,9 @@ const TABS_BAR_RADIUS: f32 = 2.;
 const TABS_UNREAD_SKIP: f32 = 5.;
 const TABS_DURATION: f32 = 150.;
 
+/// `historyComposeButton`: the label's top (its height is `COMPOSE_BUTTON_HEIGHT`).
+const COMPOSE_BUTTON_TEXT_TOP: f32 = 14.;
+
 /// `SideBarButton::kMaxLabelLines`: longer titles wrap, the button grows.
 const FILTER_MAX_LINES: usize = 3;
 
@@ -78,11 +81,11 @@ const IGNORE_START_CONNECTING: Duration = Duration::from_millis(3000);
 const CONNECTING_DELAY: Duration = Duration::from_millis(1000);
 
 // info.style: topBarSearch, topBarMenuToggle, topBarSkip, topBarCallSkip.
-const TOP_BAR_BUTTON: f32 = 40.;
-const TOP_BAR_MENU: f32 = 44.;
+pub(super) const TOP_BAR_BUTTON: f32 = 40.;
+pub(super) const TOP_BAR_MENU: f32 = 44.;
 const TOP_BAR_ICON: (f32, f32) = (4., 11.);
-const TOP_BAR_MENU_ICON: (f32, f32) = (16., 17.);
-const TOP_BAR_RIPPLE_TOP: f32 = 7.;
+pub(super) const TOP_BAR_MENU_ICON: (f32, f32) = (16., 17.);
+pub(super) const TOP_BAR_RIPPLE_TOP: f32 = 7.;
 const TOP_BAR_SKIP: f32 = -5.;
 const TOP_BAR_CALL_SKIP: f32 = -1.;
 /// window.style: columnMinimalWidthLeft + columnMinimalWidthMain: narrower is one
@@ -246,6 +249,179 @@ fn paint_arc(
 }
 
 impl MainView {
+    /// The bottom of a chat that can't be written to (`HistoryWidget`'s
+    /// `_muteUnmute` / `_joinChannel`, `historyComposeButton`): one wide flat button
+    /// in capitals with the "Direct Messages" button at its left and the gift button
+    /// at its right (`historyDirectMessage`, `historyGiftToChannel`; both stubs).
+    /// "Mute" mutes forever, "Unmute" unmutes; joining is a stub too.
+    pub(super) fn render_compose_bar(
+        &self,
+        chat: &DialogItem,
+        width: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        use crate::bridge::Compose;
+        let (label, direct, gift) = match chat.compose {
+            Compose::Field => return None,
+            Compose::Join { channel, direct } => (
+                if channel {
+                    "JOIN CHANNEL"
+                } else {
+                    "JOIN GROUP"
+                },
+                direct,
+                channel,
+            ),
+            Compose::MuteUnmute { direct } => {
+                (if chat.muted { "UNMUTE" } else { "MUTE" }, direct, true)
+            }
+        };
+        let p = self.palette();
+        let height = lg(COMPOSE_BUTTON_HEIGHT);
+        let font = scale::font(13.);
+        let over = self
+            .button_hovered
+            .as_ref()
+            .is_some_and(|h| h.as_ref() == "compose-bar");
+        let peer = chat.peer;
+        let mute = !chat.muted;
+        let join = matches!(chat.compose, Compose::Join { .. });
+        let main = div()
+            .id("compose-bar")
+            .absolute()
+            .left_0()
+            .top_0()
+            .w(gpui::px(width))
+            .h(gpui::px(height))
+            .overflow_hidden()
+            .cursor_pointer()
+            .bg(c(if over {
+                p.history_compose_button_bg_over
+            } else {
+                p.history_compose_button_bg
+            }))
+            .children(self.ripple_layer(
+                "compose-bar",
+                width,
+                height,
+                p.history_compose_button_bg_ripple,
+                false,
+            ))
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(px(COMPOSE_BUTTON_TEXT_TOP))
+                    .flex()
+                    .justify_center()
+                    .text_size(font.size)
+                    .line_height(font.line_height())
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(c(p.window_active_text_fg))
+                    .child(label),
+            )
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.button_hovered = Some("compose-bar".into());
+                } else if this
+                    .button_hovered
+                    .as_ref()
+                    .is_some_and(|h| h.as_ref() == "compose-bar")
+                {
+                    this.button_hovered = None;
+                }
+                cx.notify();
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                    // The bar spans the chat column at the window's bottom right.
+                    let size = window.viewport_size();
+                    let at = (
+                        f32::from(e.position.x) - (f32::from(size.width) - width),
+                        f32::from(e.position.y)
+                            - (f32::from(size.height) - lg(COMPOSE_BUTTON_HEIGHT)),
+                    );
+                    this.press_button("compose-bar".into(), at);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.release_buttons();
+                    cx.notify();
+                }),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.release_buttons();
+                if !join {
+                    this.set_chat_muted(peer, mute);
+                    let _ = this.commands.send(Command::SetMuted { peer, mute });
+                }
+                cx.notify();
+            }));
+        let colors = (p.window_active_text_fg, p.window_active_text_fg);
+        let side = |id: &'static str, glyph: Icon, this: &Self, cx: &mut Context<Self>| {
+            this.icon_button(
+                id,
+                glyph,
+                (COMPOSE_BUTTON_HEIGHT, COMPOSE_BUTTON_HEIGHT),
+                None,
+                ((3., 3.), 40.),
+                colors,
+                window,
+                cx,
+                |_, _, _| {},
+            )
+            .absolute()
+            .top_0()
+        };
+        Some(
+            div()
+                .relative()
+                .flex_none()
+                .w_full()
+                .h(gpui::px(height))
+                .child(main)
+                // The line over the bottom, as over the message field.
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .top_0()
+                        .h(gpui::px(lg(1.)))
+                        .bg(c(p.shadow_fg)),
+                )
+                .children(
+                    direct
+                        .then(|| side("compose-direct", Icon::MenuChatDiscuss, self, cx).left_0()),
+                )
+                .children(
+                    gift.then(|| side("compose-gift", Icon::MenuGiftPremium, self, cx).right_0()),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The mute state shown at once, before the server's answer.
+    pub(super) fn set_chat_muted(&mut self, peer: tdr_data::tdr_storage::PeerKey, muted: bool) {
+        if let Some(d) = self.dialogs.iter_mut().find(|d| d.peer == peer) {
+            d.muted = muted;
+        }
+        if let Some(d) = self.extra_chats.get_mut(&peer) {
+            d.muted = muted;
+        }
+        for list in self.folder_lists.values_mut() {
+            if let Some(d) = list.iter_mut().find(|d| d.peer == peer) {
+                d.muted = muted;
+            }
+        }
+    }
+
     /// Animations of the controls: ripples, the connecting box.
     pub(super) fn tick_chrome(&mut self, window: &mut Window) -> bool {
         self.button_ripples.retain(|r| !r.done());
@@ -797,9 +973,27 @@ impl MainView {
     }
 
     fn select_folder(&mut self, id: i32, cx: &mut Context<Self>) {
+        // A folder chosen in the open archive closes it (`setActiveChatsFilter`).
+        if self.archive_open {
+            self.archive_open = false;
+            self.archive_slide = None;
+            let _ = self.commands.send(Command::CloseArchive);
+            if self.active_folder == id {
+                self.dialogs = self.folder_lists.get(&id).cloned().unwrap_or_default();
+                self.set_scroll(super::Area::Dialogs, 0.);
+            }
+        }
         if self.active_folder != id {
             self.active_folder = id;
             let _ = self.commands.send(Command::SelectFolder(id));
+            // The list changes at once, as in tdesktop: the folder's last list, or
+            // empty until its chats come. The open chat keeps its header data.
+            if let Some(peer) = self.selected
+                && let Some(item) = self.dialogs.iter().find(|d| d.peer == peer)
+            {
+                self.extra_chats.insert(peer, item.clone());
+            }
+            self.dialogs = self.folder_lists.get(&id).cloned().unwrap_or_default();
             self.set_scroll(super::Area::Dialogs, 0.);
         }
         cx.notify();
@@ -1021,12 +1215,8 @@ impl MainView {
         let p = self.palette();
         // The folder column holds the menu button; as tabs, the header keeps it.
         let filters = self.filters_vertical();
-        let header = div()
-            .relative()
-            .h(px(super::TOP_BAR_HEIGHT))
-            .flex_none()
-            .border_b_1()
-            .border_color(c(p.shadow_fg));
+        // No line under it: the list starts right below (`Dialogs::Widget`).
+        let header = div().relative().h(px(super::TOP_BAR_HEIGHT)).flex_none();
         if narrow {
             // `_searchForNarrowLayout` with folders, else the main menu button.
             let button = if filters {

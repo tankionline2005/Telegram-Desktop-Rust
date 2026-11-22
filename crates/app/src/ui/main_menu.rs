@@ -83,6 +83,7 @@ enum RowAction {
     Account(u32),
     AddAccount,
     Settings,
+    Archive,
 }
 
 impl MainView {
@@ -217,6 +218,7 @@ impl MainView {
             RowAction::AddAccount => self.add_account_clicked(window, cx),
             // `showSettings`: in a window this wide, a layer.
             RowAction::Settings => self.layers.show_special(super::layers::Special::Settings),
+            RowAction::Archive => self.archive_from_main_menu(cx),
         }
         cx.notify();
     }
@@ -331,7 +333,6 @@ impl MainView {
         let shown = accounts.registry.menu_accounts;
         let (others, others_muted) = accounts.others_unread();
         let me = accounts.active().and_then(|s| s.me.clone());
-        let state = accounts.active().map(|s| s.state).unwrap_or_default();
         let ordered: Vec<(u32, String, u32, bool, AccountPic)> = accounts
             .ordered()
             .iter()
@@ -561,21 +562,34 @@ impl MainView {
                 .as_ref()
                 .is_some_and(|h| h.as_ref() == id)
         };
-        // The archive (`setupArchive`), with its unread chats in a grey badge.
-        if state.archive_chats > 0 {
-            let badge = (state.archive_unread > 0).then(|| {
-                self.menu_badge(state.archive_unread, true, window)
+        // The archive (`setupArchive`) when it is moved here, with its unread chats
+        // in a grey badge; the right button opens its menu.
+        if let Some(info) = self.archive.as_ref().filter(|a| a.in_menu) {
+            let badge = (info.unread > 0).then(|| {
+                self.menu_badge(info.unread, true, window)
                     .into_any_element()
             });
             list = list
-                .child(self.menu_row(
-                    "menu-archive".into(),
-                    self.row_icon(Icon::MenuArchive, hovered("menu-archive"), window),
-                    "Archived chats".into(),
-                    badge,
-                    RowAction::None,
-                    cx,
-                ))
+                .child(
+                    self.menu_row(
+                        "menu-archive".into(),
+                        self.row_icon(Icon::MenuArchiveOpen, hovered("menu-archive"), window),
+                        "Archived chats".into(),
+                        badge,
+                        RowAction::Archive,
+                        cx,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, e: &gpui::MouseDownEvent, _, cx| {
+                            this.open_archive_menu(
+                                e.position,
+                                super::archive::ArchiveMenu::MainMenu,
+                            );
+                            cx.notify();
+                        }),
+                    ),
+                )
                 .child(skip())
                 .child(shadow())
                 .child(skip());

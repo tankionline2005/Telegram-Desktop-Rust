@@ -111,6 +111,11 @@ pub enum MenuAction {
     /// Copy this, then show this toast (if any).
     Copy(String, Option<&'static str>),
     OpenUrl(String),
+    /// The archive's menu: "Move to main menu" (`true`) / "Move to chat list".
+    ArchiveInMenu(bool),
+    /// The archive menu's other items (a new window, collapsing, marking read, its
+    /// settings and the hint box come later).
+    ArchiveStub,
     // Settings' "⋮" menu.
     AddAccount,
     EditProfile,

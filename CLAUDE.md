@@ -134,3 +134,12 @@
 - Live checks against Telegram use the user's session in `data/` (git-ignored):
   `tdr me`, `tdr selftest reconnect|unknown-key|dc N`. Run cargo with
   `--manifest-path` if the shell cannot `cd` into the bracketed folder.
+- Channels: posts (`MessageItem.post`: views, signature, comments) are parsed in
+  `describe::message_info`; the bottom of a chat that can't be written to is
+  `DialogItem.compose` (`Compose::of`, drawn by `render_compose_bar` in `ui/chrome.rs`).
+  `--demo --open=4` opens the demo channel.
+- Archive: `ui/archive.rs` (its row over "All chats", its menu, its list with the slide);
+  the bridge sends `Update::Archive` and the archive's list as `Update::Dialogs` of
+  `ARCHIVE_LIST` (-1) while it is open. The per-account "in main menu" setting lives in
+  the cache's `meta` (`tdr_data::ARCHIVE_IN_MENU_KEY`). `one_line(..).marked(ranges,
+  color)` draws ranges semibold in a color.

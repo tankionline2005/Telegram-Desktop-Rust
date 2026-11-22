@@ -534,6 +534,8 @@ impl ShapedParagraph {
 /// The text measured once (fonts and break points); laid out at any width.
 pub struct Measured {
     pub rich: Rc<Rich>,
+    /// The font size in style pixels (13 for messages; labels choose theirs).
+    size: f32,
     paragraphs: Vec<ShapedParagraph>,
     /// Natural width of each paragraph (trailing spaces left out).
     natural: Vec<f32>,
@@ -616,8 +618,13 @@ fn break_points(text: &str) -> Vec<usize> {
 
 impl Measured {
     pub fn new(rich: Rc<Rich>, window: &Window) -> Self {
+        Self::with_size(rich, FONT_SIZE, window)
+    }
+
+    /// Shaped at `font_size` style pixels (`FlatLabel`s with their own font).
+    pub fn with_size(rich: Rc<Rich>, font_size: f32, window: &Window) -> Self {
         let mono = mono_family(window);
-        let size = scale::font(FONT_SIZE).size;
+        let size = scale::font(font_size).size;
         let text_system = window.text_system();
         let mut paragraphs = Vec::with_capacity(rich.paragraphs.len());
         let mut natural = Vec::with_capacity(rich.paragraphs.len());
@@ -684,6 +691,7 @@ impl Measured {
         }
         Self {
             rich,
+            size: font_size,
             paragraphs,
             natural,
             quote_max,
@@ -718,7 +726,7 @@ impl Measured {
     /// Lines at `width` (`Renderer::enumerate`), with the skip block placed after
     /// the last line or on a line of its own.
     pub fn layout(self: &Rc<Self>, width: f32, skip: (f32, f32)) -> Layout {
-        let line_height = scale::font(FONT_SIZE).height;
+        let line_height = scale::font(self.size).height;
         let mut lines = Vec::new();
         let mut boxes = Vec::new();
         let mut y = 0.;
@@ -1633,7 +1641,7 @@ impl RichText {
         let rich = self.layout.rich();
         let colors = self.colors;
         let mono = mono_family(window);
-        let f = scale::font(FONT_SIZE);
+        let f = scale::font(self.layout.measured.size);
         let lh = px(f.height);
         let reveal = if rich.has_spoilers {
             self.reveal_progress()

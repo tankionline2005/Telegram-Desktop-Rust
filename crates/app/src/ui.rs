@@ -31,6 +31,7 @@ use crate::text_input::{FieldMenu, Submit, TagSpan, TextInput};
 
 pub(crate) use chrome::paint_radial;
 
+mod archive;
 mod chrome;
 mod country_box;
 mod layers;
@@ -335,6 +336,16 @@ fn service_pill(p: &Palette, text: String, width: f32) -> gpui::Div {
 
 // chat.style: historyFastShareSize (topPeersSelectorUserpicSize), historyFastShareLeft,
 // historyFastShareBottom
+/// `historyViewsWidth`, `historyViewsSpace`, `historyViewsTop`: the eye of a post's
+/// views (its top from the date line's bottom).
+const VIEWS_WIDTH: f32 = 20.;
+const VIEWS_SPACE: f32 = 8.;
+const VIEWS_TOP: f32 = -15.;
+/// `historyCommentsButtonHeight`, `historyCommentsSkipLeft/Text/Right`.
+const COMMENTS_HEIGHT: f32 = 40.;
+const COMMENTS_SKIP_LEFT: f32 = 9.;
+const COMMENTS_SKIP_TEXT: f32 = 10.;
+const COMMENTS_SKIP_RIGHT: f32 = 8.;
 const FAST_SHARE_SIZE: f32 = 31.;
 const FAST_SHARE_LEFT: f32 = 13.;
 const FAST_SHARE_BOTTOM: f32 = 5.;
@@ -664,6 +675,8 @@ fn mix(a: Rgba, b: Rgba, t: f32, opacity: f32) -> Rgba {
 enum Area {
     History,
     Dialogs,
+    /// Settings (the layer or the section): every scrolled box of this kind.
+    Settings,
 }
 
 impl Area {
@@ -671,7 +684,7 @@ impl Area {
     fn bar_style(self) -> (f32, f32) {
         match self {
             Area::History => (12., 3.),
-            Area::Dialogs => (10., 2.),
+            Area::Dialogs | Area::Settings => (10., 2.),
         }
     }
 }
@@ -690,6 +703,7 @@ pub struct MainView {
     stick_to_bottom: bool,
     history_bar: Scrollbar,
     dialogs_bar: Scrollbar,
+    settings_bar: Scrollbar,
     /// The chat list's share of the window (tdesktop's dialogs width ratios).
     columns: Columns,
     columns_path: Option<PathBuf>,
@@ -705,6 +719,12 @@ pub struct MainView {
     scroll_anim: Option<ScrollAnim>,
     /// The list length when more chats were last asked for.
     more_dialogs_requested: usize,
+    /// The archive's row (`None`: empty), whether it is open, its slide, and where
+    /// the chat list was when it opened.
+    archive: Option<crate::bridge::ArchiveInfo>,
+    archive_open: bool,
+    archive_slide: Option<archive::ArchiveSlide>,
+    main_list_offset: f32,
     /// The main menu's "Night Mode" row is under the mouse.
     /// Header data of opened chats that are not in the loaded chat list.
     extra_chats: HashMap<PeerKey, DialogItem>,
@@ -762,6 +782,8 @@ pub struct MainView {
     country_box: Option<country_box::CountryBox>,
     /// The window's width at the last frame (the layout follows it).
     window_w: f32,
+    /// The last chat list of each folder: a folder opens at once with it.
+    folder_lists: HashMap<i32, Vec<DialogItem>>,
     column_slide: Option<ColumnSlide>,
     /// The folder tabs (`ChatsFiltersTabs`): the bar's move to the chosen tab, the
     /// tab chosen before the switch happens, the bar's range at the last frame.
@@ -893,6 +915,7 @@ impl MainView {
             stick_to_bottom: true,
             history_bar: Scrollbar::default(),
             dialogs_bar: Scrollbar::default(),
+            settings_bar: Scrollbar::default(),
             columns: Columns::default(),
             columns_path: None,
             column_drag: None,
@@ -903,6 +926,10 @@ impl MainView {
             suppress_open: false,
             scroll_anim: None,
             more_dialogs_requested: 0,
+            archive: None,
+            archive_open: false,
+            archive_slide: None,
+            main_list_offset: 0.,
             extra_chats: HashMap::new(),
             reveal_pending: None,
             remembered: HashMap::new(),
@@ -931,6 +958,7 @@ impl MainView {
             layers: Default::default(),
             country_box: None,
             window_w: 0.,
+            folder_lists: HashMap::new(),
             column_slide: None,
             tabs_anim: None,
             tabs_chosen: None,
@@ -1016,6 +1044,7 @@ impl MainView {
             self.reveal_pending = Some(peer);
             return;
         };
+        let ix = ix + self.list_skip();
         self.reveal_pending = None;
         let (_, _, offset) = self.scroll_metrics(Area::Dialogs);
         let first_visible = (offset / lg(DIALOG_ROW_HEIGHT)).floor() as usize;
@@ -1275,6 +1304,7 @@ impl MainView {
         under: gpui::Div,
         over: gpui::Div,
         slide: ColumnSlide,
+        width: f32,
         window: &mut Window,
     ) -> gpui::Div {
         let p = self.palette();
@@ -1284,7 +1314,6 @@ impl MainView {
         } else {
             1. - ease_out_circ(t)
         };
-        let width = f32::from(window.viewport_size().width) - self.filters_width();
         let coord_over = width * (1. - progress);
         let coord_under = -lg(SLIDE_SHIFT) * progress;
         window.request_animation_frame();
@@ -1346,6 +1375,7 @@ impl MainView {
             || self.pin_drag.is_some()
             || self.history_bar.drag.is_some()
             || self.dialogs_bar.drag.is_some()
+            || self.settings_bar.drag.is_some()
     }
 
     /// The mouse moved while something is dragged: wherever it is, like Qt's mouse grab
@@ -1368,6 +1398,7 @@ impl MainView {
         }
         self.drag_scrollbar(Area::History, e.position.y, cx);
         self.drag_scrollbar(Area::Dialogs, e.position.y, cx);
+        self.drag_scrollbar(Area::Settings, e.position.y, cx);
     }
 
     fn drag_ended(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -1383,6 +1414,7 @@ impl MainView {
         }
         self.end_drag(Area::History, cx);
         self.end_drag(Area::Dialogs, cx);
+        self.end_drag(Area::Settings, cx);
     }
 
     fn pinned_order(&self) -> Vec<PeerKey> {
@@ -1696,7 +1728,26 @@ impl MainView {
 
     pub(crate) fn apply(&mut self, update: Update, cx: &mut Context<Self>) {
         match update {
-            Update::Dialogs(mut list) => {
+            Update::Archive(info) => {
+                // An emptied archive closes (`Widget::refreshFolderTopBar`).
+                if info.is_none() && self.archive_open {
+                    self.archive_open = false;
+                    self.dialogs = self
+                        .folder_lists
+                        .get(&self.active_folder)
+                        .cloned()
+                        .unwrap_or_default();
+                    let _ = self.commands.send(Command::CloseArchive);
+                }
+                self.archive = info;
+            }
+            Update::Dialogs { folder, mut list } => {
+                // `Data::ChatFilters`: every folder's list is kept; a list arriving for
+                // another folder than the open one waits there.
+                self.folder_lists.insert(folder, list.clone());
+                if folder != self.shown_list_id() {
+                    return;
+                }
                 // The open chat stays open when the list no longer has it (another
                 // folder is shown): its header data is kept aside.
                 if let Some(peer) = self.selected
@@ -1948,6 +1999,7 @@ impl MainView {
         match area {
             Area::History => &mut self.history_bar,
             Area::Dialogs => &mut self.dialogs_bar,
+            Area::Settings => &mut self.settings_bar,
         }
     }
 
@@ -1955,6 +2007,7 @@ impl MainView {
         match area {
             Area::History => &self.history_bar,
             Area::Dialogs => &self.dialogs_bar,
+            Area::Settings => &self.settings_bar,
         }
     }
 
@@ -2126,6 +2179,9 @@ impl MainView {
             } else {
                 self.close_chat(window, cx);
             }
+        } else if self.archive_open {
+            // `Widget::escape` with an open folder: `closeFolder`.
+            self.close_archive(cx);
         } else {
             return;
         }
@@ -2294,6 +2350,14 @@ impl MainView {
                     -f32::from(base.offset().y),
                 )
             }
+            Area::Settings => {
+                let s = &self.layers.settings_scroll;
+                (
+                    f32::from(s.bounds().size.height),
+                    f32::from(s.max_offset().height),
+                    -f32::from(s.offset().y),
+                )
+            }
         };
         (viewport, max, offset.clamp(0., max.max(0.)))
     }
@@ -2307,6 +2371,11 @@ impl MainView {
             Area::Dialogs => {
                 let base = self.dialogs_scroll.0.borrow().base_handle.clone();
                 base.set_offset(point(px(0.), px(-target)));
+            }
+            Area::Settings => {
+                self.layers
+                    .settings_scroll
+                    .set_offset(point(px(0.), px(-target)));
             }
         }
     }
@@ -2842,6 +2911,8 @@ impl MainView {
     fn attached(pane: PaneRef, a: &MessageItem, b: &MessageItem) -> bool {
         a.service.is_none()
             && b.service.is_none()
+            && a.post.is_none()
+            && b.post.is_none()
             && a.out == b.out
             && a.author == b.author
             && (b.date - a.date).abs() < ATTACH_SECONDS
@@ -2981,8 +3052,10 @@ impl MainView {
         let is_saved = chat.is_some_and(|d| d.is_saved);
         let wide = chat_width >= CHAT_WIDE_WIDTH;
         let right_side = item.out && !wide;
-        // `hasFromPhoto`: groups, and forwards from others in Saved Messages.
-        let with_userpic = wide || ((is_group || is_saved) && !item.out);
+        // `hasFromPhoto`: groups, and forwards from others in Saved Messages; posts
+        // hide their author (`isPostHidingAuthor`).
+        let post = item.post.as_ref();
+        let with_userpic = post.is_none() && (wide || ((is_group || is_saved) && !item.out));
 
         let prev_attached = i > 0 && Self::attached(pane, &pane.messages[i - 1], item);
         let next_attached = pane
@@ -3025,11 +3098,39 @@ impl MainView {
         } else {
             item.time.clone()
         };
+        // `BottomInfo::layoutDateText`: "Author, edited 12:30".
+        let time_text = match post.and_then(|p| p.signature.as_ref()) {
+            Some(author) => format!("{author}, {time_text}"),
+            None => time_text,
+        };
+        // The views before it: the eye (`historyViewsWidth`) and the count, then
+        // `historyViewsSpace`.
+        let views = post.and_then(|p| p.views.clone());
+        let views_w = views.as_ref().map_or(0., |v| {
+            lg(VIEWS_WIDTH)
+                + text_width(window, v, DATE_FONT_SIZE, FontWeight::NORMAL).ceil()
+                + lg(VIEWS_SPACE)
+        });
+        let comments = post.and_then(|p| p.comments.clone());
+        // The button is as wide as its parts at least (less the bubble's padding).
+        let comments_w = comments.as_ref().map_or(0., |t| {
+            text_width(window, t, FONT_SIZE, FontWeight::SEMIBOLD)
+                + lg(COMMENTS_SKIP_LEFT + COMMENTS_SKIP_TEXT + COMMENTS_SKIP_RIGHT)
+                + icon_width(Icon::HistoryComments, window)
+                + icon_width(Icon::HistoryCommentsOpen, window)
+                - 2. * lg(MSG_PADDING_X)
+        });
+        let comments_h = if comments.is_some() {
+            lg(COMMENTS_HEIGHT)
+        } else {
+            0.
+        };
         // `BottomInfo`: the date, then `historySendStateSpace` for the checks. The text
         // ends with a skip block that size (`skipBlockWidth/Height`): on its last line
         // when it fits there, otherwise on a line of its own.
         let date_w = text_width(window, &time_text, DATE_FONT_SIZE, FontWeight::NORMAL).ceil();
-        let info_w = date_w
+        let info_w = views_w
+            + date_w
             + if item.read.is_some() {
                 lg(SEND_STATE_SPACE)
             } else {
@@ -3064,6 +3165,7 @@ impl MainView {
             .max(name_w)
             .max(media_w)
             .max(forwarded_w)
+            .max(comments_w)
             .min(max_text)
             * scale::get())
         .ceil()
@@ -3104,12 +3206,34 @@ impl MainView {
         let info = div()
             .absolute()
             .right(gpui::px(pad_x - lg(MSG_DATE_DELTA_X)))
-            .bottom(gpui::px(pad_y - lg(MSG_DATE_DELTA_Y)))
+            .bottom(gpui::px(pad_y - lg(MSG_DATE_DELTA_Y) + comments_h))
             .w(gpui::px(info_w))
             .h(date_font.line_height())
+            .flex()
             .text_size(date_font.size)
             .line_height(date_font.line_height())
             .text_color(c(date_fg))
+            .children(views.map(|v| {
+                div()
+                    .flex_none()
+                    .flex()
+                    .pr(px(VIEWS_SPACE))
+                    .child(
+                        div()
+                            .relative()
+                            .flex_none()
+                            .w(px(VIEWS_WIDTH))
+                            .h(date_font.line_height())
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top(gpui::px(date_font.height + lg(VIEWS_TOP)))
+                                    .child(icon(Icon::HistoryViews, date_fg, window)),
+                            ),
+                    )
+                    .child(v)
+            }))
             .child(time_text)
             .children(item.read.map(|read| {
                 let kind = if read {
@@ -3215,7 +3339,11 @@ impl MainView {
                     .child(one_line(m.clone()))
             }))
             .child(text_view)
-            .child(info);
+            .child(info)
+            .when(comments_h > 0., |d| d.pb(gpui::px(pad_y + comments_h)))
+            .children(comments.map(|text| {
+                self.render_comments_button(item.id, text, inner + 2. * pad_x, window)
+            }));
         // The tail (`bubble_tail`) hangs outside the square corner; the shadow line
         // continues under it (`PaintBubbleGeneric`).
         let tail = (!next_attached).then(|| {
@@ -3243,12 +3371,34 @@ impl MainView {
         });
         // The bubble's height, for the button beside it.
         let bubble_h = 2. * pad_y
+            + comments_h
             + text_h
             + text_font.height
                 * (sender.is_some() as u8 + forwarded.is_some() as u8 + media_line.is_some() as u8)
                     as f32;
         // "Go to original" (`drawRightAction`): a round button beside the bubble, at
         // its bottom (`historyFastShareBottom` up, centered on short bubbles).
+        // `displayFastShare`: channel posts get the round "share" button there
+        // (forwarding is not done yet: a stub).
+        let share = (original.is_none() && post.is_some()).then(|| {
+            let size = lg(FAST_SHARE_SIZE);
+            let skip = ((bubble_h - size) / 2.).clamp(0., lg(FAST_SHARE_BOTTOM));
+            let side = gpui::px(-(size + lg(FAST_SHARE_LEFT)));
+            div()
+                .id(SharedString::from(format!("fast-share-{}", item.id)))
+                .absolute()
+                .bottom(gpui::px(skip))
+                .when(right_side, |d| d.left(side))
+                .when(!right_side, |d| d.right(side))
+                .size(gpui::px(size))
+                .rounded_full()
+                .bg(c(p.msg_service_bg))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .child(icon(Icon::FastShare, p.msg_service_fg, window))
+        });
         let go_to = original.map(|(peer, msg_id)| {
             let size = lg(FAST_SHARE_SIZE);
             let skip = ((bubble_h - size) / 2.).clamp(0., lg(FAST_SHARE_BOTTOM));
@@ -3287,7 +3437,7 @@ impl MainView {
                             + forwarded.is_some() as u8
                             + media_line.is_some() as u8) as f32;
                 let gap = lg(FAST_SHARE_LEFT)
-                    + if original.is_some() {
+                    + if original.is_some() || post.is_some() {
                         lg(FAST_SHARE_SIZE) + lg(FAST_SHARE_LEFT)
                     } else {
                         0.
@@ -3318,6 +3468,7 @@ impl MainView {
             .child(bubble)
             .children(tail)
             .children(go_to)
+            .children(share)
             .children(code_pill)
             // The message's menu (over the text the text answers it, with links).
             .on_mouse_down(MouseButton::Right, move |e, _, cx| {
@@ -3383,6 +3534,63 @@ impl MainView {
             .into_any_element()
     }
 
+    /// A post's comments button (`Message::paintCommentsButton`): a faint line over
+    /// it, the bubble icon, "N comments" / "Leave a comment" in semibold and the
+    /// arrow at the right. Opening the comments is not done yet (a stub).
+    fn render_comments_button(
+        &self,
+        id: i32,
+        text: String,
+        width: f32,
+        window: &Window,
+    ) -> gpui::Stateful<gpui::Div> {
+        let p = self.palette();
+        let fg = p.msg_file_thumb_link_in_fg;
+        let font = scale::font(FONT_SIZE);
+        let height = lg(COMMENTS_HEIGHT);
+        div()
+            .id(SharedString::from(format!("comments-{id}")))
+            .absolute()
+            .left_0()
+            .bottom_0()
+            .w(gpui::px(width))
+            .h(gpui::px(height))
+            .cursor_pointer()
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top_0()
+                    .h(gpui::px(lg(1.)))
+                    .bg(c(p.msg_in_date_fg))
+                    .opacity(0.3),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(COMMENTS_SKIP_LEFT))
+                    .right(px(COMMENTS_SKIP_RIGHT))
+                    .top_0()
+                    .bottom_0()
+                    .flex()
+                    .items_center()
+                    .child(icon(Icon::HistoryComments, fg, window))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .pl(px(COMMENTS_SKIP_TEXT))
+                            .text_size(font.size)
+                            .line_height(font.line_height())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(c(fg))
+                            .child(one_line(text)),
+                    )
+                    .child(icon(Icon::HistoryCommentsOpen, fg, window)),
+            )
+    }
+
     /// An overlay scrollbar (`historyScroll` in the chat, the default `ScrollArea` style
     /// in the chat list): shown while scrolling and on hover.
     fn render_scrollbar(
@@ -3404,7 +3612,7 @@ impl MainView {
                 p.history_scroll_bar_bg,
                 p.history_scroll_bar_bg_over,
             ),
-            Area::Dialogs => (
+            Area::Dialogs | Area::Settings => (
                 p.scroll_bg,
                 p.scroll_bg_over,
                 p.scroll_bar_bg,
@@ -3428,6 +3636,7 @@ impl MainView {
         let id = match area {
             Area::History => "history-scroll",
             Area::Dialogs => "dialogs-scroll",
+            Area::Settings => "settings-scrollbar",
         };
         Some(
             div()
@@ -3481,6 +3690,7 @@ impl MainView {
                             .id(match area {
                                 Area::History => "history-scroll-bar",
                                 Area::Dialogs => "dialogs-scroll-bar",
+                                Area::Settings => "settings-scroll-bar",
                             })
                             .absolute()
                             .top(gpui::px(bar_top))
@@ -3688,6 +3898,7 @@ impl MainView {
                 let base = self.dialogs_scroll.0.borrow().base_handle.clone();
                 f32::from(base.bounds().origin.y)
             }
+            Area::Settings => f32::from(self.layers.settings_scroll.bounds().origin.y),
         }
     }
 
@@ -3924,7 +4135,7 @@ impl Render for MainView {
             }
         }
         // A dragged scrollbar keeps its thumb under the mouse as the list grows.
-        for area in [Area::History, Area::Dialogs] {
+        for area in [Area::History, Area::Dialogs, Area::Settings] {
             let (_, max, _) = self.scroll_metrics(area);
             if self
                 .bar(area)
@@ -3935,7 +4146,8 @@ impl Render for MainView {
                 self.apply_scrollbar_drag(area);
             }
         }
-        let bars_busy = self.history_bar.tick() | self.dialogs_bar.tick();
+        let bars_busy =
+            self.history_bar.tick() | self.dialogs_bar.tick() | self.settings_bar.tick();
         // The floating date: shown while scrolling, hidden a second later, fading.
         let date_on = self
             .history_bar
@@ -3962,20 +4174,23 @@ impl Render for MainView {
 
         let top_bar = self.render_dialogs_header(dialogs_width, narrow, window, cx);
 
+        let skip = self.list_skip();
         let dialogs = uniform_list(
             "dialogs",
-            self.dialogs.len(),
-            cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+            self.dialogs.len() + skip,
+            cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
                 range
-                    .filter_map(|i| this.dialogs.get(i).cloned())
+                    .filter_map(|i| {
+                        if i < skip {
+                            Some(this.render_archive_row(window, cx))
+                        } else {
+                            let item = this.dialogs.get(i - skip).cloned()?;
+                            Some(this.render_dialog(&item, false, window, cx))
+                        }
+                    })
                     // Each item is laid out on its own, where a root's `top` offset
                     // is ignored: the row slides inside a fixed slot.
-                    .map(|item| {
-                        div()
-                            .w_full()
-                            .h(px(DIALOG_ROW_HEIGHT))
-                            .child(this.render_dialog(&item, false, window, cx))
-                    })
+                    .map(|row| div().w_full().h(px(DIALOG_ROW_HEIGHT)).child(row))
                     .collect::<Vec<_>>()
             }),
         )
@@ -3998,7 +4213,8 @@ impl Render for MainView {
         let floating_row = self.pin_drag.as_ref().and_then(|drag| {
             let index = self.dialogs.iter().position(|d| d.peer == drag.peer)?;
             let item = self.dialogs[index].clone();
-            let top = index as f32 * lg(DIALOG_ROW_HEIGHT) + drag.shown_yadd() - dialogs_offset;
+            let top =
+                (index + skip) as f32 * lg(DIALOG_ROW_HEIGHT) + drag.shown_yadd() - dialogs_offset;
             Some(
                 div()
                     .absolute()
@@ -4071,18 +4287,35 @@ impl Render for MainView {
             .children(self.render_connecting(window, cx));
 
         let one_column = self.one_column();
-        let tabs = self.render_folder_tabs(window, cx);
+        let tabs = if self.archive_open {
+            None
+        } else {
+            self.render_folder_tabs(window, cx)
+        };
+        let top_bar = if self.archive_open {
+            self.render_archive_bar(window, cx)
+        } else {
+            top_bar
+        };
+        let live_list = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(c(p.dialogs_bg))
+            .child(top_bar)
+            .children(tabs)
+            .child(dialogs_area);
+        let list_content = self.archive_slide_view(live_list, dialogs_width, narrow, window, cx);
         let left = div()
             .w(gpui::px(dialogs_width))
             .flex_none()
             .h_full()
             .flex()
             .flex_col()
+            .overflow_hidden()
             .bg(c(p.dialogs_bg))
             .when(!one_column, |d| d.border_r_1().border_color(border))
-            .child(top_bar)
-            .children(tabs)
-            .child(dialogs_area);
+            .child(list_content);
 
         let day = {
             let top = if self.selected.is_some() {
@@ -4233,7 +4466,10 @@ impl Render for MainView {
                     .flex_col()
                     .child(header)
                     .child(feed)
-                    .child(composer);
+                    .child(
+                        self.render_compose_bar(&chat, self.chat_width(window), window, cx)
+                            .unwrap_or_else(|| composer.into_any_element()),
+                    );
                 self.with_slide(live, border, window, cx)
             }
         };
@@ -4242,9 +4478,16 @@ impl Render for MainView {
             match self.column_slide {
                 Some(slide) => {
                     let over = div().size_full().flex().child(right);
+                    let width = f32::from(window.viewport_size().width) - self.filters_width();
                     vec![
-                        self.column_slide_view(div().size_full().child(left), over, slide, window)
-                            .into_any_element(),
+                        self.column_slide_view(
+                            div().size_full().child(left),
+                            over,
+                            slide,
+                            width,
+                            window,
+                        )
+                        .into_any_element(),
                     ]
                 }
                 None if self.selected.is_some() => vec![right.into_any_element()],

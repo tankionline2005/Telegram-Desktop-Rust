@@ -74,6 +74,28 @@ impl CodeHint {
 }
 
 impl MainView {
+    /// A selectable label's menu (`FlatLabel::fillContextMenu`): the selection, then
+    /// its whole text.
+    pub(super) fn open_label_menu(
+        &mut self,
+        at: Point<Pixels>,
+        selected: bool,
+        copy: &str,
+        text: String,
+    ) {
+        let mut entries = Vec::new();
+        if selected {
+            entries.push(Entry::item(
+                "Copy Selected Text",
+                None,
+                true,
+                MenuAction::CopySelected,
+            ));
+        }
+        entries.push(Entry::item(copy, None, true, MenuAction::Copy(text, None)));
+        self.open_menu(entries, at, MenuTag::Other);
+    }
+
     /// Settings' "⋮" menu (`Settings::Main::fillTopBarMenu`), its top right at `at`.
     pub(super) fn open_settings_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
         let accounts = self.accounts.read(cx);
@@ -97,6 +119,15 @@ impl MainView {
         ));
         self.text_ui.menu = Some(OpenMenu {
             menu: PopupMenu::new(entries, true, at).top_right_origin(),
+            tag: MenuTag::Other,
+            phone_author: None,
+        });
+    }
+
+    /// Shows a built menu (no answers from the data thread fill it in).
+    pub(super) fn open_popup(&mut self, menu: PopupMenu) {
+        self.text_ui.menu = Some(OpenMenu {
+            menu,
             tag: MenuTag::Other,
             phone_author: None,
         });
@@ -521,6 +552,7 @@ impl MainView {
             }
             MenuAction::OpenUrl(url) => cx.open_url(&url),
             MenuAction::AddAccount => self.add_account_clicked(window, cx),
+            MenuAction::ArchiveInMenu(in_menu) => self.set_archive_in_menu(in_menu),
             MenuAction::LogOut => {
                 let id = self.accounts.read(cx).registry.active;
                 self.layers.show_layer(super::layers::LayerBox::LogOut(id));
@@ -542,6 +574,7 @@ impl MainView {
             | MenuAction::TrayHide
             | MenuAction::TrayQuit
             | MenuAction::SetReminder
+            | MenuAction::ArchiveStub
             // "Edit profile" comes with the profile section.
             | MenuAction::EditProfile => {}
         }

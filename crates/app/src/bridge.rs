@@ -87,11 +87,45 @@ pub enum Command {
     /// "Log out" (`Main::Account::logOut`): `auth.logOut`, then the account's
     /// session, cache and files go; [`Update::LoggedOut`] follows.
     LogOut,
+    /// A channel's "Mute" / "Unmute" button: notifications off forever, or on.
+    SetMuted {
+        peer: PeerKey,
+        mute: bool,
+    },
+    /// The archive was opened: its list comes as `Update::Dialogs` of
+    /// [`ARCHIVE_LIST`] (loaded further as it scrolls), until `CloseArchive`.
+    OpenArchive,
+    CloseArchive,
+    /// "Move to main menu" (`true`) / "Move to chat list" of the archive.
+    ArchiveInMenu(bool),
+}
+
+/// The list id of the archive in `Update::Dialogs` (folders have positive ids).
+pub const ARCHIVE_LIST: i32 = -1;
+
+/// The archive's row (`Data::Folder` with `kId`): the chats it shows on its
+/// second line, how many more it has, and where it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArchiveInfo {
+    /// `SessionSettings::archiveInMainMenu`: in the main menu, not over the list.
+    pub in_menu: bool,
+    /// `ComposeFolderListEntryText`: the latest chats' names, unread ones marked.
+    pub names: Vec<(String, bool)>,
+    /// "… and N more chats".
+    pub more: usize,
+    /// Chats with unread messages (a grey badge: the archive is muted).
+    pub unread: u32,
 }
 
 #[derive(Debug, Clone)]
 pub enum Update {
-    Dialogs(Vec<DialogItem>),
+    /// The archive's row, `None` while the archive is empty.
+    Archive(Option<ArchiveInfo>),
+    /// The chat list of a folder (0: all chats); the window shows the open one's.
+    Dialogs {
+        folder: i32,
+        list: Vec<DialogItem>,
+    },
     History {
         peer: PeerKey,
         messages: Vec<MessageItem>,
@@ -182,6 +216,40 @@ pub struct DialogItem {
     /// A private chat's last-seen state: the header formats it when drawn, so "5
     /// minutes ago" stays true.
     pub lastseen: Option<describe::Lastseen>,
+    /// What the bottom of the chat shows instead of the message field, if anything.
+    pub compose: Compose,
+}
+
+/// The bottom of a chat (`HistoryWidget::updateControlsVisibility`): the message
+/// field, "Join Channel" / "Join Group" (`isJoinChannel`: a channel or supergroup we
+/// are not in) or "Mute" / "Unmute" (`isMuteUnmute`: a channel we can't post to).
+/// `direct`: the "Direct Messages" button at the left (`_directMessage`, a channel
+/// taking them); channels get the gift button at the right (`_giftToChannel`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Compose {
+    #[default]
+    Field,
+    Join {
+        channel: bool,
+        direct: bool,
+    },
+    MuteUnmute {
+        direct: bool,
+    },
+}
+
+impl Compose {
+    pub fn of(peer: PeerKey, info: &describe::PeerInfo) -> Self {
+        let channel = info.kind == ChatKind::Channel;
+        let direct = info.direct_messages;
+        if peer.kind == PeerKind::Channel && info.left {
+            Compose::Join { channel, direct }
+        } else if channel && !info.can_post {
+            Compose::MuteUnmute { direct }
+        } else {
+            Compose::Field
+        }
+    }
 }
 
 impl DialogItem {
@@ -342,6 +410,11 @@ struct Folders {
     sent: Option<Vec<FolderItem>>,
     /// The counters last sent.
     state_sent: Option<AccountState>,
+    /// The archive is open (its list is sent too), with this many chats shown.
+    archive_open: bool,
+    archive_shown: usize,
+    /// The archive row last sent.
+    archive_sent: Option<Option<ArchiveInfo>>,
 }
 
 impl Folders {
@@ -351,6 +424,9 @@ impl Folders {
             active: 0,
             sent: None,
             state_sent: None,
+            archive_open: false,
+            archive_shown: DIALOGS,
+            archive_sent: None,
         }
     }
 
@@ -449,6 +525,19 @@ pub struct MessageItem {
     /// shows the date).
     pub forward_date: Option<i32>,
     pub edit_date: Option<i32>,
+    /// A channel post: its own bubble with the channel's name, no userpic.
+    pub post: Option<Post>,
+}
+
+/// What a channel post shows besides its text (`Message` with `isPost`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Post {
+    /// The view count before the time (`BottomInfo::_views`, short: "12.3K").
+    pub views: Option<String>,
+    /// The author's signature before the time ("Author, 12:30").
+    pub signature: Option<String>,
+    /// The comments button under the text: "3 comments", "Leave a comment".
+    pub comments: Option<String>,
 }
 
 /// The "Forwarded from" line (`HistoryMessageForwarded::text`).
@@ -814,6 +903,11 @@ fn dialog_item(store: &Storage, d: &DialogView, ctx: &Context) -> DialogItem {
                 && !is_saved
                 && peer != PeerKey::user(tdr_data::SERVICE_NOTIFICATIONS_ID)
         }),
+        compose: if is_saved {
+            Compose::Field
+        } else {
+            Compose::of(peer, &info)
+        },
     }
 }
 
@@ -858,11 +952,12 @@ fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec
             let fwd = info.forward.as_ref();
             let me = PeerKey::user(ctx.self_id);
             // `Message::hasOutLayout`: in Saved Messages everything is drawn as
-            // outgoing except forwards from others.
+            // outgoing except forwards from others; posts never are.
+            let post = info.post && service.is_none();
             let out = if is_saved {
                 fwd.is_none_or(|f| f.outgoing_in_saved(me))
             } else {
-                m.out
+                m.out && !post
             };
             // `HistoryItem::displayFrom`: Saved Messages show forwards under their
             // original sender (or whom they were saved from).
@@ -888,6 +983,16 @@ fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec
                     let author = hidden_author(&name);
                     let color = author.color;
                     (author, Some((name, color)))
+                }
+                // `hasFromName` without `hasFromPhoto`: the channel's name on every
+                // post (posts are never attached), its color.
+                None if post => {
+                    let author = authors
+                        .entry(peer)
+                        .or_insert_with(|| author_of(store, peer))
+                        .clone();
+                    let color = author.color;
+                    (author, Some((peer_name(store, peer), color)))
                 }
                 None => {
                     let key = if m.out { me } else { m.from.unwrap_or(peer) };
@@ -944,6 +1049,11 @@ fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec
                 entities,
                 forward_date: info.forward.as_ref().map(|f| f.date),
                 edit_date: info.edit_date,
+                post: post.then(|| Post {
+                    views: info.views.map(present::count_short),
+                    signature: info.post_author.clone(),
+                    comments: info.comments.map(present::comments_text),
+                }),
                 media,
                 service: service.filter(|_| !call),
                 edited: info.edited,
@@ -961,6 +1071,22 @@ fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec
             }
         })
         .collect()
+}
+
+/// The demo archive's row, as `archive_info` makes it.
+fn demo_archive_row(archived: &[DialogItem], in_menu: bool) -> ArchiveInfo {
+    let shown = ARCHIVE_NAMES.min(archived.len());
+    let throw_away = shown > 1 && archived.len() == shown + 1;
+    let shown = shown - usize::from(throw_away);
+    ArchiveInfo {
+        in_menu,
+        names: archived[..shown]
+            .iter()
+            .map(|d| (d.name.clone(), d.unread > 0))
+            .collect(),
+        more: archived.len() - shown,
+        unread: archived.iter().filter(|d| d.unread > 0).count() as u32,
+    }
 }
 
 /// A hidden sender ("Forwarded from" a name only): initials and a color from the
@@ -1241,7 +1367,10 @@ fn send_dialogs(
                 .collect()
         }
     };
-    let _ = tx.send(Update::Dialogs(items));
+    let _ = tx.send(Update::Dialogs {
+        folder: folders.active,
+        list: items,
+    });
     // The column: "All chats" and the folders, with their unread chats.
     let column: Vec<FolderItem> = if folders.any() {
         folders
@@ -1269,12 +1398,75 @@ fn send_dialogs(
         folders.sent = Some(column.clone());
         let _ = tx.send(Update::Folders(column));
     }
+    let archive = archive_info(store)?;
+    if folders.archive_sent.as_ref() != Some(&archive) {
+        folders.archive_sent = Some(archive.clone());
+        let _ = tx.send(Update::Archive(archive));
+    }
+    if folders.archive_open {
+        let list = store
+            .dialogs(tdr_data::ARCHIVE_FOLDER, folders.archive_shown)?
+            .iter()
+            .filter(|d| listed(d))
+            .map(|d| dialog_item(store, d, &ctx))
+            .collect();
+        let _ = tx.send(Update::Dialogs {
+            folder: ARCHIVE_LIST,
+            list,
+        });
+    }
     let state = account_state(store, &ctx);
     if folders.state_sent != Some(state) {
         folders.state_sent = Some(state);
         let _ = tx.send(Update::AccountState(state));
     }
     Ok(())
+}
+
+/// `Folder::kShowChatNamesCount`: the archive's row names this many chats.
+const ARCHIVE_NAMES: usize = 8;
+/// Archived chats looked at for the row (their unread count, the latest ones).
+const ARCHIVE_SCAN: usize = 1000;
+
+/// The archive's row from the cache (`Folder::lastHistories`,
+/// `ComposeFolderListEntryText`): the 8 latest chats by their last message, the
+/// last of them left out when only one more would follow ("and 2 more chats").
+fn archive_info(store: &Storage) -> anyhow::Result<Option<ArchiveInfo>> {
+    let mut list = store.dialogs(tdr_data::ARCHIVE_FOLDER, ARCHIVE_SCAN)?;
+    list.retain(|d| {
+        !d.peer
+            .as_ref()
+            .is_some_and(|p| describe::peer_info(p).migrated)
+    });
+    if list.is_empty() {
+        return Ok(None);
+    }
+    let in_menu = store
+        .meta_i64(tdr_data::ARCHIVE_IN_MENU_KEY)?
+        .is_some_and(|v| v != 0);
+    let count = (store
+        .meta_i64(tdr_data::ARCHIVE_COUNT_KEY)?
+        .unwrap_or(0)
+        .max(0) as usize)
+        .max(list.len());
+    let unread_of = |d: &DialogView| d.dialog.unread_count > 0 || d.dialog.unread_mark;
+    let unread = list.iter().filter(|d| unread_of(d)).count() as u32;
+    list.sort_by_key(|d| std::cmp::Reverse(list_time(d)));
+    let last = &list[..list.len().min(ARCHIVE_NAMES)];
+    let throw_away = last.len() > 1 && count == last.len() + 1;
+    let shown = &last[..last.len() - usize::from(throw_away)];
+    Ok(Some(ArchiveInfo {
+        in_menu,
+        names: shown
+            .iter()
+            .map(|d| {
+                let name = d.peer.as_ref().map_or_else(String::new, |p| p.name.clone());
+                (name, unread_of(d))
+            })
+            .collect(),
+        more: count - shown.len(),
+        unread,
+    }))
 }
 
 /// The header data of a chat that may not be in the loaded list (a chat opened
@@ -1539,12 +1731,44 @@ async fn run(
                         send_me(sync.store(), &tx);
                         let _ = tx.send(Update::Connected(*client.connected().borrow()));
                     }
+                    Command::SetMuted { peer, mute } => match sync.set_muted(peer, mute).await {
+                        Ok(()) => send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?,
+                        Err(e) => error!("mute: {e}"),
+                    },
                     Command::SelectFolder(id) => {
                         folders.active = id;
                         if folders.filter(id).is_none() {
                             folders.active = 0;
                         }
                         send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
+                    }
+                    Command::OpenArchive => {
+                        folders.archive_open = true;
+                        folders.archive_shown = DIALOGS;
+                        send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
+                        if !sync.archive_complete() {
+                            match sync.load_more_archive().await {
+                                Ok(_) => send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?,
+                                Err(e) => error!("archive: {e}"),
+                            }
+                        }
+                    }
+                    Command::CloseArchive => folders.archive_open = false,
+                    Command::ArchiveInMenu(in_menu) => {
+                        if let Err(e) = sync.set_archive_in_menu(in_menu) {
+                            error!("archive setting: {e}");
+                        }
+                        send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
+                    }
+                    Command::LoadMoreDialogs if folders.archive_open => {
+                        folders.archive_shown += DIALOGS_STEP;
+                        send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
+                        if !sync.archive_complete() {
+                            match sync.load_more_archive().await {
+                                Ok(_) => send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?,
+                                Err(e) => error!("archive: {e}"),
+                            }
+                        }
                     }
                     Command::LoadMoreDialogs => {
                         shown_dialogs += DIALOGS_STEP;
@@ -2127,6 +2351,12 @@ pub fn start_demo(
                 read_inbox_max_id: 1005,
                 // Alice is online, for the userpic dot.
                 lastseen: (i == 0).then_some(describe::Lastseen::Online { until: i32::MAX }),
+                // The channel can't be posted to: "Mute" / "Unmute" with both buttons.
+                compose: if *kind == ChatKind::Channel {
+                    Compose::MuteUnmute { direct: true }
+                } else {
+                    Compose::Field
+                },
                 status: match kind {
                     ChatKind::Group => "906 members".into(),
                     ChatKind::Channel => "8 subscribers".into(),
@@ -2163,9 +2393,65 @@ pub fn start_demo(
             read_inbox_max_id: 1005,
             status: "last seen a long time ago".into(),
             lastseen: None,
+            compose: Compose::Field,
         });
     }
-    let _ = up_tx.send(Update::Dialogs(dialogs.clone()));
+    let _ = up_tx.send(Update::Dialogs {
+        folder: 0,
+        list: dialogs.clone(),
+    });
+    // The archive: old chats, two of them unread.
+    let archived: Vec<DialogItem> = [
+        "Old Project",
+        "Crypto News",
+        "School Friends",
+        "Flat Hunting",
+        "Book Club",
+        "Gym Buddies",
+        "Travel 2024",
+        "Neighbours",
+        "Car Club",
+        "Photo Tips",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(k, name)| {
+        let id = 500 + k as i64;
+        DialogItem {
+            peer: PeerKey::user(id),
+            initials: initials(name),
+            name: name.to_string(),
+            color: color_index(id),
+            photo: None,
+            kind: if k % 3 == 1 {
+                ChatKind::Channel
+            } else if k % 3 == 2 {
+                ChatKind::Group
+            } else {
+                ChatKind::User
+            },
+            badge: PeerBadge::None,
+            is_saved: false,
+            last: line(None, None, "Archived a while ago"),
+            last_read: None,
+            time: present::dialogs_date(today(9, 0) - (2 + k as i32) * day, now),
+            unread: if k == 1 || k == 4 { 3 } else { 0 },
+            muted: true,
+            pinned: false,
+            draft: None,
+            read_inbox_max_id: 1005,
+            status: "last seen a long time ago".into(),
+            lastseen: None,
+            compose: Compose::Field,
+        }
+    })
+    .collect();
+    let mut archive_in_menu = false;
+    let _ = up_tx.send(Update::Archive(Some(demo_archive_row(
+        &archived,
+        archive_in_menu,
+    ))));
+    let mut demo_folder = 0;
     // `--folders`: the folder column with a few folders.
     let demo_folders = std::env::args().any(|a| a == "--folders");
     let folder_of = |id: i32, d: &DialogItem| match id {
@@ -2303,6 +2589,7 @@ pub fn start_demo(
                     entities: Vec::new(),
                     forward_date: None,
                     edit_date: None,
+                    post: None,
                 }
             })
             .collect();
@@ -2326,6 +2613,7 @@ pub fn start_demo(
                 entities,
                 forward_date: None,
                 edit_date: None,
+                post: None,
             });
         }
         // Older demo messages appear 20 at a time when the user scrolls up.
@@ -2336,7 +2624,15 @@ pub fn start_demo(
         while let Some(cmd) = cmd_rx.blocking_recv() {
             match cmd {
                 Command::Refresh => {
-                    let _ = up_tx.send(Update::Dialogs(dialogs.clone()));
+                    demo_folder = 0;
+                    let _ = up_tx.send(Update::Archive(Some(demo_archive_row(
+                        &archived,
+                        archive_in_menu,
+                    ))));
+                    let _ = up_tx.send(Update::Dialogs {
+                        folder: 0,
+                        list: dialogs.clone(),
+                    });
                     if demo_folders {
                         let _ = up_tx.send(Update::Folders(folder_items(&dialogs)));
                     }
@@ -2345,18 +2641,28 @@ pub fn start_demo(
                     let _ = up_tx.send(Update::Connected(true));
                 }
                 Command::SelectFolder(id) => {
+                    demo_folder = id;
                     let shown: Vec<DialogItem> = dialogs
                         .iter()
                         .filter(|d| folder_of(id, d))
                         .cloned()
                         .collect();
-                    let _ = up_tx.send(Update::Dialogs(shown));
+                    // The demo answers late, as a server would: the window shows the
+                    // folder at once, from what it had.
+                    std::thread::sleep(std::time::Duration::from_millis(600));
+                    let _ = up_tx.send(Update::Dialogs {
+                        folder: id,
+                        list: shown,
+                    });
                 }
                 Command::ReorderPinned(order) => {
                     let rank = |d: &DialogItem| order.iter().position(|p| *p == d.peer);
                     let pinned = dialogs.iter().take_while(|d| d.pinned).count();
                     dialogs[..pinned].sort_by_key(|d| rank(d).unwrap_or(usize::MAX));
-                    let _ = up_tx.send(Update::Dialogs(dialogs.clone()));
+                    let _ = up_tx.send(Update::Dialogs {
+                        folder: demo_folder,
+                        list: dialogs.clone(),
+                    });
                     continue;
                 }
                 Command::LoadMoreDialogs
@@ -2389,6 +2695,38 @@ pub fn start_demo(
                     let _ = up_tx.send(Update::LoggedOut);
                     break;
                 }
+                Command::OpenArchive => {
+                    // Late, as a server would answer.
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let _ = up_tx.send(Update::Dialogs {
+                        folder: ARCHIVE_LIST,
+                        list: archived.clone(),
+                    });
+                    continue;
+                }
+                Command::CloseArchive => continue,
+                Command::ArchiveInMenu(in_menu) => {
+                    archive_in_menu = in_menu;
+                    let _ = up_tx.send(Update::Archive(Some(demo_archive_row(
+                        &archived,
+                        archive_in_menu,
+                    ))));
+                    continue;
+                }
+                Command::SetMuted { peer, mute } => {
+                    if let Some(d) = dialogs.iter_mut().find(|d| d.peer == peer) {
+                        d.muted = mute;
+                    }
+                    let _ = up_tx.send(Update::Dialogs {
+                        folder: demo_folder,
+                        list: dialogs
+                            .iter()
+                            .filter(|d| folder_of(demo_folder, d))
+                            .cloned()
+                            .collect(),
+                    });
+                    continue;
+                }
                 Command::OpenChat(_)
                 | Command::CloseChat
                 | Command::SaveDraft { .. }
@@ -2418,6 +2756,7 @@ pub fn start_demo(
                                 entities: Vec::new(),
                                 forward_date: None,
                                 edit_date: None,
+                                post: None,
                             }
                         })
                         .collect();
@@ -2470,6 +2809,7 @@ pub fn start_demo(
                         entities,
                         forward_date: None,
                         edit_date: None,
+                        post: None,
                     });
                 }
             }
@@ -2506,6 +2846,39 @@ pub fn start_demo(
                                 }),
                             });
                         }
+                    }
+                }
+                // The channel (Telegram Tips): posts with views, a signature and
+                // comments on some.
+                if dialogs
+                    .get(i as usize)
+                    .is_some_and(|d| d.kind == ChatKind::Channel)
+                {
+                    let name = dialogs[i as usize].name.clone();
+                    let color = dialogs[i as usize].color;
+                    for (k, m) in messages
+                        .iter_mut()
+                        .enumerate()
+                        .filter(|(_, m)| m.service.is_none())
+                    {
+                        m.out = false;
+                        m.read = None;
+                        m.sender = Some((name.clone(), color));
+                        m.author = Author {
+                            key: Some(PeerKey::user(i + 1)),
+                            initials: initials(&name),
+                            color,
+                            photo: None,
+                        };
+                        m.post = Some(Post {
+                            views: Some(present::count_short([12, 987, 12_345, 1_234_567][k % 4])),
+                            signature: (k % 5 == 1).then(|| "Alice".to_string()),
+                            comments: match k % 3 {
+                                0 => Some(present::comments_text(3)),
+                                1 => Some(present::comments_text(0)),
+                                _ => None,
+                            },
+                        });
                     }
                 }
                 let _ = up_tx.send(Update::History {

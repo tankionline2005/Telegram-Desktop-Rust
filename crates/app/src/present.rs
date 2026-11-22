@@ -431,9 +431,51 @@ pub fn count_text(count: i32, one: &str, many: &str) -> String {
     format!("{grouped} {}", if count == 1 { one } else { many })
 }
 
+/// `Lang::FormatCountToShort`: "987", "9999", then "12.3K", "1.2M", "1B" (rounded
+/// down to a tenth, ".0" left out). Views are at least 1.
+pub fn count_short(count: i32) -> String {
+    let n = i64::from(count).max(1);
+    let shorten = |divider: i64, multiplier: char| {
+        let rounded = n / (divider / 10);
+        if rounded % 10 != 0 {
+            format!("{}.{}{multiplier}", rounded / 10, rounded % 10)
+        } else {
+            format!("{}{multiplier}", rounded / 10)
+        }
+    };
+    if n >= 1_000_000_000 {
+        shorten(1_000_000_000, 'B')
+    } else if n >= 1_000_000 {
+        shorten(1_000_000, 'M')
+    } else if n >= 10_000 {
+        shorten(1_000, 'K')
+    } else {
+        n.to_string()
+    }
+}
+
+/// The comments button's text: `lng_comments_open_count` or `lng_comments_open_none`.
+pub fn comments_text(count: i32) -> String {
+    if count > 0 {
+        count_text(count, "comment", "comments")
+    } else {
+        "Leave a comment".into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_counts_like_tdesktop() {
+        assert_eq!(count_short(987), "987");
+        assert_eq!(count_short(9_999), "9999");
+        assert_eq!(count_short(12_345), "12.3K");
+        assert_eq!(count_short(20_000), "20K");
+        assert_eq!(count_short(1_234_567), "1.2M");
+        assert_eq!(count_short(0), "1");
+    }
 
     #[test]
     fn relative_dates_like_tdesktop() {

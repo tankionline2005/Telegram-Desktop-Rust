@@ -370,12 +370,8 @@ impl MainView {
             .as_ref()
             .and_then(|m| m.phone.clone())
             .unwrap_or_default();
-        let username = me
-            .as_ref()
-            .and_then(|m| m.username.clone())
-            .map_or_else(|| "Add username".to_string(), |u| format!("@{u}"));
-        let name_font = scale::font(TITLE_FONT);
-        let font = scale::font(13.);
+        let username = me.as_ref().and_then(|m| m.username.clone());
+        let own = me.as_ref().map(|m| m.peer);
         let qr = div()
             .absolute()
             .right(px(RIGHT_SKIP - QR_INSET))
@@ -393,18 +389,54 @@ impl MainView {
                 cx,
                 |_, _, _| {},
             ));
-        let text = |top: f32, size: scale::Font, weight: FontWeight, color, s: String| {
-            div()
-                .absolute()
-                .left(px(NAME_LEFT))
-                .right(px(RIGHT_SKIP + QR_SIZE + RIGHT_SKIP))
-                .top(px(top))
-                .text_size(size.size)
-                .line_height(size.line_height())
-                .font_weight(weight)
-                .text_color(c(color))
-                .child(one_line(s))
-        };
+        // `Cover`: the name and the phone are selectable labels with "Copy Name" /
+        // "Copy Phone Number" in their menus; the username is a link copying the
+        // profile's link ("Add username" without one).
+        let width = (self.layers.settings_width.get()
+            - lg(NAME_LEFT)
+            - lg(RIGHT_SKIP + QR_SIZE + RIGHT_SKIP))
+        .max(lg(40.));
+        let place =
+            |top: f32, el: AnyElement| div().absolute().left(px(NAME_LEFT)).top(px(top)).child(el);
+        let name_el = own.map(|peer| {
+            self.selectable_label(
+                (peer, LABEL_NAME),
+                &name,
+                (TITLE_FONT, true, p.window_bold_fg),
+                width,
+                "Copy Name",
+                window,
+                cx,
+            )
+        });
+        let phone_el = own.map(|peer| {
+            self.selectable_label(
+                (peer, LABEL_PHONE),
+                &phone,
+                (13., false, p.window_fg),
+                width,
+                "Copy Phone Number",
+                window,
+                cx,
+            )
+        });
+        use super::layers::{LinkTarget, Part};
+        let username_el = self.linked_label(
+            "settings-username",
+            vec![match &username {
+                Some(u) => Part::Link(
+                    format!("@{u}"),
+                    LinkTarget::CopyLink(format!("https://t.me/{u}")),
+                ),
+                None => Part::Link("Add username".into(), LinkTarget::None),
+            }],
+            None,
+            13.,
+            None,
+            FontWeight::NORMAL,
+            (p.window_sub_text_fg, p.window_sub_text_fg),
+            cx,
+        );
         div()
             .flex_none()
             .relative()
@@ -416,28 +448,77 @@ impl MainView {
                     .top(px(PHOTO_TOP))
                     .child(self.active_userpic(PHOTO_SIZE, cx)),
             )
-            .child(text(
-                NAME_TOP,
-                name_font,
-                FontWeight::SEMIBOLD,
-                p.window_bold_fg,
-                name,
-            ))
-            .child(text(
-                PHONE_TOP,
-                font,
-                FontWeight::NORMAL,
-                p.window_sub_text_fg,
-                phone,
-            ))
-            .child(text(
-                USERNAME_TOP,
-                font,
-                FontWeight::NORMAL,
-                p.window_sub_text_fg,
-                username,
-            ))
+            .children(name_el.map(|el| place(NAME_TOP, el)))
+            .children(phone_el.map(|el| place(PHONE_TOP, el)))
+            .child(place(USERNAME_TOP, username_el))
             .child(qr)
+    }
+
+    /// A selectable one-line `FlatLabel` (`setSelectable`): drag, double and triple
+    /// clicks select, Ctrl+C copies, its menu copies the selection or `copy` the
+    /// whole text.
+    #[allow(clippy::too_many_arguments)]
+    fn selectable_label(
+        &self,
+        key: super::message_text::TextKey,
+        text: &str,
+        (size, semibold, fg): (f32, bool, tdr_theme::Color),
+        width: f32,
+        copy: &'static str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::rich_text::{Kind, TextColors, TextEntity};
+        let p = self.palette();
+        let entities = if semibold && !text.is_empty() {
+            vec![TextEntity {
+                range: 0..text.len(),
+                kind: Kind::Bold,
+            }]
+        } else {
+            Vec::new()
+        };
+        let measured = self.rich_measured_sized(key, text, &entities, size, window);
+        let layout = self.rich_layout(key, &measured, width, (0., 0.));
+        let (state, dragging) = self.text_state(key);
+        // `defaultTextPalette`: the selection over the text in its own color.
+        let colors = TextColors {
+            fg,
+            link: fg,
+            mono: fg,
+            select_bg: p.msg_in_bg_selected,
+            select_fg: fg,
+            select_link: fg,
+            select_mono: fg,
+            spoiler: fg,
+            select_spoiler: fg,
+            quote: fg,
+            dark: self.dark,
+            syntax: [fg; 8],
+            copy_hint: false,
+        };
+        let view = cx.entity().downgrade();
+        let handler_layout = layout.clone();
+        let full = text.to_string();
+        crate::rich_text::view(
+            gpui::SharedString::from(format!("label-{}-{}", key.0.id, key.1)),
+            layout,
+            colors,
+            state,
+            dragging,
+            move |event, window, cx| {
+                let full = full.clone();
+                let _ = view.update(cx, |this, cx| match event {
+                    crate::rich_text::TextEvent::Context { position, .. } => {
+                        let selected = this.text_ui_selection_key().is_some_and(|k| k == key);
+                        this.open_label_menu(position, selected, copy, full);
+                        cx.notify();
+                    }
+                    event => this.on_text_event(key, &handler_layout, event, window, cx),
+                });
+            },
+        )
+        .into_any_element()
     }
 
     /// The Settings layer, `width` wide and at most `max_h` tall.
@@ -574,6 +655,7 @@ impl MainView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.palette();
+        self.layers.settings_width.set(width);
         let content = self.settings_content(width, window, cx);
         let (box_left, box_top, ..) = {
             let size = window.viewport_size();
@@ -622,7 +704,44 @@ impl MainView {
             ));
         let _ = p;
         self.layers.settings_left.set(box_left);
-        self.info_layer_frame(width, max_h, buttons, content)
+        self.info_layer_frame(width, max_h, buttons, content, cx)
+    }
+
+    /// The scrolled content of Settings with its `ScrollArea` bar: shown when the
+    /// mouse comes in or the content scrolls, gone a second later, wider and
+    /// darker under the mouse; the thumb can be dragged (as in the chat list).
+    /// `fill`: the section fills its height; the layer takes the content's.
+    fn settings_scroll_area(
+        &self,
+        content: gpui::Div,
+        fill: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        use super::Area;
+        let scroll = div()
+            .id("settings-scroll")
+            .flex_shrink()
+            .min_h(gpui::px(0.))
+            .when(fill, |d| d.flex_1())
+            .overflow_y_scroll()
+            .track_scroll(&self.layers.settings_scroll)
+            .child(content);
+        div()
+            .id("settings-scroll-area")
+            .relative()
+            .flex_shrink()
+            .min_h(gpui::px(0.))
+            .when(fill, |d| d.flex_1())
+            .flex()
+            .flex_col()
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.area_hovered(Area::Settings, *hovered, cx);
+            }))
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                this.scrolled(Area::Settings, cx);
+            }))
+            .child(scroll)
+            .children(self.render_scrollbar(Area::Settings, cx))
     }
 
     /// Settings as a section (`Info::WrapWidget` in one column): the top bar with the
@@ -636,6 +755,7 @@ impl MainView {
     ) -> AnyElement {
         let p = self.palette();
         self.layers.settings_left.set(left);
+        self.layers.settings_width.set(width);
         let content = self.settings_content(width, window, cx);
         let title_font = scale::font(SECTION_TITLE_FONT);
         let back_y = ((SECTION_TOP_BAR - icons::style_size(Icon::Back).1) / 2.).floor();
@@ -715,15 +835,7 @@ impl MainView {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(top_bar)
             .child(div().flex_none().h(gpui::px(lg(1.))).bg(c(p.shadow_fg)))
-            .child(
-                div()
-                    .id("settings-section-scroll")
-                    .flex_1()
-                    .min_h(gpui::px(0.))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.layers.settings_scroll)
-                    .child(content),
-            )
+            .child(self.settings_scroll_area(content, true, cx))
             .into_any_element()
     }
 
@@ -735,6 +847,7 @@ impl MainView {
         max_h: f32,
         buttons: gpui::Div,
         content: gpui::Div,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.palette();
         let title_font = scale::font(TITLE_FONT);
@@ -766,15 +879,7 @@ impl MainView {
             .shadow(box_shadow())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(top_bar)
-            .child(
-                div()
-                    .id("settings-scroll")
-                    .flex_shrink()
-                    .min_h(gpui::px(0.))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.layers.settings_scroll)
-                    .child(content),
-            )
+            .child(self.settings_scroll_area(content, false, cx))
             .child(div().flex_none().h(px(BOX_RADIUS)))
             .into_any_element()
     }
@@ -873,7 +978,7 @@ impl MainView {
             cx,
             |this, _, _| this.layers.hide_all(),
         ));
-        self.info_layer_frame(width, max_h, buttons, content)
+        self.info_layer_frame(width, max_h, buttons, content, cx)
     }
 
     /// A `Ui::Checkbox` with `settingsCheckbox` (rows with `settingsCheckboxPadding`):
@@ -1152,6 +1257,10 @@ impl MainView {
         row.child(custom)
     }
 }
+
+/// Keys of the cover's selectable labels (message ids are positive).
+const LABEL_NAME: i32 = -1;
+const LABEL_PHONE: i32 = -2;
 
 /// `infoTopBar` of a section: its height, the back arrow (`infoTopBarBack`: 60 px,
 /// the icon at 11), the 14 px semibold title.

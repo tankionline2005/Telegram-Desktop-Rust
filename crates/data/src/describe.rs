@@ -87,6 +87,13 @@ pub struct MessageInfo {
     pub grouped_id: Option<i64>,
     /// A channel post (views, signature).
     pub post: bool,
+    /// How many saw the post (`views`).
+    pub views: Option<i32>,
+    /// The author's signature of a post (`post_author`).
+    pub post_author: Option<String>,
+    /// A post with a discussion group: its comment count (`replies` with
+    /// `comments`).
+    pub comments: Option<i32>,
     pub forward: Option<Forward>,
     /// Formatting and links of the text (`message.entities`).
     pub entities: Vec<Entity>,
@@ -294,6 +301,12 @@ pub fn message_info(row: &MessageRow) -> MessageInfo {
             edit_date: m.edit_date.filter(|_| !m.edit_hide),
             grouped_id: m.grouped_id,
             post: m.post,
+            views: m.views,
+            post_author: m.post_author.clone(),
+            comments: m.replies.as_ref().and_then(|r| {
+                let enums::MessageReplies::MessageReplies(r) = r;
+                r.comments.then_some(r.replies)
+            }),
             forward: m.fwd_from.as_ref().map(|f| {
                 let enums::MessageFwdHeader::MessageFwdHeader(f) = f;
                 Forward {
@@ -482,6 +495,9 @@ pub struct PeerInfo {
     pub verified: bool,
     /// An emoji status is set (drawn instead of the Premium star).
     pub emoji_status: bool,
+    /// A group or channel we are not in (left, kicked, never joined): tdesktop
+    /// keeps it out of the chat list (`amIn`).
+    pub left: bool,
     /// A Telegram Premium user.
     pub premium: bool,
     pub first_name: Option<String>,
@@ -492,6 +508,12 @@ pub struct PeerInfo {
     /// A basic group upgraded to a supergroup (`migrated_to`): tdesktop leaves it out
     /// of the chat list (`History::shouldBeInChatList`), the supergroup goes on.
     pub migrated: bool,
+    /// A channel we may post to (`ChannelData::canPostMessages`: its creator or an
+    /// admin with `post_messages`); groups and users are always writable here.
+    pub can_post: bool,
+    /// A channel taking direct messages (`broadcast_messages_allowed` with a linked
+    /// monoforum): the "Direct Messages" button under its feed.
+    pub direct_messages: bool,
 }
 
 fn color(c: &Option<enums::PeerColor>) -> Option<u8> {
@@ -532,16 +554,21 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
                 first_name: u.first_name.clone(),
                 contact: u.contact,
                 phone: u.phone.clone(),
+                left: false,
                 migrated: false,
+                can_post: true,
+                direct_messages: false,
             },
             _ => PeerInfo::default(),
         },
         K::Chat | K::Channel => match parse::<enums::Chat>(&row.raw) {
             Some(enums::Chat::Chat(c)) => PeerInfo {
                 kind: PeerKind::Group,
+                left: c.left || c.deactivated,
                 members: Some(c.participants_count),
                 photo: chat_photo(&c.photo),
                 migrated: c.migrated_to.is_some(),
+                can_post: true,
                 ..Default::default()
             },
             Some(enums::Chat::Channel(c)) => PeerInfo {
@@ -551,6 +578,16 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
                     PeerKind::Group
                 },
                 color: color(&c.color),
+                left: c.left,
+                can_post: !c.broadcast
+                    || c.creator
+                    || c.admin_rights.as_ref().is_some_and(|r| {
+                        let enums::ChatAdminRights::ChatAdminRights(r) = r;
+                        r.post_messages
+                    }),
+                direct_messages: c.broadcast
+                    && c.broadcast_messages_allowed
+                    && c.linked_monoforum_id.is_some(),
                 members: c.participants_count,
                 photo: chat_photo(&c.photo),
                 verified: c.verified,
@@ -560,7 +597,13 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
                     .is_some_and(|s| !matches!(s, enums::EmojiStatus::Empty)),
                 ..Default::default()
             },
-            _ => PeerInfo {
+            // `chatForbidden`, `channelForbidden`: not ours any more.
+            Some(_) => PeerInfo {
+                kind: PeerKind::Group,
+                left: true,
+                ..Default::default()
+            },
+            None => PeerInfo {
                 kind: PeerKind::Group,
                 ..Default::default()
             },

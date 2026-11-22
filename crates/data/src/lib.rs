@@ -168,6 +168,12 @@ impl Applied {
 /// How many chats to load when the cache is empty.
 pub const INITIAL_DIALOGS: usize = 200;
 const DIALOGS_PAGE: i32 = 100;
+/// The archive's folder id (`Data::Folder::kId`).
+pub const ARCHIVE_FOLDER: i32 = 1;
+/// `meta` keys: the archive's size on the server; the account's
+/// `SessionSettings::archiveInMainMenu`.
+pub const ARCHIVE_COUNT_KEY: &str = "archive_count";
+pub const ARCHIVE_IN_MENU_KEY: &str = "archive_in_main_menu";
 const CHANNEL_DIFFERENCE_LIMIT: i32 = 100;
 
 pub struct Sync {
@@ -182,6 +188,9 @@ pub struct Sync {
     dialogs_cursor: Option<DialogsCursor>,
     /// The server's chat list was loaded to its end in this session.
     dialogs_complete: bool,
+    /// The same for the archive (folder 1).
+    archive_cursor: Option<DialogsCursor>,
+    archive_complete: bool,
     /// Chats loaded from the top of the server's list in this session.
     dialogs_loaded: usize,
     /// Chats the server's chat list had in this session.
@@ -235,6 +244,8 @@ impl Sync {
             dialog_drafts: Vec::new(),
             dialogs_cursor: None,
             dialogs_complete: false,
+            archive_cursor: None,
+            archive_complete: false,
             dialogs_loaded: 0,
             listed: Default::default(),
             pinned_extra: Vec::new(),
@@ -327,6 +338,32 @@ impl Sync {
         }))
     }
 
+    /// Kept chats we are not in (kept before this rule, or left since) leave the list.
+    fn prune_kept_left(&mut self) -> Result<()> {
+        let left: Vec<PeerKey> = self
+            .store
+            .kept_dialogs()?
+            .into_iter()
+            .filter(|&key| key.kind != PeerKind::User)
+            .filter(|&key| {
+                self.store
+                    .peer(key)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|p| describe::peer_info(&p).left)
+            })
+            .collect();
+        if !left.is_empty() {
+            self.store.write(|w| {
+                for key in &left {
+                    w.delete_dialog(*key)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
     pub async fn request_dialog_entry(&mut self, peer: PeerKey) -> Result<bool> {
         if self.listed.contains(&peer) {
             return Ok(false);
@@ -386,6 +423,16 @@ impl Sync {
             self.store.write(|w| w.delete_dialog(peer))?;
             return Ok(false);
         }
+        // Only a private chat, or a group or channel we are in, joins the list
+        // (`History::shouldBeInChatList`): a channel just looked at stays out.
+        let member = |key: PeerKey| {
+            key.kind == PeerKind::User
+                || peer_rows
+                    .iter()
+                    .find(|p| p.key == key)
+                    .is_some_and(|p| !describe::peer_info(p).left)
+        };
+        let rows: Vec<DialogRow> = rows.into_iter().filter(|d| member(d.peer)).collect();
         self.store.write(|w| {
             for p in &peer_rows {
                 w.put_peer(p)?;
@@ -399,7 +446,7 @@ impl Sync {
             }
             Ok(())
         })?;
-        Ok(true)
+        Ok(!rows.is_empty())
     }
 
     /// The whole chat list has been loaded from the server in this session.
@@ -419,7 +466,30 @@ impl Sync {
         if self.dialogs_complete {
             return Ok(0);
         }
-        self.load_dialogs_page().await
+        self.load_dialogs_page(0).await
+    }
+
+    /// "Move to main menu" / "Move to chat list" of the archive's menu: the
+    /// account's `archiveInMainMenu`, kept with its cache.
+    pub fn set_archive_in_menu(&mut self, in_menu: bool) -> Result<()> {
+        self.store
+            .write(|w| w.set_meta_i64(ARCHIVE_IN_MENU_KEY, in_menu.into()))?;
+        Ok(())
+    }
+
+    /// The archive was loaded to its end in this session.
+    pub fn archive_complete(&self) -> bool {
+        self.archive_complete
+    }
+
+    /// The next page of the archive (folder 1; `messages.getDialogs` with its
+    /// `folder_id`, as tdesktop's `requestDialogs(folder)`), from its top the first
+    /// time. Returns how many chats came.
+    pub async fn load_more_archive(&mut self) -> Result<usize> {
+        if self.archive_complete {
+            return Ok(0);
+        }
+        self.load_dialogs_page(ARCHIVE_FOLDER).await
     }
 
     /// The user dragged the pinned chats of the main list into `order`: stored, then
@@ -479,6 +549,7 @@ impl Sync {
                 })?;
             }
         }
+        self.prune_kept_left()?;
         if self.store.meta_i64(MUTE_USERS)?.is_none() {
             self.load_notify_defaults().await?;
         }
@@ -534,6 +605,12 @@ impl Sync {
         let state = State::from(&*state);
         self.store.write(|w| w.clear_dialogs())?;
         let loaded = self.load_dialogs(INITIAL_DIALOGS).await?;
+        // The archive's first page: its row in the list (names, unread chats).
+        self.archive_cursor = None;
+        self.archive_complete = false;
+        if let Err(e) = self.load_dialogs_page(ARCHIVE_FOLDER).await {
+            debug!("archive: {e}");
+        }
         let out = self.engine.set_state(state);
         let mut applied = self.commit(out)?;
         applied.reloaded = true;
@@ -549,7 +626,7 @@ impl Sync {
         self.dialogs_loaded = 0;
         let mut loaded = 0;
         while loaded < limit && !self.dialogs_complete {
-            loaded += self.load_dialogs_page().await?;
+            loaded += self.load_dialogs_page(0).await?;
         }
         Ok(loaded)
     }
@@ -558,9 +635,15 @@ impl Sync {
     /// earlier sessions that are no longer in the list or have moved: every page
     /// replaces the cached chats in the range of dates it covers, so the part of the
     /// list loaded in this session is exact.
-    async fn load_dialogs_page(&mut self) -> Result<usize> {
-        let first = self.dialogs_cursor.is_none();
-        let (offset_date, offset_id, offset_peer) = match &self.dialogs_cursor {
+    async fn load_dialogs_page(&mut self, folder: i32) -> Result<usize> {
+        let archive = folder == ARCHIVE_FOLDER;
+        let cursor = if archive {
+            &self.archive_cursor
+        } else {
+            &self.dialogs_cursor
+        };
+        let first = cursor.is_none();
+        let (offset_date, offset_id, offset_peer) = match cursor {
             Some(c) => (c.date, c.id, c.peer.clone()),
             None => (0, 0, enums::InputPeer::Empty),
         };
@@ -568,7 +651,7 @@ impl Sync {
             .client
             .invoke(&functions::messages::GetDialogs {
                 exclude_pinned: false,
-                folder_id: None,
+                folder_id: archive.then_some(folder),
                 offset_date,
                 offset_id,
                 offset_peer,
@@ -576,13 +659,21 @@ impl Sync {
                 hash: 0,
             })
             .await?;
-        let (dialogs, messages, chats, users, slice) = match page {
+        let (dialogs, messages, chats, users, slice, total) = match page {
             enums::messages::Dialogs::Dialogs(d) => {
-                (d.dialogs, d.messages, d.chats, d.users, false)
+                let total = d.dialogs.len() as i64;
+                (d.dialogs, d.messages, d.chats, d.users, false, total)
             }
-            enums::messages::Dialogs::Slice(d) => (d.dialogs, d.messages, d.chats, d.users, true),
+            enums::messages::Dialogs::Slice(d) => {
+                let total = i64::from(d.count);
+                (d.dialogs, d.messages, d.chats, d.users, true, total)
+            }
             enums::messages::Dialogs::NotModified(_) => {
-                self.dialogs_complete = true;
+                if archive {
+                    self.archive_complete = true;
+                } else {
+                    self.dialogs_complete = true;
+                }
                 return Ok(0);
             }
         };
@@ -696,24 +787,27 @@ impl Sync {
                 w.set_channel_pts(*id, *pts)?;
             }
             if first {
-                w.set_pinned_order(0, &pinned_order)?;
+                w.set_pinned_order(folder, &pinned_order)?;
+            }
+            // How many chats the archive has (`chatsList()->fullSize()`): "and N
+            // more chats" on its row.
+            if archive {
+                w.set_meta_i64(ARCHIVE_COUNT_KEY, total)?;
             }
             if prune {
-                w.prune_dialogs(0, after, before, &keep)
+                w.prune_dialogs(folder, after, before, &keep)
             } else {
                 Ok(0)
             }
         })?;
-        if first {
+        if first && !archive {
             self.pinned_extra = pinned_extra;
         }
         if removed > 0 {
             debug!(removed, "stale chats dropped from the cached list");
         }
-        self.dialogs_complete = complete;
-        self.dialogs_loaded += rows.len();
         // Continue after the last chat of this page.
-        self.dialogs_cursor = rows.last().and_then(|last| {
+        let next = rows.last().and_then(|last| {
             let peer = convert::input_peer(last.peer, hash_of(last.peer))?;
             Some(DialogsCursor {
                 date: last.top_date,
@@ -721,8 +815,14 @@ impl Sync {
                 peer,
             })
         });
-        if self.dialogs_cursor.is_none() {
-            self.dialogs_complete = true;
+        let complete = complete || next.is_none();
+        if archive {
+            self.archive_complete = complete;
+            self.archive_cursor = next;
+        } else {
+            self.dialogs_complete = complete;
+            self.dialogs_loaded += rows.len();
+            self.dialogs_cursor = next;
         }
         Ok(rows.len())
     }
@@ -903,6 +1003,42 @@ impl Sync {
             .into(),
         )
         .await
+    }
+
+    /// Mutes a chat forever or unmutes it (the channel's "Mute" / "Unmute" button,
+    /// `Data::NotifySettings::update` with `MuteValue{ .forever }` / `.unmute`). The
+    /// chat's other settings (previews, sound) are sent back as they are, as tdesktop
+    /// sends its whole `NotifyPeerSettingsValue`.
+    pub async fn set_muted(&mut self, peer: PeerKey, mute: bool) -> Result<()> {
+        let Some(input) = self.input_peer(peer) else {
+            return Ok(());
+        };
+        let notify: enums::InputNotifyPeer = types::InputNotifyPeer { peer: input }.into();
+        let enums::PeerNotifySettings::PeerNotifySettings(now) = self
+            .client
+            .invoke(&functions::account::GetNotifySettings {
+                peer: notify.clone(),
+            })
+            .await?;
+        let mute_until = if mute { i32::MAX } else { 0 };
+        let settings = types::InputPeerNotifySettings {
+            show_previews: now.show_previews,
+            silent: now.silent,
+            mute_until: Some(mute_until),
+            sound: now.other_sound,
+            stories_muted: now.stories_muted,
+            stories_hide_sender: now.stories_hide_sender,
+            stories_sound: now.stories_other_sound,
+        };
+        self.client
+            .invoke(&functions::account::UpdateNotifySettings {
+                peer: notify,
+                settings: settings.into(),
+            })
+            .await?;
+        self.store
+            .write(|w| w.set_mute_until(peer, Some(mute_until)))?;
+        Ok(())
     }
 
     /// Members of a group or subscribers of a channel (`*.getFullChannel`; basic groups
@@ -1455,6 +1591,15 @@ fn apply_update(
             if set_user_status(w, x.user_id, &x.status)? {
                 applied.statuses_changed = true;
             }
+        }
+        // Chats moved into the archive or out of it (`Session::processFolderPeers`):
+        // a moved chat is no longer pinned there.
+        U::FolderPeers(x) => {
+            for f in &x.folder_peers {
+                let enums::FolderPeer::FolderPeer(f) = f;
+                w.set_dialog_folder(convert::peer_key(&f.peer), f.folder_id)?;
+            }
+            applied.pinned_changed = true;
         }
         U::DialogPinned(x) if x.folder_id.unwrap_or(0) == 0 => {
             if let enums::DialogPeer::DialogPeer(d) = &x.peer {

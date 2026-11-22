@@ -36,11 +36,17 @@ pub enum ToastIcon {
     Copy,
 }
 
+/// `boxWideWidth`: a wide toast's width (`windowArchiveToast`).
+const WIDE_WIDTH: f32 = 364.;
+
 #[derive(Clone, Debug)]
 pub struct Toast {
     text: SharedString,
     icon: Option<ToastIcon>,
     shown: Instant,
+    duration_ms: f32,
+    /// `boxWideWidth` wide, its lines wrapped.
+    wide: bool,
 }
 
 impl Toast {
@@ -49,6 +55,17 @@ impl Toast {
             text: text.into(),
             icon,
             shown: Instant::now(),
+            duration_ms: DURATION_MS,
+            wide: false,
+        }
+    }
+
+    /// A wide toast of several lines, shown for `duration_ms`.
+    pub fn wide(text: impl Into<SharedString>, duration_ms: f32) -> Self {
+        Self {
+            duration_ms,
+            wide: true,
+            ..Self::new(text, None)
         }
     }
 
@@ -57,10 +74,10 @@ impl Toast {
         let ms = self.shown.elapsed().as_secs_f32() * 1000.;
         if ms < FADE_IN_MS {
             Some(ms / FADE_IN_MS)
-        } else if ms < DURATION_MS {
+        } else if ms < self.duration_ms {
             Some(1.)
-        } else if ms < DURATION_MS + FADE_OUT_MS {
-            Some(1. - (ms - DURATION_MS) / FADE_OUT_MS)
+        } else if ms < self.duration_ms + FADE_OUT_MS {
+            Some(1. - (ms - self.duration_ms) / FADE_OUT_MS)
         } else {
             None
         }
@@ -142,6 +159,46 @@ pub fn render(
     let level = toast.level()?;
     let f = scale::font(FONT_SIZE);
     let [pl, pt, pr, pb] = PADDING.map(lg);
+    if toast.wide {
+        // Its lines wrap in the fixed width; the plate sits in the middle.
+        let width = lg(WIDE_WIDTH).min(area_width - 2. * lg(MARGIN)).max(0.);
+        window.request_animation_frame();
+        return Some(
+            div()
+                .absolute()
+                .left(gpui::px(left))
+                .top(gpui::px(top))
+                .w(gpui::px(area_width))
+                .h(gpui::px(area_height))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .w(gpui::px(width))
+                        .pl(gpui::px(pl))
+                        .pr(gpui::px(pr))
+                        .pt(gpui::px(pt))
+                        .pb(gpui::px(pb))
+                        .opacity(level)
+                        .rounded(px(RADIUS))
+                        .bg(gpui::rgba(p.toast_bg.rgba()))
+                        .text_color(gpui::rgba(p.toast_fg.rgba()))
+                        .text_size(f.size)
+                        .line_height(f.line_height())
+                        .font_weight(FontWeight::NORMAL)
+                        .flex()
+                        .flex_col()
+                        .children(
+                            toast
+                                .text
+                                .split('\n')
+                                .map(|line| div().w_full().child(line.to_string())),
+                        ),
+                )
+                .into_any_element(),
+        );
+    }
     let icon = toast
         .icon
         .and_then(|i| icon_frames(i, p.toast_fg, window.scale_factor()));
