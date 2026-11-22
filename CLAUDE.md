@@ -143,3 +143,9 @@
   `ARCHIVE_LIST` (-1) while it is open. The per-account "in main menu" setting lives in
   the cache's `meta` (`tdr_data::ARCHIVE_IN_MENU_KEY`). `one_line(..).marked(ranges,
   color)` draws ranges semibold in a color.
+- Focus: `root.rs` gives the focus back to `MainView` when the focused element goes
+  away (`on_focus_lost`), so window-wide actions (Esc) always reach the view.
+- Full info of supergroups/channels (`channelFull`) is stored as a blob in `peer_full`
+  (`Storage::peer_full`, `describe::full_info`), loaded by `Sync::load_full` on open.
+  A chat's loaded history hangs on its `dialogs` row: a chat without one gets it before
+  (or, failing that, from) its first history page.

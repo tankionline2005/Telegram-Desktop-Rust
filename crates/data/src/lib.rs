@@ -174,6 +174,8 @@ pub const ARCHIVE_FOLDER: i32 = 1;
 /// `SessionSettings::archiveInMainMenu`.
 pub const ARCHIVE_COUNT_KEY: &str = "archive_count";
 pub const ARCHIVE_IN_MENU_KEY: &str = "archive_in_main_menu";
+/// `SessionSettings::phoneNumberHidden`: the own number under a spoiler in Settings.
+pub const PHONE_HIDDEN_KEY: &str = "phone_number_hidden";
 const CHANNEL_DIFFERENCE_LIMIT: i32 = 100;
 
 pub struct Sync {
@@ -423,16 +425,9 @@ impl Sync {
             self.store.write(|w| w.delete_dialog(peer))?;
             return Ok(false);
         }
-        // Only a private chat, or a group or channel we are in, joins the list
-        // (`History::shouldBeInChatList`): a channel just looked at stays out.
-        let member = |key: PeerKey| {
-            key.kind == PeerKind::User
-                || peer_rows
-                    .iter()
-                    .find(|p| p.key == key)
-                    .is_some_and(|p| !describe::peer_info(p).left)
-        };
-        let rows: Vec<DialogRow> = rows.into_iter().filter(|d| member(d.peer)).collect();
+        // A group or channel we are not in is stored too (its history is read
+        // through its row) but stays out of the list (`shouldBeInChatList`, see
+        // `bridge::in_chat_list`).
         self.store.write(|w| {
             for p in &peer_rows {
                 w.put_peer(p)?;
@@ -474,6 +469,13 @@ impl Sync {
     pub fn set_archive_in_menu(&mut self, in_menu: bool) -> Result<()> {
         self.store
             .write(|w| w.set_meta_i64(ARCHIVE_IN_MENU_KEY, in_menu.into()))?;
+        Ok(())
+    }
+
+    /// "Hide with Spoiler" of the own phone number (`setPhoneNumberHidden`).
+    pub fn set_phone_hidden(&mut self, hidden: bool) -> Result<()> {
+        self.store
+            .write(|w| w.set_meta_i64(PHONE_HIDDEN_KEY, hidden.into()))?;
         Ok(())
     }
 
@@ -1071,7 +1073,10 @@ impl Sync {
         Ok(!rows.is_empty())
     }
 
-    pub async fn member_count(&mut self, peer: PeerKey) -> Result<Option<i32>> {
+    /// The full info of a supergroup or channel (`ApiWrap::requestFullPeer` when it
+    /// is opened: `channels.getFullChannel`): stored with the peers that came with
+    /// it (the channel itself, its discussion group). Returns it.
+    pub async fn load_full(&mut self, peer: PeerKey) -> Result<Option<describe::FullInfo>> {
         if peer.kind != PeerKind::Channel {
             return Ok(None);
         }
@@ -1088,10 +1093,23 @@ impl Sync {
                 .into(),
             })
             .await?;
-        Ok(match &full.full_chat {
-            enums::ChatFull::ChannelFull(c) => c.participants_count,
-            _ => None,
-        })
+        let peer_rows: Vec<_> = full
+            .users
+            .iter()
+            .filter_map(convert::user_row)
+            .chain(full.chats.iter().filter_map(convert::chat_row))
+            .collect();
+        let raw = convert::raw(&full.full_chat);
+        self.store.write(|w| {
+            for p in &peer_rows {
+                w.put_peer(p)?;
+            }
+            if let Some(raw) = &raw {
+                w.put_peer_full(peer, raw)?;
+            }
+            Ok(())
+        })?;
+        Ok(describe::full_info(&raw))
     }
 
     /// Sends a text message and records it in the cache.
@@ -1819,11 +1837,35 @@ impl Sync {
                 .filter_map(convert::user_row)
                 .chain(chats.iter().filter_map(convert::chat_row))
                 .collect();
+            // A chat without a row (a channel looked at, whose dialog the server
+            // did not give): its newest message makes one, the history hangs on it.
+            let newest = rows.iter().max_by_key(|m| m.id);
+            let made_row = match newest {
+                Some(top) if offset == 0 && !self.store.has_dialog(peer)? => Some(DialogRow {
+                    peer,
+                    top_message: top.id,
+                    top_date: top.date,
+                    pinned: false,
+                    folder_id: 0,
+                    unread_count: 0,
+                    pts: None,
+                    read_inbox_max_id: top.id,
+                    read_outbox_max_id: 0,
+                    mute_until: None,
+                    unread_mentions: 0,
+                    unread_mark: false,
+                }),
+                _ => None,
+            };
+            let extend_from = made_row.as_ref().map_or(offset, |r| r.top_message);
             self.store.write(|w| {
                 for p in &peers {
                     w.put_peer(p)?;
                 }
-                w.extend_history(peer, offset, start_reached, &rows)
+                if let Some(row) = &made_row {
+                    w.put_dialog(row)?;
+                }
+                w.extend_history(peer, extend_from, start_reached, &rows)
             })?;
             fetched += rows.len();
             have += rows.len();

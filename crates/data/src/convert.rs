@@ -3,7 +3,7 @@
 use tdr_storage::{MessageRow, PeerKey, PeerRow};
 use tdr_tl::{Serializable, enums, types};
 
-fn raw(object: &impl Serializable) -> Option<(i32, Vec<u8>)> {
+pub(crate) fn raw(object: &impl Serializable) -> Option<(i32, Vec<u8>)> {
     Some((tdr_tl::LAYER, object.to_bytes()))
 }
 
@@ -53,20 +53,37 @@ pub fn user_row(user: &enums::User) -> Option<PeerRow> {
         access_hash: u.access_hash,
         is_min: u.min,
         name,
-        username: u.username.clone(),
+        username: primary_username(u.username.as_ref(), u.usernames.as_deref()),
         is_megagroup: false,
         raw: raw(user),
     })
 }
 
+/// The username shown and linked (`UsernamesInfo::username`): with a list of
+/// usernames (collectible ones, several of a bot or a channel) the first active one,
+/// else the plain `username`.
+pub fn primary_username(
+    username: Option<&String>,
+    usernames: Option<&[enums::Username]>,
+) -> Option<String> {
+    match usernames {
+        Some(list) if !list.is_empty() => list.iter().find_map(|u| {
+            let enums::Username::Username(u) = u;
+            u.active.then(|| u.username.clone())
+        }),
+        _ => username.cloned(),
+    }
+    .filter(|u| !u.is_empty())
+}
+
 pub fn chat_row(chat: &enums::Chat) -> Option<PeerRow> {
     let row =
-        |key, access_hash, is_min, name: &str, username: Option<&String>, is_megagroup| PeerRow {
+        |key, access_hash, is_min, name: &str, username: Option<String>, is_megagroup| PeerRow {
             key,
             access_hash,
             is_min,
             name: name.to_string(),
-            username: username.cloned(),
+            username,
             is_megagroup,
             raw: raw(chat),
         };
@@ -78,7 +95,7 @@ pub fn chat_row(chat: &enums::Chat) -> Option<PeerRow> {
             c.access_hash,
             c.min,
             &c.title,
-            c.username.as_ref(),
+            primary_username(c.username.as_ref(), c.usernames.as_deref()),
             c.megagroup,
         ),
         enums::Chat::ChannelForbidden(c) => row(

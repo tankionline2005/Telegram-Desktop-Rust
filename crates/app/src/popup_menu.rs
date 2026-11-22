@@ -14,12 +14,13 @@ use std::time::Instant;
 use gpui::{
     AnyElement, App, Bounds, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton,
     ParentElement, Pixels, Point, SharedString, StatefulInteractiveElement, Styled, TextRun,
-    Window, div, font, linear_color_stop, linear_gradient, point, px as gpx,
+    Window, div, font, linear_color_stop, linear_gradient, point, prelude::FluentBuilder,
+    px as gpx,
 };
 use tdr_data::tdr_storage::PeerKey;
 use tdr_theme::{Color, Palette};
 
-use crate::icons::{Icon, icon};
+use crate::icons::{Icon, icon, icon_width};
 use crate::one_line::one_line;
 use crate::scale::{self, lg, px};
 
@@ -113,6 +114,8 @@ pub enum MenuAction {
     OpenUrl(String),
     /// The archive's menu: "Move to main menu" (`true`) / "Move to chat list".
     ArchiveInMenu(bool),
+    /// The phone number's "Hide with Spoiler" in Settings.
+    TogglePhoneSpoiler,
     /// The archive menu's other items (a new window, collapsing, marking read, its
     /// settings and the hint box come later).
     ArchiveStub,
@@ -142,6 +145,9 @@ pub enum Entry {
         action: MenuAction,
         /// `menuWithIconsAttention`: red text and icon ("Log out").
         attention: bool,
+        /// `Menu::AddCheckedAction`: room for the check at the right, drawn when
+        /// `Some(true)`.
+        check: Option<bool>,
     },
     /// A plain item (`defaultMenu`): its shortcut on the right, greyed out when
     /// disabled, or a submenu (an arrow on the right, opens on hover).
@@ -178,6 +184,30 @@ impl Entry {
             icon: Some(icon),
             action,
             attention: false,
+            check: None,
+        }
+    }
+
+    /// An action without an icon in a menu with icons (its text where theirs is).
+    pub fn text_action(label: &str, action: MenuAction) -> Self {
+        Entry::Action {
+            label: label.to_string().into(),
+            icon: None,
+            action,
+            attention: false,
+            check: None,
+        }
+    }
+
+    /// `Menu::AddCheckedAction`: the check (`mediaPlayerMenuCheck`) at its right
+    /// while `checked`.
+    pub fn checked(label: &str, icon: Icon, action: MenuAction, checked: bool) -> Self {
+        Entry::Action {
+            label: label.to_string().into(),
+            icon: Some(icon),
+            action,
+            attention: false,
+            check: Some(checked),
         }
     }
 
@@ -188,6 +218,7 @@ impl Entry {
             icon: Some(icon),
             action,
             attention: true,
+            check: None,
         }
     }
 
@@ -503,8 +534,14 @@ impl PopupMenu {
                     )
                 }
                 Entry::Separator => (0., lg(5.) + lg(1.) + lg(5.)),
-                Entry::Action { label, .. } => (
-                    pl + text_width(window, label, FONT_SIZE) + pr,
+                Entry::Action { label, check, .. } => (
+                    pl + text_width(window, label, FONT_SIZE)
+                        + pr
+                        + if check.is_some() {
+                            lg(ITEM_RIGHT_SKIP) + icon_width(Icon::PlayerCheck, window)
+                        } else {
+                            0.
+                        },
                     pt + font_h + pb,
                 ),
                 Entry::WideSeparator => (0., lg(4.) + lg(6.) + lg(4.)),
@@ -580,6 +617,8 @@ pub struct MenuColors {
     /// `attentionButtonFg`, `attentionButtonFgOver`.
     pub attention: Color,
     pub attention_over: Color,
+    /// `mediaPlayerActiveFg`: a checked item's check.
+    pub check: Color,
 }
 
 impl MenuColors {
@@ -598,6 +637,7 @@ impl MenuColors {
             separator: p.menu_separator_fg,
             attention: p.attention_button_fg,
             attention_over: p.attention_button_fg_over,
+            check: p.media_player_active_fg,
         }
     }
 }
@@ -843,8 +883,20 @@ fn render_frame(
                 label,
                 icon: kind,
                 attention,
+                check,
                 ..
             } => row
+                .when(*check == Some(true), |row| {
+                    let w = icon_width(Icon::PlayerCheck, window);
+                    let ch = crate::icons::icon_height(Icon::PlayerCheck, window);
+                    row.child(
+                        div()
+                            .absolute()
+                            .left(gpx(g.w - lg(ITEM_RIGHT_SKIP) - w))
+                            .top(gpx(((h - ch) / 2.).round()))
+                            .child(icon(Icon::PlayerCheck, colors.check, window)),
+                    )
+                })
                 .children(kind.map(|k| {
                     div()
                         .absolute()

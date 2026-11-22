@@ -379,6 +379,13 @@ impl MainView {
             old_row: self.archive_row_shown(),
         });
         self.main_list_offset = offset;
+        // The open chat stays open (`changeOpenedFolder` leaves the chat alone): its
+        // header data is kept aside while the archive's list is shown.
+        if let Some(peer) = self.selected
+            && let Some(item) = self.dialogs.iter().find(|d| d.peer == peer)
+        {
+            self.extra_chats.insert(peer, item.clone());
+        }
         self.archive_open = true;
         self.dialogs = self
             .folder_lists

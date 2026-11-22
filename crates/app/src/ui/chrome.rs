@@ -264,17 +264,21 @@ impl MainView {
         use crate::bridge::Compose;
         let (label, direct, gift) = match chat.compose {
             Compose::Field => return None,
-            Compose::Join { channel, direct } => (
+            Compose::Join {
+                channel,
+                direct,
+                gift,
+            } => (
                 if channel {
                     "JOIN CHANNEL"
                 } else {
                     "JOIN GROUP"
                 },
                 direct,
-                channel,
+                gift,
             ),
-            Compose::MuteUnmute { direct } => {
-                (if chat.muted { "UNMUTE" } else { "MUTE" }, direct, true)
+            Compose::MuteUnmute { direct, gift } => {
+                (if chat.muted { "UNMUTE" } else { "MUTE" }, direct, gift)
             }
         };
         let p = self.palette();
@@ -1483,6 +1487,7 @@ impl MainView {
             .left(px((total_h - CONNECTING_RADIAL) / 2.))
             .top(px((total_h - CONNECTING_RADIAL) / 2.))
             .size(px(CONNECTING_RADIAL))
+            .bg(c(p.window_bg))
             .child(
                 canvas(
                     |_, _, _| {},
@@ -1508,10 +1513,25 @@ impl MainView {
                 )
                 .size_full(),
             );
+        // The proxy state at the right (`ProxyIcon`): no proxy, the grey shield.
+        let shield = div()
+            .absolute()
+            .right(px((total_h - CONNECTING_RADIAL) / 2.))
+            .top_0()
+            .h(px(total_h))
+            .w(px(CONNECTING_RADIAL))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon(Icon::ProxyOff, p.menu_icon_fg, window));
         let slide = (total_h - CONNECTING_MARGIN) * (1. - shown);
         Some(
             div()
                 .id("connecting")
+                // A button (`ConnectionState::Widget`, it opens the proxy settings,
+                // not done yet): presses never reach the list under it.
+                .occlude()
+                .cursor_pointer()
                 .absolute()
                 .left_0()
                 .bottom(px(-slide))
@@ -1528,7 +1548,12 @@ impl MainView {
                     Icon::ConnectingRight,
                     Icon::ConnectingRightShadow,
                 ))
+                // The spinner over the shield (`Progress` is made after `ProxyIcon`,
+                // both on the window's color): folded, only the spinner shows.
+                .child(shield)
                 .child(spinner)
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(gpui::MouseButton::Right, |_, _, cx| cx.stop_propagation())
                 .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                     this.connection.text.set(if *hovered { 1. } else { 0. });
                     cx.notify();

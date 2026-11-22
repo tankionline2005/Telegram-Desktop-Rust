@@ -98,6 +98,8 @@ pub enum Command {
     CloseArchive,
     /// "Move to main menu" (`true`) / "Move to chat list" of the archive.
     ArchiveInMenu(bool),
+    /// "Hide with Spoiler" of the own number in Settings.
+    SetPhoneHidden(bool),
 }
 
 /// The list id of the archive in `Update::Dialogs` (folders have positive ids).
@@ -225,6 +227,8 @@ pub struct DialogItem {
 /// are not in) or "Mute" / "Unmute" (`isMuteUnmute`: a channel we can't post to).
 /// `direct`: the "Direct Messages" button at the left (`_directMessage`, a channel
 /// taking them); channels get the gift button at the right (`_giftToChannel`).
+/// `gift`: the gift button at the right (`_giftToChannel`: a channel whose full
+/// info says `stargifts_available`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Compose {
     #[default]
@@ -232,20 +236,27 @@ pub enum Compose {
     Join {
         channel: bool,
         direct: bool,
+        gift: bool,
     },
     MuteUnmute {
         direct: bool,
+        gift: bool,
     },
 }
 
 impl Compose {
-    pub fn of(peer: PeerKey, info: &describe::PeerInfo) -> Self {
+    pub fn of(peer: PeerKey, info: &describe::PeerInfo, full: Option<&describe::FullInfo>) -> Self {
         let channel = info.kind == ChatKind::Channel;
         let direct = info.direct_messages;
+        let gift = channel && full.is_some_and(|f| f.stargifts);
         if peer.kind == PeerKind::Channel && info.left {
-            Compose::Join { channel, direct }
+            Compose::Join {
+                channel,
+                direct,
+                gift,
+            }
         } else if channel && !info.can_post {
-            Compose::MuteUnmute { direct }
+            Compose::MuteUnmute { direct, gift }
         } else {
             Compose::Field
         }
@@ -292,6 +303,8 @@ pub struct MeInfo {
     /// "+7 900 123 45 67" (`Ui::FormatPhone`), and the username without "@".
     pub phone: Option<String>,
     pub username: Option<String>,
+    /// The number is shown under a spoiler (the account's `phoneNumberHidden`).
+    pub phone_hidden: bool,
 }
 
 /// Unread counters of an account (`Data::Session::unreadBadge`, the archive's
@@ -355,6 +368,7 @@ fn me_info(store: &Storage) -> Option<MeInfo> {
     let peer = PeerKey::user(self_id);
     let row = store.peer(peer).ok().flatten()?;
     let info = describe::peer_info(&row);
+    let username = describe::username(&row);
     let countries = COUNTRIES.get().map(Vec::as_slice).unwrap_or_default();
     Some(MeInfo {
         peer,
@@ -367,7 +381,12 @@ fn me_info(store: &Storage) -> Option<MeInfo> {
             .phone
             .filter(|p| !p.is_empty())
             .map(|p| tdr_data::login::format_phone(&p, countries)),
-        username: row.username.filter(|u| !u.is_empty()),
+        username,
+        phone_hidden: store
+            .meta_i64(tdr_data::PHONE_HIDDEN_KEY)
+            .ok()
+            .flatten()
+            .is_some_and(|v| v != 0),
     })
 }
 
@@ -905,8 +924,15 @@ fn dialog_item(store: &Storage, d: &DialogView, ctx: &Context) -> DialogItem {
         }),
         compose: if is_saved {
             Compose::Field
+        } else if kind == ChatKind::Channel {
+            let full = store
+                .peer_full(peer)
+                .ok()
+                .flatten()
+                .and_then(|raw| describe::full_info(&Some(raw)));
+            Compose::of(peer, &info, full.as_ref())
         } else {
-            Compose::of(peer, &info)
+            Compose::of(peer, &info, None)
         },
     }
 }
@@ -1316,6 +1342,42 @@ pub fn start(
 /// Every cached chat, the main list and the archive (what folders pick from).
 const ALL_DIALOGS: usize = 100_000;
 
+/// The full info of an opened supergroup or channel: its member count for the
+/// header, then the list and the header data again (the gift button).
+async fn load_full(
+    sync: &mut Sync,
+    peer: PeerKey,
+    shown_dialogs: usize,
+    folders: &mut Folders,
+    tx: &mpsc::UnboundedSender<Update>,
+) -> anyhow::Result<()> {
+    match sync.load_full(peer).await {
+        Ok(Some(full)) => {
+            if let Some(n) = full.members {
+                let text = members_text(sync.store(), peer, n);
+                let _ = tx.send(Update::Members { peer, text });
+            }
+            send_dialogs(sync.store(), shown_dialogs, folders, tx)?;
+            if let Some(item) = chat_info(sync.store(), peer) {
+                let _ = tx.send(Update::ChatInfo(Box::new(item)));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => error!("full info: {e}"),
+    }
+    Ok(())
+}
+
+/// `History::shouldBeInChatList`: not a basic group upgraded to a supergroup, and
+/// not a group or channel we are not in (one opened by a link has its row, for its
+/// history, but no place in the list).
+fn in_chat_list(d: &DialogView) -> bool {
+    d.peer.as_ref().is_none_or(|p| {
+        let info = describe::peer_info(p);
+        !info.migrated && (p.key.kind == PeerKind::User || !info.left)
+    })
+}
+
 fn send_dialogs(
     store: &Storage,
     shown: usize,
@@ -1323,11 +1385,7 @@ fn send_dialogs(
     tx: &mpsc::UnboundedSender<Update>,
 ) -> anyhow::Result<()> {
     let ctx = Context::load(store);
-    let listed = |d: &DialogView| {
-        !d.peer
-            .as_ref()
-            .is_some_and(|p| describe::peer_info(p).migrated)
-    };
+    let listed = in_chat_list;
     // Folders pick from every chat: their badges, and the open folder's list.
     let everything: Vec<DialogView> = if folders.any() {
         let mut all = store.dialogs(0, ALL_DIALOGS)?;
@@ -1433,11 +1491,7 @@ const ARCHIVE_SCAN: usize = 1000;
 /// last of them left out when only one more would follow ("and 2 more chats").
 fn archive_info(store: &Storage) -> anyhow::Result<Option<ArchiveInfo>> {
     let mut list = store.dialogs(tdr_data::ARCHIVE_FOLDER, ARCHIVE_SCAN)?;
-    list.retain(|d| {
-        !d.peer
-            .as_ref()
-            .is_some_and(|p| describe::peer_info(p).migrated)
-    });
+    list.retain(in_chat_list);
     if list.is_empty() {
         return Ok(None);
     }
@@ -1754,6 +1808,12 @@ async fn run(
                         }
                     }
                     Command::CloseArchive => folders.archive_open = false,
+                    Command::SetPhoneHidden(hidden) => {
+                        if let Err(e) = sync.set_phone_hidden(hidden) {
+                            error!("phone setting: {e}");
+                        }
+                        send_me(sync.store(), &tx);
+                    }
                     Command::ArchiveInMenu(in_menu) => {
                         if let Err(e) = sync.set_archive_in_menu(in_menu) {
                             error!("archive setting: {e}");
@@ -1811,15 +1871,8 @@ async fn run(
                             error!("user: {e}");
                         }
                         send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
-                        // Supergroups and channels: the member count is in the full info.
-                        match sync.member_count(peer).await {
-                            Ok(Some(n)) => {
-                                let text = members_text(sync.store(), peer, n);
-                                let _ = tx.send(Update::Members { peer, text });
-                            }
-                            Ok(None) => {}
-                            Err(e) => error!("full info: {e}"),
-                        }
+                        // Supergroups and channels: the full info (members, gifts).
+                        load_full(&mut sync, peer, shown_dialogs, &mut folders, &tx).await?;
                     }
                     Command::Read { peer, max_id } => match sync.read_history(peer, max_id).await {
                         Ok(_) => send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?,
@@ -1943,6 +1996,13 @@ async fn run(
                         if let Some(item) = chat_info(sync.store(), peer) {
                             let _ = tx.send(Update::ChatInfo(Box::new(item)));
                         }
+                        // A chat never seen (a channel opened by its link): its row
+                        // first, since its loaded history is read through it.
+                        if !sync.store().has_dialog(peer)?
+                            && let Err(e) = sync.request_dialog_entry(peer).await
+                        {
+                            error!("dialog entry: {e}");
+                        }
                         // In the cached history: shown from the newest down to it.
                         let cached_from = match msg_id {
                             Some(id) => sync.store().count_from(peer, id)?,
@@ -1996,14 +2056,8 @@ async fn run(
                             error!("user: {e}");
                         }
                         send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
-                        match sync.member_count(peer).await {
-                            Ok(Some(n)) => {
-                                let text = members_text(sync.store(), peer, n);
-                                let _ = tx.send(Update::Members { peer, text });
-                            }
-                            Ok(None) => {}
-                            Err(e) => error!("full info: {e}"),
-                        }
+                        // Supergroups and channels: the full info (members, gifts).
+                        load_full(&mut sync, peer, shown_dialogs, &mut folders, &tx).await?;
                     }
                     Command::OpenUsername { username, post } => {
                         match sync.resolve_username(&username).await {
@@ -2353,7 +2407,10 @@ pub fn start_demo(
                 lastseen: (i == 0).then_some(describe::Lastseen::Online { until: i32::MAX }),
                 // The channel can't be posted to: "Mute" / "Unmute" with both buttons.
                 compose: if *kind == ChatKind::Channel {
-                    Compose::MuteUnmute { direct: true }
+                    Compose::MuteUnmute {
+                        direct: true,
+                        gift: true,
+                    }
                 } else {
                     Compose::Field
                 },
@@ -2496,7 +2553,7 @@ pub fn start_demo(
     }
     // The demo account's own user and counters.
     let names = ["Alex Morgan", "Jamie Lee", "Sam Taylor"];
-    let me = MeInfo {
+    let mut me = MeInfo {
         peer: PeerKey::user(103 + account as i64),
         name: names[account % names.len()].into(),
         initials: initials(names[account % names.len()]),
@@ -2507,6 +2564,7 @@ pub fn start_demo(
             ["+1 555 010 0001", "+44 7700 900123", "+49 151 2345 6789"][account % 3].into(),
         ),
         username: (account != 1).then(|| ["alex_morgan", "", "sam_taylor"][account % 3].into()),
+        phone_hidden: false,
     };
     let state = match account {
         0 => AccountState {
@@ -2705,6 +2763,11 @@ pub fn start_demo(
                     continue;
                 }
                 Command::CloseArchive => continue,
+                Command::SetPhoneHidden(hidden) => {
+                    me.phone_hidden = hidden;
+                    let _ = up_tx.send(Update::Me(me.clone()));
+                    continue;
+                }
                 Command::ArchiveInMenu(in_menu) => {
                     archive_in_menu = in_menu;
                     let _ = up_tx.send(Update::Archive(Some(demo_archive_row(

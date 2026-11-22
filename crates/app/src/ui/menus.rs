@@ -74,25 +74,47 @@ impl CodeHint {
 }
 
 impl MainView {
-    /// A selectable label's menu (`FlatLabel::fillContextMenu`): the selection, then
-    /// its whole text.
+    /// A selectable label's menu in Settings' cover. The name (`FlatLabel` with
+    /// `setContextCopyText`, a menu without icons): "Copy Selected Text" with a
+    /// selection, else "Copy Name". The phone (`popupMenuWithIcons` and its hook):
+    /// the selection or "Copy Phone Number", then "Hide with Spoiler", checked
+    /// while the number is hidden (`AddPhoneSpoilerMenu`).
     pub(super) fn open_label_menu(
         &mut self,
         at: Point<Pixels>,
         selected: bool,
-        copy: &str,
+        label: super::settings::CoverLabel,
         text: String,
     ) {
-        let mut entries = Vec::new();
-        if selected {
-            entries.push(Entry::item(
-                "Copy Selected Text",
-                None,
-                true,
-                MenuAction::CopySelected,
-            ));
-        }
-        entries.push(Entry::item(copy, None, true, MenuAction::Copy(text, None)));
+        use super::settings::CoverLabel;
+        let entries = match label {
+            CoverLabel::Name => vec![if selected {
+                Entry::item("Copy Selected Text", None, true, MenuAction::CopySelected)
+            } else {
+                Entry::item("Copy Name", None, true, MenuAction::Copy(text, None))
+            }],
+            CoverLabel::Phone { hidden } => {
+                // `CopyPhoneToClipboard`: the digits without spaces and dashes.
+                let digits: String = text.chars().filter(|c| *c != ' ' && *c != '-').collect();
+                vec![
+                    if selected {
+                        Entry::text_action("Copy Selected Text", MenuAction::CopySelected)
+                    } else {
+                        Entry::action(
+                            "Copy Phone Number",
+                            Icon::MenuCopy,
+                            MenuAction::Copy(digits, None),
+                        )
+                    },
+                    Entry::checked(
+                        "Hide with Spoiler",
+                        Icon::MenuSpoiler,
+                        MenuAction::TogglePhoneSpoiler,
+                        hidden,
+                    ),
+                ]
+            }
+        };
         self.open_menu(entries, at, MenuTag::Other);
     }
 
@@ -553,6 +575,15 @@ impl MainView {
             MenuAction::OpenUrl(url) => cx.open_url(&url),
             MenuAction::AddAccount => self.add_account_clicked(window, cx),
             MenuAction::ArchiveInMenu(in_menu) => self.set_archive_in_menu(in_menu),
+            MenuAction::TogglePhoneSpoiler => {
+                let hidden = self
+                    .accounts
+                    .read(cx)
+                    .active()
+                    .and_then(|s| s.me.as_ref())
+                    .is_some_and(|m| m.phone_hidden);
+                let _ = self.commands.send(Command::SetPhoneHidden(!hidden));
+            }
             MenuAction::LogOut => {
                 let id = self.accounts.read(cx).registry.active;
                 self.layers.show_layer(super::layers::LayerBox::LogOut(id));

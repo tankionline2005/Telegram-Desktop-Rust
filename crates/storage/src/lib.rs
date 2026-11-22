@@ -24,7 +24,7 @@ pub use rusqlite::Error;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Schema version (`PRAGMA user_version`); bump with a migration in [`migrate`].
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 9;
 
 /// Message ids above this are made by the client (tdesktop's `ServerMaxMsgId`), e.g.
 /// service notifications that the server sends as updates rather than messages.
@@ -233,6 +233,18 @@ fn migrate(conn: &mut Connection) -> Result<()> {
              ALTER TABLE dialogs ADD COLUMN unread_mark INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
+    if version < 9 {
+        // The full info of groups and channels (`channelFull`): the TL blob.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS peer_full (
+                kind      INTEGER NOT NULL,
+                id        INTEGER NOT NULL,
+                raw_layer INTEGER NOT NULL,
+                raw       BLOB NOT NULL,
+                PRIMARY KEY (kind, id)
+             ) WITHOUT ROWID;",
+        )?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()
 }
@@ -393,6 +405,16 @@ impl Storage {
                  FROM peers WHERE kind = ?1 AND id = ?2",
             )?
             .query_row(params![key.kind as i64, key.id], read_peer)
+            .optional()
+    }
+
+    /// The full info of a group or channel (`*.getFullChannel`): the TL blob.
+    pub fn peer_full(&self, key: PeerKey) -> Result<Option<(i32, Vec<u8>)>> {
+        self.conn
+            .prepare_cached("SELECT raw_layer, raw FROM peer_full WHERE kind = ?1 AND id = ?2")?
+            .query_row(params![key.kind as i64, key.id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .optional()
     }
 
@@ -680,6 +702,19 @@ impl Writer<'_> {
 
     /// Inserts or updates a peer. A "min" row never replaces a full one; a full row
     /// keeps a known access hash if the new object lacks one.
+    /// Stores the full info of a group or channel.
+    pub fn put_peer_full(&self, key: PeerKey, (layer, raw): &(i32, Vec<u8>)) -> Result<()> {
+        self.tx
+            .prepare_cached(
+                "INSERT INTO peer_full (kind, id, raw_layer, raw) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (kind, id) DO UPDATE SET
+                    raw_layer = excluded.raw_layer,
+                    raw       = excluded.raw",
+            )?
+            .execute(params![key.kind as i64, key.id, layer, raw])?;
+        Ok(())
+    }
+
     pub fn put_peer(&self, p: &PeerRow) -> Result<()> {
         let (layer, data) = match &p.raw {
             Some((l, d)) => (Some(*l), Some(d.as_slice())),
@@ -1349,6 +1384,48 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1, "the channel message with the same id survives");
+    }
+
+    /// A chat without a row (a channel opened by its link): its first page makes
+    /// the row from the newest message and hangs the segment on it.
+    #[test]
+    fn first_page_of_an_unknown_chat_is_shown() {
+        let mut s = Storage::open_in_memory().unwrap();
+        let c = PeerKey::channel(7);
+        let page = [
+            msg(c, 30, 30, false, "c"),
+            msg(c, 20, 20, false, "b"),
+            msg(c, 10, 10, false, "a"),
+        ];
+        // Without a row the messages are stored but no history is shown.
+        s.write(|w| w.extend_history(c, 0, false, &page)).unwrap();
+        assert!(s.history(c, 10).unwrap().messages.is_empty());
+        s.write(|w| {
+            w.put_dialog(&DialogRow {
+                peer: c,
+                top_message: 30,
+                top_date: 30,
+                pinned: false,
+                folder_id: 0,
+                unread_count: 0,
+                pts: None,
+                read_inbox_max_id: 30,
+                read_outbox_max_id: 0,
+                mute_until: None,
+                unread_mentions: 0,
+                unread_mark: false,
+            })?;
+            w.extend_history(c, 30, false, &page)
+        })
+        .unwrap();
+        let ids: Vec<i32> = s
+            .history(c, 10)
+            .unwrap()
+            .messages
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec![30, 20, 10]);
     }
 
     #[test]

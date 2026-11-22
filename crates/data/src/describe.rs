@@ -611,6 +611,62 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
     }
 }
 
+/// What the full info of a group or channel says (`channelFull`), as far as the
+/// window uses it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FullInfo {
+    pub members: Option<i32>,
+    /// `stargiftsAvailable`: the gift button under a channel.
+    pub stargifts: bool,
+    /// `paid_messages_available`.
+    pub paid_messages: bool,
+    /// The discussion group of a channel (or the channel of a group).
+    pub linked_chat: Option<i64>,
+    pub pinned_msg_id: Option<i32>,
+    pub online: Option<i32>,
+}
+
+/// The cached full info (`Storage::peer_full`).
+pub fn full_info(raw: &Option<(i32, Vec<u8>)>) -> Option<FullInfo> {
+    match parse::<enums::ChatFull>(raw)? {
+        enums::ChatFull::ChannelFull(c) => Some(FullInfo {
+            members: c.participants_count,
+            stargifts: c.stargifts_available,
+            paid_messages: c.paid_messages_available,
+            linked_chat: c.linked_chat_id,
+            pinned_msg_id: c.pinned_msg_id,
+            online: c.online_count,
+        }),
+        enums::ChatFull::ChatFull(c) => Some(FullInfo {
+            pinned_msg_id: c.pinned_msg_id,
+            ..Default::default()
+        }),
+        enums::ChatFull::CommunityFull(_) => Some(FullInfo::default()),
+    }
+}
+
+/// The peer's username from its cached object (rows cached before usernames lists
+/// were read keep only the plain `username` in their column).
+pub fn username(row: &PeerRow) -> Option<String> {
+    use tdr_storage::PeerKind as K;
+    match row.key.kind {
+        K::User => match parse::<enums::User>(&row.raw) {
+            Some(enums::User::User(u)) => {
+                crate::convert::primary_username(u.username.as_ref(), u.usernames.as_deref())
+            }
+            _ => None,
+        },
+        K::Channel => match parse::<enums::Chat>(&row.raw) {
+            Some(enums::Chat::Channel(c)) => {
+                crate::convert::primary_username(c.username.as_ref(), c.usernames.as_deref())
+            }
+            _ => None,
+        },
+        K::Chat => None,
+    }
+    .or_else(|| row.username.clone().filter(|u| !u.is_empty()))
+}
+
 fn chat_photo(p: &enums::ChatPhoto) -> Option<(i64, i32)> {
     match p {
         enums::ChatPhoto::ChatPhoto(p) => Some((p.photo_id, p.dc_id)),

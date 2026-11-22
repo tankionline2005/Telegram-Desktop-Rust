@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use gpui::{AppContext, Context, Entity, Focusable, IntoElement, Render, Window};
+use gpui::{AppContext, Context, Entity, Focusable, IntoElement, Render, Subscription, Window};
 
 use crate::accounts::{Accounts, Activated};
 use crate::bridge::Command;
@@ -13,6 +13,7 @@ pub struct Root {
     accounts: Entity<Accounts>,
     view: Entity<MainView>,
     columns_path: PathBuf,
+    _focus_lost: Subscription,
 }
 
 impl Root {
@@ -37,10 +38,18 @@ impl Root {
             this.rebuild(window, cx);
         })
         .detach();
+        // The focused element went away (a chat opened from a link, a menu closed):
+        // keys would reach only the window's root, past the view's Esc and other
+        // window-wide actions. The view takes the focus back, as tdesktop's window
+        // always handles Esc.
+        let focus_lost = cx.on_focus_lost(window, |this, window, cx| {
+            window.focus(&this.view.focus_handle(cx));
+        });
         Self {
             accounts,
             view,
             columns_path,
+            _focus_lost: focus_lost,
         }
     }
 

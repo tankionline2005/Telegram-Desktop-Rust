@@ -398,13 +398,14 @@ impl MainView {
         .max(lg(40.));
         let place =
             |top: f32, el: AnyElement| div().absolute().left(px(NAME_LEFT)).top(px(top)).child(el);
+        let phone_hidden = me.as_ref().is_some_and(|m| m.phone_hidden);
         let name_el = own.map(|peer| {
             self.selectable_label(
                 (peer, LABEL_NAME),
                 &name,
                 (TITLE_FONT, true, p.window_bold_fg),
                 width,
-                "Copy Name",
+                CoverLabel::Name,
                 window,
                 cx,
             )
@@ -415,7 +416,9 @@ impl MainView {
                 &phone,
                 (13., false, p.window_fg),
                 width,
-                "Copy Phone Number",
+                CoverLabel::Phone {
+                    hidden: phone_hidden,
+                },
                 window,
                 cx,
             )
@@ -464,20 +467,26 @@ impl MainView {
         text: &str,
         (size, semibold, fg): (f32, bool, tdr_theme::Color),
         width: f32,
-        copy: &'static str,
+        label: CoverLabel,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::rich_text::{Kind, TextColors, TextEntity};
         let p = self.palette();
-        let entities = if semibold && !text.is_empty() {
-            vec![TextEntity {
+        let mut entities = Vec::new();
+        if semibold && !text.is_empty() {
+            entities.push(TextEntity {
                 range: 0..text.len(),
                 kind: Kind::Bold,
-            }]
-        } else {
-            Vec::new()
-        };
+            });
+        }
+        // `updatePhoneText`: the hidden number is one spoiler (a click shows it).
+        if label == (CoverLabel::Phone { hidden: true }) && !text.is_empty() {
+            entities.push(TextEntity {
+                range: 0..text.len(),
+                kind: Kind::Spoiler,
+            });
+        }
         let measured = self.rich_measured_sized(key, text, &entities, size, window);
         let layout = self.rich_layout(key, &measured, width, (0., 0.));
         let (state, dragging) = self.text_state(key);
@@ -511,7 +520,7 @@ impl MainView {
                 let _ = view.update(cx, |this, cx| match event {
                     crate::rich_text::TextEvent::Context { position, .. } => {
                         let selected = this.text_ui_selection_key().is_some_and(|k| k == key);
-                        this.open_label_menu(position, selected, copy, full);
+                        this.open_label_menu(position, selected, label, full);
                         cx.notify();
                     }
                     event => this.on_text_event(key, &handler_layout, event, window, cx),
@@ -1256,6 +1265,13 @@ impl MainView {
         }
         row.child(custom)
     }
+}
+
+/// Which label of the cover a menu is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CoverLabel {
+    Name,
+    Phone { hidden: bool },
 }
 
 /// Keys of the cover's selectable labels (message ids are positive).

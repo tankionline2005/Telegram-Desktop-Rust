@@ -2095,3 +2095,48 @@ sha256 = "01366da7015c474bbea78481d555ea6400e75636bff247e534c9b2654224bf47"
 path = "assets/tdesktop-icons/menu__search@3x.png"
 upstream = "Telegram/Resources/icons/menu/search@3x.png"
 sha256 = "168eb4bfbd707558ead210d0c551dc672463872497dd634cf44f1c5b326fd6c2"
+
+[[vendored]]
+path = "assets/tdesktop-icons/proxy_off.png"
+upstream = "Telegram/Resources/icons/proxy_off.png"
+sha256 = "1cc3ccbf75a0aaa4fdd2b24568324c2f767fe52e415bc1c83a907fc4d47d79a5"
+
+[[vendored]]
+path = "assets/tdesktop-icons/proxy_off@2x.png"
+upstream = "Telegram/Resources/icons/proxy_off@2x.png"
+sha256 = "fea9bde3c363f0927c0aa460ed6e8fcf30abd5ca6fc8ca413e45d792cf2a0aff"
+
+[[vendored]]
+path = "assets/tdesktop-icons/proxy_off@3x.png"
+upstream = "Telegram/Resources/icons/proxy_off@3x.png"
+sha256 = "e4c162b0b683891c6dc8713c7a5e70506abe1e6ba28b8119733cb86325f24f2e"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__spoiler_on.png"
+upstream = "Telegram/Resources/icons/menu/spoiler_on.png"
+sha256 = "def9e9c6021bfee0bf8ef298409e3a4a127ddf520b1e021b4ac9814212ffb909"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__spoiler_on@2x.png"
+upstream = "Telegram/Resources/icons/menu/spoiler_on@2x.png"
+sha256 = "c07b3b12268946d9ac17c760b96ba5742cc430f4ca06ba1ef0e632bd633cc9ba"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__spoiler_on@3x.png"
+upstream = "Telegram/Resources/icons/menu/spoiler_on@3x.png"
+sha256 = "bab72327f1abac9f3c4b1048e78f022517bb0929a126cd2b9e0f90eba66ebc86"
+
+[[vendored]]
+path = "assets/tdesktop-icons/player__player_check.png"
+upstream = "Telegram/Resources/icons/player/player_check.png"
+sha256 = "f3ad0e8dc04a96ccaf8beee8fe891d4ffb7b78fe6216f481d4dcd2c05168cd28"
+
+[[vendored]]
+path = "assets/tdesktop-icons/player__player_check@2x.png"
+upstream = "Telegram/Resources/icons/player/player_check@2x.png"
+sha256 = "226f5336c64fdbec1d170436e2285e48f86a5d0f6134d023b5753aa635eee58f"
+
+[[vendored]]
+path = "assets/tdesktop-icons/player__player_check@3x.png"
+upstream = "Telegram/Resources/icons/player/player_check@3x.png"
+sha256 = "9f0d2f5ef36ca3fd578d240122c38d3e74c7aefbcab667cbf8ef1b6bda629013"

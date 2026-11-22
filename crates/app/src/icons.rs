@@ -40,6 +40,12 @@ pub enum Icon {
     MenuChatDiscuss,
     /// The archive's userpic (`dialogsArchiveUserpic`) and its menus' icons.
     ArchiveUserpic,
+    /// The shield at the right of "Connecting..." (`connectingProxyOff`).
+    ProxyOff,
+    /// A checked menu item's check (`mediaPlayerMenuCheck`) and the phone's
+    /// "Hide with Spoiler" (`menuIconSpoiler`).
+    PlayerCheck,
+    MenuSpoiler,
     MenuArchiveOpen,
     MenuNewWindow,
     MenuCollapse,
@@ -311,6 +317,9 @@ impl Icon {
             Icon::HistoryCommentsOpen => icon_bytes!("history_comments_open"),
             Icon::MenuChatDiscuss => icon_bytes!("menu__chat_discuss"),
             Icon::ArchiveUserpic => icon_bytes!("archive_userpic"),
+            Icon::ProxyOff => icon_bytes!("proxy_off"),
+            Icon::PlayerCheck => icon_bytes!("player__player_check"),
+            Icon::MenuSpoiler => icon_bytes!("menu__spoiler_on"),
             Icon::Back => icon_bytes!("info__info_back"),
             Icon::SlideShadow => icon_bytes!("slide_shadow"),
             Icon::MiniQuote => icon_bytes!("chat__mini_quote"),
