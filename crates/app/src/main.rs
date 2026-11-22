@@ -14,6 +14,7 @@ mod icons;
 mod instance;
 mod intro;
 mod lottie;
+mod markdown;
 mod one_line;
 mod placement;
 mod popup_menu;

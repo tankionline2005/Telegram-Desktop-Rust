@@ -128,6 +128,8 @@ fn caret_blink_time() -> Option<std::time::Duration> {
 pub struct Submit {
     pub text: String,
     pub tags: Vec<TagSpan>,
+    /// Languages of the code blocks the markdown made (```` ```rust ````).
+    pub languages: Vec<(Range<usize>, String)>,
 }
 
 /// The right button in the field: its menu at this window point.
@@ -618,7 +620,8 @@ impl TextInput {
     }
 
     /// `InputField::toggleSelectionMarkdown`: the format is removed where the whole
-    /// selection has it, added otherwise. Code over whole lines is a code block.
+    /// selection has it, added otherwise. Code over several whole lines is a code
+    /// block.
     pub fn toggle(&mut self, tag: Tag, cx: &mut Context<Self>) {
         let mut r = self.format_range();
         if r.is_empty() {
@@ -626,7 +629,9 @@ impl TextInput {
         }
         let whole_lines = (r.start == 0 || self.content[..r.start].ends_with('\n'))
             && (r.end == self.content.len() || self.content[r.end..].starts_with('\n'));
-        let tag = if tag == Tag::Code && whole_lines {
+        // `ChooseCodeTagForRange`: a block only over several whole lines.
+        let single_line = !self.content[r.clone()].contains('\n');
+        let tag = if tag == Tag::Code && whole_lines && !single_line {
             Tag::Pre
         } else {
             tag
@@ -681,7 +686,35 @@ impl TextInput {
         }
         tags.retain(|t| !t.range.is_empty());
         self.set_text(String::new(), cx);
-        cx.emit(Submit { text, tags });
+        // `getTextWithAppliedMarkdown`, then `PrepareForSending`'s trim.
+        let applied = crate::markdown::apply(&text, &tags);
+        let lead = applied.text.len() - applied.text.trim_start().len();
+        let text = applied.text.trim().to_string();
+        let fit = |r: &Range<usize>| {
+            r.start.saturating_sub(lead).min(text.len())..r.end.saturating_sub(lead).min(text.len())
+        };
+        let tags: Vec<TagSpan> = applied
+            .tags
+            .iter()
+            .map(|t| TagSpan {
+                range: fit(&t.range),
+                tag: t.tag,
+            })
+            .filter(|t| !t.range.is_empty())
+            .collect();
+        let languages = applied
+            .languages
+            .iter()
+            .map(|(r, l)| (fit(r), l.clone()))
+            .collect();
+        if text.is_empty() {
+            return;
+        }
+        cx.emit(Submit {
+            text,
+            tags,
+            languages,
+        });
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
@@ -1704,6 +1737,31 @@ impl Focusable for TextInput {
 
 /// The field's tags as the API's entities, in UTF-16 offsets
 /// (`ConvertTextTagsToEntities`).
+/// The entities of a sent text, with the code blocks' languages.
+pub fn out_entities_with(
+    text: &str,
+    tags: &[TagSpan],
+    languages: &[(Range<usize>, String)],
+) -> Vec<tdr_data::OutEntity> {
+    let utf16 = |byte: usize| -> i32 {
+        text[..byte.min(text.len())]
+            .chars()
+            .map(char::len_utf16)
+            .sum::<usize>() as i32
+    };
+    let mut out = out_entities(text, tags);
+    for (range, language) in languages {
+        let offset = utf16(range.start);
+        let length = utf16(range.end) - offset;
+        if let Some(e) = out.iter_mut().find(|e| {
+            e.offset == offset && e.length == length && matches!(e.kind, tdr_data::OutKind::Pre(_))
+        }) {
+            e.kind = tdr_data::OutKind::Pre(language.clone());
+        }
+    }
+    out
+}
+
 pub fn out_entities(text: &str, tags: &[TagSpan]) -> Vec<tdr_data::OutEntity> {
     use tdr_data::OutKind;
     let utf16 = |byte: usize| -> i32 {

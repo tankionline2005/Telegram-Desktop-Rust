@@ -163,3 +163,8 @@
   whose history it is. Forums open their topics list (`MainView::forum`) beside the
   chat list narrowed to userpics. Demo: Telegram Tips has comments, Design Team is a
   forum.
+- Markdown typed by hand is applied on send by `markdown.rs` (tdesktop's
+  `getTextWithAppliedMarkdown`), called from `text_input`'s `enter`; the field keeps
+  the raw text. Animated switches: forum open/close (`MainView::forum_hiding`,
+  `forum_shown`), folder tabs (`FolderSlide`, `folder_slide_view`), main menu
+  accounts (`menu_accounts_toggled`).

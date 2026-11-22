@@ -421,6 +421,20 @@ pub(crate) struct IntroSlide {
 
 /// One column: the chat coming over the chat list, or going back
 /// (`Window::SlideAnimation`, as `MainWidget` shows a chat in one column).
+/// The chat list changing folders from the tabs (`startChatsFilterSlide`,
+/// `Ui::SlideAnimation`): the old list's rows as they were shown.
+struct FolderSlide {
+    start: Instant,
+    old: Vec<DialogItem>,
+    old_skip: usize,
+    old_offset: f32,
+    /// The new folder stands left of the old one: the lists move right.
+    left: bool,
+}
+
+/// `dialogsFilterSlideDuration`.
+const FOLDER_SLIDE_DURATION: f32 = 200.;
+
 #[derive(Clone, Copy)]
 struct ColumnSlide {
     start: Instant,
@@ -821,6 +835,9 @@ pub struct MainView {
     /// tab chosen before the switch happens, the bar's range at the last frame.
     tabs_anim: Option<(Instant, f32, f32)>,
     tabs_chosen: Option<i32>,
+    folder_slide: Option<FolderSlide>,
+    /// When the main menu's accounts were last shown or hidden.
+    menu_accounts_toggled: Option<Instant>,
     tabs_bar: std::cell::Cell<(f32, f32)>,
     /// The caption button under the mouse.
     title_hovered: Option<&'static str>,
@@ -843,6 +860,8 @@ pub struct MainView {
     thread: Option<threads::ThreadView>,
     /// An open forum: its topics beside the narrowed chat list.
     forum: Option<threads::ForumView>,
+    /// A closed forum's topics sliding out, and how far they were shown.
+    forum_hiding: Option<(threads::ForumView, Instant, f32)>,
     /// The message each chat's field replies to (`FullReplyTo` of the draft).
     reply_to: HashMap<PeerKey, ReplyDraft>,
     /// The login screens sliding in over the account or out under it, with the
@@ -894,45 +913,55 @@ impl MainView {
             this.open_field_menu(*at, cx);
         })
         .detach();
-        cx.subscribe(&input, |this: &mut Self, _, Submit { text, tags }, cx| {
-            if let Some(peer) = this.selected {
-                // Sending clears the draft (the data thread clears the stored one).
-                this.drafts.insert(peer, None);
-                this.draft_tags.remove(&peer);
-                this.input_text.clear();
-                this.draft_dirty_since = None;
-                this.draft_generation += 1;
-                this.stick_to_bottom = true;
-                // tdesktop drops the bar once you write.
-                this.unread_bar = None;
-                // Sending shows the end of the history (`HistoryWidget::send` scrolls
-                // to the bottom), so the new message is in view when it comes.
-                this.messages_state.scroll_to(ListOffset {
-                    item_ix: this.messages.len(),
-                    offset_in_item: px(0.),
-                });
-                // In a thread every message replies to its root, or under it.
-                let root = this.thread.as_ref().and_then(|t| t.root);
-                let reply_to = match (this.reply_to.remove(&peer), root) {
-                    (Some(r), root) => Some(tdr_data::OutReply {
-                        msg_id: r.msg_id,
-                        top_id: root,
-                    }),
-                    (None, Some(root)) => Some(tdr_data::OutReply {
-                        msg_id: root,
-                        top_id: Some(root),
-                    }),
-                    (None, None) => None,
-                };
-                let _ = this.commands.send(Command::Send {
-                    peer,
-                    text: text.clone(),
-                    entities: crate::text_input::out_entities(text, tags),
-                    reply_to,
-                });
-            }
-            cx.notify();
-        })
+        cx.subscribe(
+            &input,
+            |this: &mut Self,
+             _,
+             Submit {
+                 text,
+                 tags,
+                 languages,
+             },
+             cx| {
+                if let Some(peer) = this.selected {
+                    // Sending clears the draft (the data thread clears the stored one).
+                    this.drafts.insert(peer, None);
+                    this.draft_tags.remove(&peer);
+                    this.input_text.clear();
+                    this.draft_dirty_since = None;
+                    this.draft_generation += 1;
+                    this.stick_to_bottom = true;
+                    // tdesktop drops the bar once you write.
+                    this.unread_bar = None;
+                    // Sending shows the end of the history (`HistoryWidget::send` scrolls
+                    // to the bottom), so the new message is in view when it comes.
+                    this.messages_state.scroll_to(ListOffset {
+                        item_ix: this.messages.len(),
+                        offset_in_item: px(0.),
+                    });
+                    // In a thread every message replies to its root, or under it.
+                    let root = this.thread.as_ref().and_then(|t| t.root);
+                    let reply_to = match (this.reply_to.remove(&peer), root) {
+                        (Some(r), root) => Some(tdr_data::OutReply {
+                            msg_id: r.msg_id,
+                            top_id: root,
+                        }),
+                        (None, Some(root)) => Some(tdr_data::OutReply {
+                            msg_id: root,
+                            top_id: Some(root),
+                        }),
+                        (None, None) => None,
+                    };
+                    let _ = this.commands.send(Command::Send {
+                        peer,
+                        text: text.clone(),
+                        entities: crate::text_input::out_entities_with(text, tags, languages),
+                        reply_to,
+                    });
+                }
+                cx.notify();
+            },
+        )
         .detach();
 
         // "last seen 5 minutes ago" moves on with the clock.
@@ -1017,6 +1046,8 @@ impl MainView {
             column_slide: None,
             tabs_anim: None,
             tabs_chosen: None,
+            folder_slide: None,
+            menu_accounts_toggled: None,
             tabs_bar: std::cell::Cell::new((0., 0.)),
             title_hovered: None,
             jump_hovered: None,
@@ -1031,6 +1062,7 @@ impl MainView {
             reply_to: HashMap::new(),
             thread: None,
             forum: None,
+            forum_hiding: None,
             folders: Vec::new(),
             active_folder: 0,
             connection: chrome::Connection::new(),
@@ -1318,8 +1350,11 @@ impl MainView {
     /// The chat list shows userpics only (tdesktop's `narrow` row context; never in
     /// one column).
     fn narrow(&self, window: &Window) -> bool {
-        // An open forum narrows the chat list to userpics beside its topics.
-        self.forum.is_some()
+        // An open forum narrows the chat list to userpics beside its topics (once
+        // they slid in: until then they cover the wide list).
+        self.forum
+            .as_ref()
+            .is_some_and(|f| f.start.elapsed() >= SLIDE_DURATION)
             || (!self.one_column() && self.dialogs_width(window) < COLUMN_MIN_LEFT / 2.)
     }
 
@@ -1361,6 +1396,88 @@ impl MainView {
         let own = chat.unread.max(0) as u32;
         let count = state.unread.saturating_sub(own);
         (count > 0).then_some((count, state.unread_muted))
+    }
+
+    /// The chat list during a folder change from the tabs: `Ui::SlideAnimation`'s
+    /// frame, the arriving list moving with `easeOutCirc` and appearing with
+    /// `easeInCirc`, the departing one the other way round.
+    fn folder_slide_view(
+        &mut self,
+        live: AnyElement,
+        width: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(slide) = self.folder_slide.take() else {
+            return live;
+        };
+        let t = slide.start.elapsed().as_secs_f32() * 1000. / FOLDER_SLIDE_DURATION;
+        if t >= 1. {
+            return live;
+        }
+        window.request_animation_frame();
+        let p = self.palette();
+        let (out, inn) = (crate::anim::ease_out_circ(t), crate::anim::ease_in_circ(t));
+        let (new_x, old_x) = if slide.left {
+            (-width * (1. - out), width * inn)
+        } else {
+            (width * (1. - out), -width * inn)
+        };
+        let row = lg(DIALOG_ROW_HEIGHT);
+        let height = f32::from(window.viewport_size().height);
+        let first = (slide.old_offset / row).floor().max(0.) as usize;
+        let mut rows = Vec::new();
+        let mut i = first;
+        loop {
+            let top = i as f32 * row - slide.old_offset;
+            if top >= height {
+                break;
+            }
+            let element = if i < slide.old_skip {
+                self.render_archive_row(window, cx)
+            } else if let Some(item) = slide.old.get(i - slide.old_skip) {
+                self.render_dialog(item, false, window, cx)
+            } else {
+                break;
+            };
+            rows.push(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(gpui::px(top))
+                    .w_full()
+                    .h(px(DIALOG_ROW_HEIGHT))
+                    .child(element),
+            );
+            i += 1;
+        }
+        self.folder_slide = Some(slide);
+        div()
+            .relative()
+            .size_full()
+            .overflow_hidden()
+            .bg(c(p.dialogs_bg))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(gpui::px(old_x))
+                    .w(gpui::px(width))
+                    .h_full()
+                    .opacity(1. - out)
+                    .children(rows),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(gpui::px(new_x))
+                    .w(gpui::px(width))
+                    .h_full()
+                    .opacity(inn)
+                    .child(live),
+            )
+            .into_any_element()
     }
 
     /// The list under, the chat over it sliding in from the right or out
@@ -4668,7 +4785,7 @@ impl Render for MainView {
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.row_press = None),
             )
-            .child(dialogs)
+            .child(self.folder_slide_view(dialogs.into_any_element(), dialogs_width, window, cx))
             .children(floating_row)
             .children(self.render_scrollbar(Area::Dialogs, cx))
             .children(to_up)
@@ -4680,7 +4797,14 @@ impl Render for MainView {
         } else {
             self.render_folder_tabs(window, cx)
         };
-        let forum_open = self.forum.is_some();
+        let forum_shown = self.forum_shown();
+        let forum_view = self
+            .forum
+            .clone()
+            .or_else(|| self.forum_hiding.as_ref().map(|h| h.0.clone()));
+        // Settled: the narrowed list and the topics side by side; else the topics
+        // slide over the wide list.
+        let forum_open = self.forum.is_some() && forum_shown >= 1.;
         let top_bar = if forum_open {
             self.render_forum_strip_header(window, cx)
         } else if self.archive_open {
@@ -4698,11 +4822,40 @@ impl Render for MainView {
             .child(top_bar)
             .children(tabs.filter(|_| !forum_open))
             .child(dialogs_area);
-        let live_list = if forum_open {
-            let topics = self.render_topics_column((dialogs_width - strip).max(0.), window, cx);
-            div().size_full().flex().child(live_list).child(topics)
-        } else {
-            live_list
+        let topics_width = (dialogs_width - strip).max(0.);
+        let live_list = match forum_view {
+            Some(forum) if forum_open => {
+                let topics = self.render_topics_column(&forum, 1., topics_width, window, cx);
+                div().size_full().flex().child(live_list).child(topics)
+            }
+            Some(forum) => {
+                let topics =
+                    self.render_topics_column(&forum, forum_shown, topics_width, window, cx);
+                let strip_header = self.render_forum_strip_header(window, cx);
+                div()
+                    .relative()
+                    .size_full()
+                    .child(live_list)
+                    // The narrow top (back arrow) fades in over the wide one.
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w(gpui::px(strip))
+                            .opacity(forum_shown)
+                            .child(strip_header),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left(gpui::px(strip))
+                            .h_full()
+                            .child(topics),
+                    )
+            }
+            None => live_list,
         };
         let list_content = self.archive_slide_view(live_list, dialogs_width, narrow, window, cx);
         let left = div()

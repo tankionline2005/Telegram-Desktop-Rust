@@ -970,21 +970,58 @@ impl MainView {
             return;
         }
         let (left, width) = self.tabs_bar.get();
+        // `DiscreteSlider::setActiveSection`: the folder is activated at once
+        // (`activateCallback`), unless the bar's previous move still runs; then the
+        // bar starts moving.
+        let wait = self
+            .tabs_anim
+            .map(|(start, ..)| TABS_DURATION - start.elapsed().as_secs_f32() * 1000.)
+            .filter(|wait| *wait > 0.);
         self.tabs_anim = Some((Instant::now(), left, width));
-        self.tabs_chosen = Some(id);
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(TABS_DURATION as u64))
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if this.tabs_chosen == Some(id) {
-                    this.tabs_chosen = None;
-                    this.select_folder(id, cx);
-                }
-            });
-        })
-        .detach();
+        match wait {
+            None => {
+                self.tabs_chosen = None;
+                self.switch_folder_sliding(id, cx);
+            }
+            Some(wait) => {
+                self.tabs_chosen = Some(id);
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(wait as u64))
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.tabs_chosen == Some(id) {
+                            this.tabs_chosen = None;
+                            this.switch_folder_sliding(id, cx);
+                        }
+                    });
+                })
+                .detach();
+            }
+        }
         cx.notify();
+    }
+
+    /// `Widget::switchToChatsFilter` from the tabs: the old list slides out to one
+    /// side and the new one in from the other (`startChatsFilterSlide`).
+    fn switch_folder_sliding(&mut self, id: i32, cx: &mut Context<Self>) {
+        let was = self.active_folder;
+        let old = self.dialogs.clone();
+        let old_skip = self.list_skip();
+        let (_, _, old_offset) = self.scroll_metrics(super::Area::Dialogs);
+        let archive = self.archive_open;
+        self.select_folder(id, cx);
+        if archive || self.active_folder == was {
+            return;
+        }
+        let index = |f: i32| self.folders.iter().position(|x| x.id == f);
+        self.folder_slide = Some(super::FolderSlide {
+            start: Instant::now(),
+            old,
+            old_skip,
+            old_offset,
+            left: index(id) < index(was),
+        });
     }
 
     fn select_folder(&mut self, id: i32, cx: &mut Context<Self>) {

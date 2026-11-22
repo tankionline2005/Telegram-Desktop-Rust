@@ -3634,8 +3634,8 @@ pub fn start_demo(
                     });
                 }
             }
-            // Replies: the last messages answer earlier ones.
-            let n = history.len();
+            // Replies: two of the first messages answer earlier ones.
+            let n = count as usize;
             for (at, to) in [
                 (n.saturating_sub(1), n.saturating_sub(4)),
                 (n.saturating_sub(3), n.saturating_sub(6)),

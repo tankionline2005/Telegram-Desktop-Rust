@@ -59,6 +59,7 @@ pub(super) struct ThreadView {
 }
 
 /// An open forum: its topics beside the narrowed chat list, sliding in.
+#[derive(Clone)]
 pub(super) struct ForumView {
     pub peer: PeerKey,
     pub topics: Option<Vec<TopicItem>>,
@@ -131,6 +132,10 @@ impl MainView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A closing forum's list slides out under the mouse: not clickable.
+        if self.forum.as_ref().is_none_or(|f| f.peer != peer) {
+            return;
+        }
         for pane in std::mem::take(&mut self.back_stack) {
             self.remember(pane);
         }
@@ -188,9 +193,30 @@ impl MainView {
         cx.notify();
     }
 
+    /// `closeChildList`: the topics slide out to the right from where they are
+    /// (`_childListShown = (1 - progress) * shown`).
     pub(super) fn close_forum(&mut self, cx: &mut Context<Self>) {
-        self.forum = None;
+        if let Some(forum) = self.forum.take() {
+            let shown = forum_open_progress(&forum);
+            self.forum_hiding = Some((forum, Instant::now(), shown));
+        }
         cx.notify();
+    }
+
+    /// `_childListShown`: 1 for an open forum once its slide ended, going down to 0
+    /// while a closed one slides out (then forgotten).
+    pub(super) fn forum_shown(&mut self) -> f32 {
+        if let Some(forum) = &self.forum {
+            return forum_open_progress(forum);
+        }
+        if let Some((_, start, shown)) = &self.forum_hiding {
+            let t = start.elapsed().as_secs_f32() / super::SLIDE_DURATION.as_secs_f32();
+            if t < 1. {
+                return (1. - ease_out_circ(t)) * shown;
+            }
+            self.forum_hiding = None;
+        }
+        0.
     }
 
     /// The narrowed chat list's top: the back arrow closing the forum, with the
@@ -237,22 +263,23 @@ impl MainView {
 
     /// The forum's column: its top bar (back, title, members) and its topics,
     /// sliding in from the right (`_childListShown`).
+    /// While it slides (`shown` < 1) the chat list under it darkens and the
+    /// column casts the slide's shadow (`Window::SlideAnimation`).
     pub(super) fn render_topics_column(
         &mut self,
+        forum: &ForumView,
+        shown: f32,
         width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.palette();
-        let Some(forum) = &self.forum else {
-            return div().into_any_element();
-        };
         let peer = forum.peer;
-        let t = (forum.start.elapsed().as_secs_f32() / super::SLIDE_DURATION.as_secs_f32()).min(1.);
-        if t < 1. {
+        let sliding = shown < 1.;
+        if sliding {
             window.request_animation_frame();
         }
-        let shift = width * (1. - ease_out_circ(t));
+        let shift = width * (1. - shown);
         let chat = self.chat_item(peer).cloned();
         let title = chat.as_ref().map(|c| c.name.clone()).unwrap_or_default();
         let status = self
@@ -319,12 +346,42 @@ impl MainView {
                     .h(gpui::px(lg(1.)))
                     .bg(c(p.shadow_fg)),
             );
+        let opening = self.forum.is_some();
         div()
             .relative()
             .h_full()
             .w(gpui::px(width))
             .flex_none()
             .overflow_hidden()
+            .when(sliding, |d| {
+                d.child(
+                    div()
+                        .id("forum-fade")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .bg(c(p.slide_fade_out_bg))
+                        .opacity(shown)
+                        // The opening list takes the clicks, the closing one doesn't.
+                        .when(opening, |d| d.occlude()),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(gpui::px(
+                            shift - crate::icons::icon_width(Icon::SlideShadow, window),
+                        ))
+                        .h_full()
+                        .opacity(shown)
+                        .child(crate::icons::stretched(
+                            Icon::SlideShadow,
+                            p.slide_fade_out_shadow_fg,
+                            window,
+                        )),
+                )
+            })
             .child(
                 div()
                     .absolute()
@@ -542,4 +599,10 @@ pub(super) fn commenters_width(count: usize) -> f32 {
         return 0.;
     }
     lg(COMMENTS_USERPIC) + (count - 1) as f32 * (lg(COMMENTS_USERPIC) - lg(COMMENTS_USERPIC_SHIFT))
+}
+
+/// The open forum's slide (`Window::SlideAnimation`, `slideDuration`).
+fn forum_open_progress(forum: &ForumView) -> f32 {
+    let t = forum.start.elapsed().as_secs_f32() / super::SLIDE_DURATION.as_secs_f32();
+    if t < 1. { ease_out_circ(t) } else { 1. }
 }

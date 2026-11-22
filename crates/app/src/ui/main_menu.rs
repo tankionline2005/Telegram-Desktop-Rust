@@ -364,12 +364,27 @@ impl MainView {
             .map(|o| self.account_userpic(&o.4, USERPIC_SIZE));
         let can_add = ordered.len() < crate::accounts::PREMIUM_MAX_ACCOUNTS;
         let width = MENU_WIDTH;
+        // `_toggledAnimation` / the accounts' `SlideWrap`: `slideWrapDuration`, linear.
+        let toggled = match self.menu_accounts_toggled {
+            Some(start) if start.elapsed().as_secs_f32() * 1000. < SLIDE_WRAP_DURATION => {
+                window.request_animation_frame();
+                let t = start.elapsed().as_secs_f32() * 1000. / SLIDE_WRAP_DURATION;
+                if shown { t } else { 1. - t }
+            }
+            _ => {
+                if shown {
+                    1.
+                } else {
+                    0.
+                }
+            }
+        };
 
         // ----- The cover -----
         // `ToggleAccountsButton`: the arrow, and while the list is hidden the other
         // accounts' unread count (unless all muted).
-        let badge =
-            (!shown && others > 0 && !others_muted).then(|| self.menu_badge(others, false, window));
+        let badge = (toggled < 1. && others > 0 && !others_muted)
+            .then(|| self.menu_badge(others, false, window));
         let badge_w = badge
             .as_ref()
             .map(|_| {
@@ -387,18 +402,26 @@ impl MainView {
                 0.
             };
         let arrow_color = p.window_sub_text_fg;
-        let up = shown;
         let arrow = canvas(
             |_, _, _| {},
             move |bounds, _, window, _| {
-                // `Ui::ToggleUpDownArrowPath`: a chevron, up while the list is open.
+                // `Ui::ToggleUpDownArrowPath`: a chevron pointing up, turned by
+                // `(progress - 1) * pi` around its center (down while the list is
+                // hidden).
                 use gpui::{PathStyle, StrokeOptions};
                 let (x, y) = (
                     f32::from(bounds.right()) - scale::lg(TOGGLE_POSITION),
                     f32::from(bounds.bottom()) - scale::lg(TOGGLE_POSITION),
                 );
                 let s = scale::lg(TOGGLE_SIZE);
-                let dy = if up { -s / 2. } else { s / 2. };
+                let alpha = (toggled - 1.) * std::f32::consts::PI;
+                let (sin, cos) = alpha.sin_cos();
+                let turn = |px: f32, py: f32| {
+                    point(
+                        gpui::px(x + px * cos - py * sin),
+                        gpui::px(y + py * cos + px * sin),
+                    )
+                };
                 let width = scale::lg(1.5);
                 let mut path = PathBuilder::stroke(gpui::px(width)).with_style(PathStyle::Stroke(
                     StrokeOptions::default()
@@ -406,9 +429,9 @@ impl MainView {
                         .with_line_cap(lyon::tessellation::LineCap::Round)
                         .with_line_join(lyon::tessellation::LineJoin::Round),
                 ));
-                path.move_to(point(gpui::px(x - s), gpui::px(y - dy)));
-                path.line_to(point(gpui::px(x), gpui::px(y + dy)));
-                path.line_to(point(gpui::px(x + s), gpui::px(y - dy)));
+                path.move_to(turn(-s, s / 2.));
+                path.line_to(turn(0., -s / 2.));
+                path.line_to(turn(s, s / 2.));
                 if let Ok(path) = path.build() {
                     window.paint_path(path, c(arrow_color));
                 }
@@ -428,9 +451,7 @@ impl MainView {
             .w(px(width))
             .h(px(COVER_HEIGHT - NAME_TOP))
             .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.accounts.update(cx, |a, cx| a.toggle_menu_accounts(cx));
-            }));
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_menu_accounts(cx)));
         let cover = div()
             .relative()
             .flex_none()
@@ -445,9 +466,7 @@ impl MainView {
                     .top(px(USERPIC_TOP))
                     .cursor_pointer()
                     .children(active_pic)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.accounts.update(cx, |a, cx| a.toggle_menu_accounts(cx));
-                    })),
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_menu_accounts(cx))),
             )
             .child(
                 div()
@@ -470,6 +489,7 @@ impl MainView {
             )
             .children(badge.map(|b| {
                 div()
+                    .opacity(1. - toggled)
                     .absolute()
                     .left(px(width - TOGGLE_POSITION - TOGGLE_SIZE * 3. - badge_w))
                     .top(px(COVER_HEIGHT - TOGGLE_POSITION - BADGE_SIZE / 2.))
@@ -489,8 +509,10 @@ impl MainView {
         let mut list = div().flex().flex_col();
         let shadow = || div().flex_none().h(px(1.)).bg(c(p.shadow_fg));
         let skip = || div().flex_none().h(px(SKIP));
-        if shown {
-            list = list.child(skip());
+        if toggled > 0. {
+            let mut accounts_list = div().flex().flex_col().flex_none().child(skip());
+            let rows = usize::from(ordered.len() > 1) * ordered.len() + usize::from(can_add);
+            let full_height = 2. * SKIP + rows as f32 * ROW_HEIGHT;
             if ordered.len() > 1 {
                 for (id, name, unread, muted, pic) in &ordered {
                     let (id, unread, muted) = (*id, *unread, *muted);
@@ -526,7 +548,7 @@ impl MainView {
                         .into_any_element();
                     let badge = (!active && unread > 0)
                         .then(|| self.menu_badge(unread, muted, window).into_any_element());
-                    list = list.child(self.menu_row(
+                    accounts_list = accounts_list.child(self.menu_row(
                         format!("menu-account-{id}").into(),
                         userpic,
                         name.clone(),
@@ -549,7 +571,7 @@ impl MainView {
                     .justify_center()
                     .child(icon(Icon::SettingsAdd, p.window_fg_active, window))
                     .into_any_element();
-                list = list.child(self.menu_row(
+                accounts_list = accounts_list.child(self.menu_row(
                     "menu-add-account".into(),
                     plus,
                     "Add Account".into(),
@@ -558,7 +580,18 @@ impl MainView {
                     cx,
                 ));
             }
-            list = list.child(skip()).child(shadow());
+            // The `SlideWrap` opens from the top: its height grows, the rows stay.
+            list = list.child(
+                div()
+                    .flex_none()
+                    .overflow_hidden()
+                    .h(px(full_height * toggled))
+                    .child(accounts_list.child(skip())),
+            );
+            // The shadow's wrap has no animation and follows the toggle at once.
+            if shown {
+                list = list.child(shadow());
+            }
         }
         list = list.child(skip());
         let hovered = |id: &str| {
@@ -712,6 +745,18 @@ impl MainView {
             .flex_col()
             .child(cover)
             .child(body)
+    }
+}
+
+/// `slideWrapDuration`.
+const SLIDE_WRAP_DURATION: f32 = 150.;
+
+impl MainView {
+    /// `MainMenu::toggleAccounts`: the list slides open or closed.
+    fn toggle_menu_accounts(&mut self, cx: &mut Context<Self>) {
+        self.menu_accounts_toggled = Some(std::time::Instant::now());
+        self.accounts.update(cx, |a, cx| a.toggle_menu_accounts(cx));
+        cx.notify();
     }
 }
 
