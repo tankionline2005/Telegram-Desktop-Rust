@@ -73,6 +73,8 @@ pub(super) enum LayerBox {
     Countries,
     /// "Are you sure you want to leave this group?" (`DeleteChatBox`).
     Leave(tdr_data::tdr_storage::PeerKey),
+    /// "Do you want to reset recent emoji?" (the emoji panel's menu).
+    ResetRecentEmoji,
 }
 
 /// `LayerStackWidget::BackgroundWidget::Action`.
@@ -679,6 +681,45 @@ impl MainView {
             .into_any_element()
     }
 
+    /// `MakeConfirmBox` of the emoji panel's "Reset recents".
+    fn render_reset_recent_emoji(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let p = self.palette();
+        let font = scale::font(14.);
+        let [pl, pt, pr, pb] = BOX_PADDING;
+        let body = div()
+            .pt(px(BOX_MARGIN_TOP + pt))
+            .pl(px(pl))
+            .pr(px(pr))
+            .pb(px(pb))
+            .text_size(font.size)
+            .line_height(px(BOX_LABEL_LINE))
+            .text_color(c(p.box_text_fg))
+            .child("Do you want to reset recent emoji?");
+        let confirm = self.box_button(
+            "emoji-reset-confirm",
+            "Reset",
+            true,
+            window,
+            cx,
+            |this, _, _| {
+                this.layers.hide_layer();
+                this.emoji_reset_recent();
+            },
+        );
+        let cancel = self.box_button(
+            "emoji-reset-cancel",
+            "Cancel",
+            false,
+            window,
+            cx,
+            |this, _, _| {
+                this.layers.hide_layer();
+            },
+        );
+        self.box_frame(BOX_WIDTH, body, vec![confirm, cancel])
+            .into_any_element()
+    }
+
     /// `DeleteChatBox` for a group or channel: its userpic and name
     /// (`IconWithTitle`), the question, "Leave" in red and "Cancel". Leaving closes
     /// the chat (`closeChatFromWindows`).
@@ -939,6 +980,7 @@ impl MainView {
                 LayerBox::About => self.render_about(window, cx),
                 LayerBox::LogOut(id) => self.render_logout(id, window, cx),
                 LayerBox::Leave(peer) => self.render_leave(peer, window, cx),
+                LayerBox::ResetRecentEmoji => self.render_reset_recent_emoji(window, cx),
                 LayerBox::Countries => self.render_country_box(window, cx),
             };
             root = root.child(

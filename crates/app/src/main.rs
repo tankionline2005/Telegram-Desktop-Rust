@@ -9,6 +9,9 @@
 mod accounts;
 mod anim;
 mod bridge;
+mod emoji;
+mod emoji_font;
+mod emoji_search;
 mod icons;
 #[cfg(windows)]
 mod instance;
@@ -245,6 +248,7 @@ fn main() {
                 Cow::Borrowed(
                     include_bytes!("../../../assets/fonts/OpenSans-SemiBoldItalic.ttf").as_slice(),
                 ),
+                Cow::Owned(emoji_font::build()),
             ])
             .expect("bundled fonts are valid");
         tracing::info!(elapsed = ?STARTED.elapsed(), "ui: fonts loaded");

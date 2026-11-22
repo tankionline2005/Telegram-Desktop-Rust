@@ -138,6 +138,12 @@ pub struct Accounts {
 impl EventEmitter<Activated> for Accounts {}
 
 impl Accounts {
+    /// The recent emoji and skin tones (app-wide, `Core::Settings`); the demo
+    /// keeps them in memory only.
+    pub fn emoji_settings_path(&self) -> Option<PathBuf> {
+        (!self.demo).then(|| self.base.join("emoji.txt"))
+    }
+
     /// Starts the data threads of the logged-in accounts (`demo`: that many fake
     /// accounts).
     pub fn new(

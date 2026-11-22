@@ -34,6 +34,7 @@ pub(crate) use chrome::paint_radial;
 mod archive;
 mod chrome;
 mod country_box;
+mod emoji_panel;
 mod layers;
 mod main_menu;
 mod menus;
@@ -723,6 +724,8 @@ enum Area {
     Dialogs,
     /// Settings (the layer or the section): every scrolled box of this kind.
     Settings,
+    /// The emoji panel's list.
+    Emoji,
 }
 
 impl Area {
@@ -731,6 +734,8 @@ impl Area {
         match self {
             Area::History => (12., 3.),
             Area::Dialogs | Area::Settings => (10., 2.),
+            // `emojiScroll`.
+            Area::Emoji => (7., 1.5),
         }
     }
 }
@@ -750,6 +755,9 @@ pub struct MainView {
     history_bar: Scrollbar,
     dialogs_bar: Scrollbar,
     settings_bar: Scrollbar,
+    emoji_bar: Scrollbar,
+    /// The emoji panel or the docked selector.
+    emoji_panel: emoji_panel::EmojiPanel,
     /// The chat list's share of the window (tdesktop's dialogs width ratios).
     columns: Columns,
     columns_path: Option<PathBuf>,
@@ -1000,6 +1008,8 @@ impl MainView {
             history_bar: Scrollbar::default(),
             dialogs_bar: Scrollbar::default(),
             settings_bar: Scrollbar::default(),
+            emoji_bar: Scrollbar::default(),
+            emoji_panel: emoji_panel::EmojiPanel::new(accounts.read(cx).emoji_settings_path()),
             columns: Columns::default(),
             columns_path: None,
             column_drag: None,
@@ -1364,7 +1374,7 @@ impl MainView {
         if self.one_column() {
             return body;
         }
-        body - self.dialogs_width(window)
+        body - self.dialogs_width(window) - self.emoji_section_width(window)
     }
 
     /// In one column, the chat goes back to the list with the slide; the chat closes
@@ -1583,6 +1593,7 @@ impl MainView {
         self.drag_scrollbar(Area::History, e.position.y, cx);
         self.drag_scrollbar(Area::Dialogs, e.position.y, cx);
         self.drag_scrollbar(Area::Settings, e.position.y, cx);
+        self.drag_scrollbar(Area::Emoji, e.position.y, cx);
     }
 
     fn drag_ended(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -1599,6 +1610,7 @@ impl MainView {
         self.end_drag(Area::History, cx);
         self.end_drag(Area::Dialogs, cx);
         self.end_drag(Area::Settings, cx);
+        self.end_drag(Area::Emoji, cx);
     }
 
     fn pinned_order(&self) -> Vec<PeerKey> {
@@ -2212,6 +2224,7 @@ impl MainView {
             Area::History => &mut self.history_bar,
             Area::Dialogs => &mut self.dialogs_bar,
             Area::Settings => &mut self.settings_bar,
+            Area::Emoji => &mut self.emoji_bar,
         }
     }
 
@@ -2220,6 +2233,7 @@ impl MainView {
             Area::History => &self.history_bar,
             Area::Dialogs => &self.dialogs_bar,
             Area::Settings => &self.settings_bar,
+            Area::Emoji => &self.emoji_bar,
         }
     }
 
@@ -2594,6 +2608,14 @@ impl MainView {
                     -f32::from(s.offset().y),
                 )
             }
+            Area::Emoji => {
+                let s = &self.emoji_panel.scroll;
+                (
+                    f32::from(s.bounds().size.height),
+                    f32::from(s.max_offset().height),
+                    -f32::from(s.offset().y),
+                )
+            }
         };
         (viewport, max, offset.clamp(0., max.max(0.)))
     }
@@ -2607,6 +2629,11 @@ impl MainView {
             Area::Dialogs => {
                 let base = self.dialogs_scroll.0.borrow().base_handle.clone();
                 base.set_offset(point(px(0.), px(-target)));
+            }
+            Area::Emoji => {
+                self.emoji_panel
+                    .scroll
+                    .set_offset(point(px(0.), px(-target)));
             }
             Area::Settings => {
                 self.layers
@@ -4110,7 +4137,7 @@ impl MainView {
                 p.history_scroll_bar_bg,
                 p.history_scroll_bar_bg_over,
             ),
-            Area::Dialogs | Area::Settings => (
+            Area::Dialogs | Area::Settings | Area::Emoji => (
                 p.scroll_bg,
                 p.scroll_bg_over,
                 p.scroll_bar_bg,
@@ -4135,6 +4162,7 @@ impl MainView {
             Area::History => "history-scroll",
             Area::Dialogs => "dialogs-scroll",
             Area::Settings => "settings-scrollbar",
+            Area::Emoji => "emoji-scrollbar",
         };
         Some(
             div()
@@ -4189,6 +4217,7 @@ impl MainView {
                                 Area::History => "history-scroll-bar",
                                 Area::Dialogs => "dialogs-scroll-bar",
                                 Area::Settings => "settings-scroll-bar",
+                                Area::Emoji => "emoji-scroll-bar",
                             })
                             .absolute()
                             .top(gpui::px(bar_top))
@@ -4397,6 +4426,7 @@ impl MainView {
                 f32::from(base.bounds().origin.y)
             }
             Area::Settings => f32::from(self.layers.settings_scroll.bounds().origin.y),
+            Area::Emoji => f32::from(self.emoji_panel.scroll.bounds().origin.y),
         }
     }
 
@@ -4640,7 +4670,7 @@ impl Render for MainView {
             }
         }
         // A dragged scrollbar keeps its thumb under the mouse as the list grows.
-        for area in [Area::History, Area::Dialogs, Area::Settings] {
+        for area in [Area::History, Area::Dialogs, Area::Settings, Area::Emoji] {
             let (_, max, _) = self.scroll_metrics(area);
             if self
                 .bar(area)
@@ -4956,6 +4986,8 @@ impl Render for MainView {
                     .children(floating_date)
                     .children(scrollbar)
                     .children(to_down);
+                let chat_h = f32::from(window.viewport_size().height) - lg(TITLE_HEIGHT);
+                let feed = feed.children(self.render_emoji_panel(chat_h, window, cx));
                 let has_text = !self.input.read(cx).is_empty();
                 let field_extras = self.render_field_extras(self.chat_width(window), window, cx);
                 let reply_bar = self.render_reply_bar(window, cx);
@@ -5008,7 +5040,16 @@ impl Render for MainView {
                             )
                             .child(self.input.clone()),
                     )
-                    .child(self.render_emoji(window, cx))
+                    .child(
+                        // `TabbedPanel::eventFilter`: the panel follows the mouse over
+                        // the button.
+                        div()
+                            .id("compose-emoji-hover")
+                            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                this.emoji_button_hovered(*hovered, cx);
+                            }))
+                            .child(self.render_emoji(window, cx)),
+                    )
                     .child(self.render_send(has_text, window, cx))
                     .children(field_extras);
                 let live = div()
@@ -5061,7 +5102,12 @@ impl Render for MainView {
                 None => vec![left.into_any_element()],
             }
         } else {
-            vec![left.into_any_element(), right.into_any_element()]
+            let body_h = f32::from(window.viewport_size().height) - lg(TITLE_HEIGHT);
+            let mut columns = vec![left.into_any_element(), right.into_any_element()];
+            if let Some(section) = self.render_emoji_section(body_h, window, cx) {
+                columns.push(section);
+            }
+            columns
         };
         let layers = self.render_layers(window, cx);
         // The login screens and the account slide over each other

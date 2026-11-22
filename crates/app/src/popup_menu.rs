@@ -82,6 +82,9 @@ const PLAIN: Style = Style {
 pub enum MenuAction {
     /// A submenu's row: opens the submenu.
     None,
+    /// The emoji panel's recent emoji: remove one, reset all (asks first).
+    EmojiRemoveRecent(u16),
+    EmojiResetRecent,
     // The message field's menu.
     FieldUndo,
     FieldRedo,

@@ -5678,6 +5678,7 @@ dependencies = [
  "smallvec",
  "tdr-api",
  "tdr-data",
+ "tdr-emoji",
  "tdr-prism",
  "tdr-theme",
  "tokio",
@@ -5729,6 +5730,10 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "tdr-emoji"
+version = "0.1.0"
 
 [[package]]
 name = "tdr-mtproto"

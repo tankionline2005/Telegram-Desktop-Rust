@@ -80,6 +80,8 @@ pub struct Prepaint {
     line_height: Pixels,
     /// The spoilers' x ranges in the shaped line.
     spoilers: Vec<(Pixels, Pixels)>,
+    /// The emoji images: their spaces' x and the emoji.
+    emoji: Vec<(Pixels, u16)>,
 }
 
 impl Element for OneLine {
@@ -182,9 +184,22 @@ impl Element for OneLine {
             if runs.is_empty() {
                 runs.push(style.to_run(text.len()));
             }
-            window
+            let emoji = crate::emoji::find_all(&text);
+            let (display, runs) = crate::emoji::shape_text(&text, 0, &emoji, runs, font_size);
+            let line = window
                 .text_system()
-                .shape_line(text, font_size, &runs, None)
+                .shape_line(display.into(), font_size, &runs, None);
+            // Emoji under a spoiler stay hidden.
+            let images = emoji
+                .iter()
+                .filter(|(r, _)| {
+                    !spoilers
+                        .iter()
+                        .any(|s| s.start <= r.start && r.end <= s.end)
+                })
+                .map(|(r, i)| (line.x_for_index(r.start), *i))
+                .collect::<Vec<_>>();
+            (line, images)
         };
         let ranges = |line: &ShapedLine, len: usize| -> Vec<(Pixels, Pixels)> {
             spoilers
@@ -193,7 +208,7 @@ impl Element for OneLine {
                 .map(|r| (line.x_for_index(r.start), line.x_for_index(r.end.min(len))))
                 .collect()
         };
-        let full = shape(window, text.clone(), text.len());
+        let (full, emoji) = shape(window, text.clone(), text.len());
         let width = bounds.size.width;
         if full.width <= width {
             let spoilers = ranges(&full, text.len());
@@ -201,22 +216,27 @@ impl Element for OneLine {
                 line: full,
                 line_height,
                 spoilers,
+                emoji,
             };
         }
-        let ellipsis_width = shape(window, ELLIPSIS.into(), 0).width;
+        let ellipsis_width = shape(window, ELLIPSIS.into(), 0).0.width;
         let room = (width - ellipsis_width).max(px(0.));
         let mut cut = full.closest_index_for_x(room).min(text.len());
+        let all_emoji = crate::emoji::find_all(&text);
+        cut = crate::emoji::snap_down(&all_emoji, cut);
         while cut > 0 && (!text.is_char_boundary(cut) || full.x_for_index(cut) > room) {
             cut -= 1;
+            cut = crate::emoji::snap_down(&all_emoji, cut);
         }
         let kept = text[..cut].trim_end().len();
         let cut_text: SharedString = format!("{}{ELLIPSIS}", &text[..kept]).into();
-        let line = shape(window, cut_text, kept);
+        let (line, emoji) = shape(window, cut_text, kept);
         let spoilers = ranges(&line, kept);
         Prepaint {
             line,
             line_height,
             spoilers,
+            emoji,
         }
     }
 
@@ -240,6 +260,11 @@ impl Element for OneLine {
             let _ = prepaint
                 .line
                 .paint(origin, prepaint.line_height, window, cx);
+            for (x, index) in &prepaint.emoji {
+                let at =
+                    crate::emoji::origin_in_line(origin.x + *x, origin.y, prepaint.line_height);
+                crate::emoji::paint(*index, at, crate::emoji::size_normal(), window);
+            }
             if let Some(color) = self.spoiler_color
                 && !prepaint.spoilers.is_empty()
             {

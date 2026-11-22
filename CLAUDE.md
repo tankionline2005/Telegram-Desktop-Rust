@@ -168,3 +168,11 @@
   the raw text. Animated switches: forum open/close (`MainView::forum_hiding`,
   `forum_shown`), folder tabs (`FolderSlide`, `folder_slide_view`), main menu
   accounts (`menu_accounts_toggled`).
+- Emoji are tdesktop's sprite images (`assets/emoji`), never the system font: the list
+  and text search are `tdr-emoji` (lib_ui's `emoji.txt` prepared like codegen's
+  `emoji/data.cpp`; the index is the sprite position), images `emoji.rs`. In shaped
+  text an emoji becomes a space of the in-memory font `emoji_font` (same byte
+  length, fillers): use `emoji::shape_text` for any text you shape and paint the
+  images with `emoji::paint`; snap hit-test indices with `emoji::snap`. The panel is
+  `ui/emoji_panel.rs` (`Area::Emoji` scroll), recent emoji and skin tones
+  `tdr_emoji::recent` (`data/emoji.txt`).

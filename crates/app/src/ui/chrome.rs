@@ -1725,7 +1725,12 @@ impl MainView {
             .button_hovered
             .as_ref()
             .is_some_and(|h| h.as_ref() == "compose-emoji");
-        let line = if over {
+        // Docked as the third column: the button is active
+        // (`historyAttachEmojiActive`, `historyRecordVoiceFgActive`).
+        let docked = self.emoji_section_width(window) > 0.;
+        let line = if docked {
+            p.window_bg_active
+        } else if over {
             p.history_compose_icon_fg_over
         } else {
             p.history_compose_icon_fg
@@ -1756,10 +1761,14 @@ impl MainView {
             (COMPOSE_BUTTON_WIDTH, COMPOSE_BUTTON_HEIGHT),
             None,
             (COMPOSE_RIPPLE, 40.),
-            (p.history_compose_icon_fg, p.history_compose_icon_fg_over),
+            if docked {
+                (p.window_bg_active, p.window_bg_active)
+            } else {
+                (p.history_compose_icon_fg, p.history_compose_icon_fg_over)
+            },
             window,
             cx,
-            |_, _, _| {},
+            |this, window, cx| this.emoji_button_clicked(window, cx),
         )
         .child(circle)
     }

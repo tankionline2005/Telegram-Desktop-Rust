@@ -2398,3 +2398,235 @@ sha256 = "bde8200ef8f908c4293e7016ede02ebfa8d341391df5a9df19c86947493846b3"
 path = "assets/tdesktop-art/topic_icons__yellow.svg"
 upstream = "Telegram/Resources/art/topic_icons/yellow.svg"
 sha256 = "9c0964c868b9924def262d259895a305bb3369adf73199338b0cb258678832ab"
+
+[[vendored]]
+path = "assets/emoji/emoji.txt"
+upstream = "emoji.txt"
+submodule = "Telegram/lib_ui"
+sha256 = "bb5fa4b87d0bb499dc1e1a7c2c87f2e8ad05b06e5cab79ac882825fcad1ecb62"
+
+[[vendored]]
+path = "assets/emoji/emoji_1.webp"
+upstream = "Telegram/Resources/emoji/emoji_1.webp"
+sha256 = "4fdc6288fa0bae49d33f5e22bd2c9c5fca0068a8d6a45eea4e6964c7e5e4b587"
+
+[[vendored]]
+path = "assets/emoji/emoji_2.webp"
+upstream = "Telegram/Resources/emoji/emoji_2.webp"
+sha256 = "514ac69f6ec47f1f76b29cc7d4ef6773a3947fb136137275ea2f5ce914bc506c"
+
+[[vendored]]
+path = "assets/emoji/emoji_3.webp"
+upstream = "Telegram/Resources/emoji/emoji_3.webp"
+sha256 = "5497f55a124f294dcac29afa67b01bee79a00e4f2a42d3122d4e708077212ab4"
+
+[[vendored]]
+path = "assets/emoji/emoji_4.webp"
+upstream = "Telegram/Resources/emoji/emoji_4.webp"
+sha256 = "afc6004cddb86b4a42f36b00b796233a13de672af70f272be30e632979026486"
+
+[[vendored]]
+path = "assets/emoji/emoji_5.webp"
+upstream = "Telegram/Resources/emoji/emoji_5.webp"
+sha256 = "30244f93022238009ccbbf25b4b4216279a8137fbac9e37444048eea72dda422"
+
+[[vendored]]
+path = "assets/emoji/emoji_6.webp"
+upstream = "Telegram/Resources/emoji/emoji_6.webp"
+sha256 = "5efccb2328e320c7c3e6f02f6b7f5dee7d11361a0ef5cccfad6a2776a9dc68ef"
+
+[[vendored]]
+path = "assets/emoji/emoji_7.webp"
+upstream = "Telegram/Resources/emoji/emoji_7.webp"
+sha256 = "cc59c1e9db9c72fcee9e7d200eb971f59e856558755289adca31c18433323a26"
+
+[[vendored]]
+path = "assets/emoji/emoji_8.webp"
+upstream = "Telegram/Resources/emoji/emoji_8.webp"
+sha256 = "9b8217e33c41102fdec2ee5d97274f4a6b6a2b9bef949802a431ed2098bf1866"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_recent.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_recent.png"
+sha256 = "c90b27e76fea7510e00780b5d2021d5e2a3eba40dc857532274d622ae98bc763"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_recent@2x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_recent@2x.png"
+sha256 = "e08f1295c8d708a42669b421c115706d58d6c86c0832a267852a844901efa6ac"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_recent@3x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_recent@3x.png"
+sha256 = "ab2a63c454ad8f12ea3a567f39f35fe212fd981f7918f9c189c53a4d56e0e0c7"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_smile.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_smile.png"
+sha256 = "dc52eb49da85f51e0335a44f3c66e450cb7cb1172f7f8fc68630f5fc92f8567f"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_smile@2x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_smile@2x.png"
+sha256 = "e32e346f37459ae6731cbd8394140e674766664758a46bbdb2075e9a61ac3789"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_smile@3x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_smile@3x.png"
+sha256 = "df709e8a23ca03434ee1bbb76b6c781aedf32749af274edf190c034b9b6ae232"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_nature.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_nature.png"
+sha256 = "1adce8f45b2ba556232a180f8f8233d6cbf30e8b34f351b048ac35bd82c76b7c"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_nature@2x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_nature@2x.png"
+sha256 = "1a0b59d29e85c50dd732956b34f4219e5e5c5e5d4e57a0b0c488d08b4f003d44"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_nature@3x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_nature@3x.png"
+sha256 = "5df0b75eaf6b195f0b8f2189826805200daec737e5604ad75b9aead5232564c0"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_food.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_food.png"
+sha256 = "c2f8b7f166816dde20691bbc4161c5d01a8b59fd3fdd79b418001afb90e2537a"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_food@2x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_food@2x.png"
+sha256 = "c80d52ef25ee20f101bfccc99c23d559b200a7f7c6a0ef5473dfb488cda830c8"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_food@3x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_food@3x.png"
+sha256 = "06e84740b7d44fd4974549e437b8a7f4af6dd2f178e928b04ce07f74d6297a07"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_activities.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_activities.png"
+sha256 = "9b9d37861506b52fe6be517de31ad27c1b290450724523689795b1a276ae8b49"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_activities@2x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_activities@2x.png"
+sha256 = "63ad9f7da772d3755c93c96d45458360dad7a25f5489f7174a9beba01ea89f55"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_activities@3x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_activities@3x.png"
+sha256 = "4a14cc10333aa401640f93bbab2104d5c777ce2ba4dcca856f0f7c7306a481a5"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_travel.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_travel.png"
+sha256 = "939b8ffd60a44f42052f4045b08e80a625eed501225544f849712514bcf78dd8"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_travel@2x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_travel@2x.png"
+sha256 = "8088cd7ba3c84ddf98c73ce4425df3b9d5d1c79105e406d3eb1b25cc97d23979"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_travel@3x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_travel@3x.png"
+sha256 = "96ff3dc64c7d08253819ac9b0c3cbafc36c3df94c8cb6df1702f114bc10a8e1b"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_love.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_love.png"
+sha256 = "9e8878ba6f66d201886125260ec799b4003b8fd991a19ee84aba0edda312040a"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_love@2x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_love@2x.png"
+sha256 = "f9d5ddf5d61992bce7ade8658387f26f6b5242de4c55d43db3013a6c323b0e5b"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_love@3x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_love@3x.png"
+sha256 = "e46764fdfc43fb47b44a1d7df1faf3471d41bb6b3de0bc4e9f5e61d5aa4f375d"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_search_input.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_search_input.png"
+sha256 = "e1a6d981c8c73098fde4484c157adb4ab828675409403af819f34a2387856640"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_search_input@2x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_search_input@2x.png"
+sha256 = "22f7a64df10ac71a7cfdc06547d890c7dca02fe8f6dc415f946474e80b6250a3"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_search_input@3x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_search_input@3x.png"
+sha256 = "f21692f62ab4f2f0f046e0c89bc24548b498f64cb4e8a1fff34d04e370d7934c"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_back.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_back.png"
+sha256 = "ee64c24ac1815406a6a4b18ef0644b494ffbe3d5ba04b21153e6edafc7299070"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_back@2x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_back@2x.png"
+sha256 = "f1ae558e2e2325ea36d8456bd209e4ef61a13e490219018ae5b749dd7ed04bab"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_back@3x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_back@3x.png"
+sha256 = "50a5c4405b6f36d1c4706a11c52120e0969e7f089cec588ca3699c712714d87b"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_skin.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_skin.png"
+sha256 = "144e8b6aee4a1fa95a3b0130bf99766192e4b4c1758b886099a8c945a15cd258"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_skin@2x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_skin@2x.png"
+sha256 = "20d393316d0e67b6d9d25ed2479f01c584be3de4fe6d311146d85f73283f3eec"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_skin@3x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_skin@3x.png"
+sha256 = "024841c260812ee29525102e4f19e1fae8aa0e42c765e47323f3b8dd9c7d1264"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__cancel.png"
+upstream = "Telegram/Resources/icons/menu/cancel.png"
+sha256 = "fb87eff6141ad131a603fcd05b6a0786a013673c4f80279b4ecb8305ab149b4d"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__cancel@2x.png"
+upstream = "Telegram/Resources/icons/menu/cancel@2x.png"
+sha256 = "aadc0c7ad59d64923489dfa2d6965a6440c315153d00d6b6462b539bbab168bf"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__cancel@3x.png"
+upstream = "Telegram/Resources/icons/menu/cancel@3x.png"
+sha256 = "3874c1a01f2818e00f2bab7859ed925fa9d8901c5a723b2dcc944918069e6126"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__restore.png"
+upstream = "Telegram/Resources/icons/menu/restore.png"
+sha256 = "3688d5247221745e36ef3b520a540253d60de6cb618b1b6f77a46aa931964181"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__restore@2x.png"
+upstream = "Telegram/Resources/icons/menu/restore@2x.png"
+sha256 = "92d0ffd7de7bdf41d773ee08a2721cb0b64899253613233e5d4ae4d3d10aa035"
+
+[[vendored]]
+path = "assets/tdesktop-icons/menu__restore@3x.png"
+upstream = "Telegram/Resources/icons/menu/restore@3x.png"
+sha256 = "ce0c638b7deaf81b4e60e2228bca2b63b641e2b02b7586d42629991579d02c4e"
+
+[[vendored]]
+path = "assets/emoji/emoji_autocomplete.json"
+upstream = "emoji_suggestions/emoji_autocomplete.json"
+submodule = "Telegram/lib_ui"
+sha256 = "e5c6077389fa9c433987edbd0e53f9c00963ee27662759aa8a27dd5326bbfcec"

@@ -16,6 +16,7 @@ tdr-api.workspace = true
 tdr-data.workspace = true
 tdr-theme.workspace = true
 tdr-prism.workspace = true
+tdr-emoji.workspace = true
 gpui = "0.2.2"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
@@ -23,7 +24,7 @@ anyhow = "1.0.104"
 tracing = "0.1.44"
 unicode-segmentation = "1.13.3"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 smallvec = "1"
 # Already built for GPUI: stroke joins and caps for drawn icons.
 lyon = "1.0"

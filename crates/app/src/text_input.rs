@@ -1006,6 +1006,16 @@ impl TextInput {
         }
     }
 
+    /// `InsertEmojiAtCursor`: `text` in place of the selection, the caret after it.
+    pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let r = self.selected_range.clone();
+        self.edit(r.clone(), text, EditKind::Other);
+        let end = r.start + text.len();
+        self.selected_range = end..end;
+        self.last_edit = None;
+        cx.notify();
+    }
+
     pub fn paste_text(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             let r = self.selected_range.clone();

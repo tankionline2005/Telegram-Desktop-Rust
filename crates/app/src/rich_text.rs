@@ -135,6 +135,8 @@ pub struct Rich {
     quotes: Vec<Quote>,
     links: Vec<Link>,
     pub has_spoilers: bool,
+    /// The emoji, drawn as images (`emoji`).
+    pub emoji: Vec<(Range<usize>, u16)>,
 }
 
 fn is_quote(kind: &Kind) -> bool {
@@ -347,6 +349,7 @@ pub fn prepare(text: &str, entities: &[TextEntity]) -> Rich {
         start += line.len() + 1;
     }
     let has_spoilers = spans.iter().any(|s| s.flags & SPOILER != 0);
+    let emoji = crate::emoji::find_all(&out);
     Rich {
         text: out,
         spans,
@@ -354,6 +357,7 @@ pub fn prepare(text: &str, entities: &[TextEntity]) -> Rich {
         quotes,
         links,
         has_spoilers,
+        emoji,
     }
 }
 
@@ -631,7 +635,9 @@ impl Measured {
         for p in &rich.paragraphs {
             let text = &rich.text[p.range.clone()];
             let runs = runs_for(&rich, p.range.clone(), &mono);
-            let layout = text_system.layout_line(text, size, &runs, None);
+            let (display, runs) =
+                crate::emoji::shape_text(text, p.range.start, &rich.emoji, runs, size);
+            let layout = text_system.layout_line(&display, size, &runs, None);
             let shaped = ShapedParagraph {
                 layout,
                 breaks: break_points(text),
@@ -1066,7 +1072,7 @@ impl Layout {
             hit.index = line.range.end;
         } else {
             let ix = shaped.layout.closest_index_for_x(px(base + local)) + pstart;
-            hit.index = ix.clamp(line.range.start, line.range.end);
+            hit.index = crate::emoji::snap(&rich.emoji, ix.clamp(line.range.start, line.range.end));
             if inside_y
                 && let Some(under) = shaped.layout.index_for_x(px(base + local))
                 && let Some(span) = rich.span_at(under + pstart)
@@ -1761,7 +1767,14 @@ impl RichText {
                 });
             }
             separate_fonts(&mut runs);
-            let text: SharedString = rich.text[range.clone()].to_string().into();
+            let (display, runs) = crate::emoji::shape_text(
+                &rich.text[range.clone()],
+                range.start,
+                &rich.emoji,
+                runs,
+                f.size,
+            );
+            let text: SharedString = display.into();
             let shaped = if text.is_empty() {
                 None
             } else {
@@ -1800,6 +1813,22 @@ impl RichText {
                 let baseline = top + px(f.ascent);
                 let origin_y = baseline - (lh + ascent - descent) / 2.;
                 let _ = shaped.paint(point(left, origin_y), lh, window, cx);
+                // The emoji over their spaces; hidden spoilers keep theirs hidden.
+                for (r, index) in &rich.emoji {
+                    if r.start < range.start || r.end > range.end {
+                        continue;
+                    }
+                    let hidden = rich
+                        .span_at(r.start)
+                        .is_some_and(|s| s.flags & SPOILER != 0)
+                        && reveal < 0.5
+                        && !rich.spoiler_shown(r.start, self.state.shown_spoilers.as_ref());
+                    if hidden {
+                        continue;
+                    }
+                    let origin = crate::emoji::origin_in_line(left + x_of(r.start), top, lh);
+                    crate::emoji::paint(*index, origin, crate::emoji::size_normal(), window);
+                }
             }
         }
         if rich.has_spoilers && reveal < 1. {

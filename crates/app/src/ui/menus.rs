@@ -739,6 +739,11 @@ impl MainView {
                 }
             }
             MenuAction::OpenUrl(url) => cx.open_url(&url),
+            MenuAction::EmojiRemoveRecent(emoji) => self.emoji_remove_recent(emoji),
+            MenuAction::EmojiResetRecent => {
+                self.layers
+                    .show_layer(super::layers::LayerBox::ResetRecentEmoji);
+            }
             MenuAction::AddAccount => self.add_account_clicked(window, cx),
             MenuAction::ArchiveInMenu(in_menu) => self.set_archive_in_menu(in_menu),
             MenuAction::ChatMute(peer, mute) => {
