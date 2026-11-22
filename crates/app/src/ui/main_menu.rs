@@ -217,7 +217,11 @@ impl MainView {
             }
             RowAction::AddAccount => self.add_account_clicked(window, cx),
             // `showSettings`: in a window this wide, a layer.
-            RowAction::Settings => self.layers.show_special(super::layers::Special::Settings),
+            RowAction::Settings => {
+                // The number is hidden again each time (`Cover` is made anew).
+                self.hide_phone_spoiler();
+                self.layers.show_special(super::layers::Special::Settings)
+            }
             RowAction::Archive => self.archive_from_main_menu(cx),
         }
         cx.notify();

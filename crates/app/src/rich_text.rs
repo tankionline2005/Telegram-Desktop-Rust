@@ -1118,6 +1118,38 @@ fn hsla(color: Color) -> Hsla {
     gpui::rgba(color.rgba()).into()
 }
 
+/// A reply's box (`Ui::Text::FillQuotePaint` with `messageQuoteStyle`): the tinted
+/// rounded box, its outline on the left, the quote icon in the corner of a quote.
+pub fn paint_quote_box(r: Bounds<Pixels>, color: Color, quote_icon: bool, window: &mut Window) {
+    let radius = px(scale::lg(QUOTE_RADIUS));
+    let outline = px(scale::lg(QUOTE_OUTLINE));
+    let rounded = |c: Hsla| gpui::fill(r, c).corner_radii(Corners::all(radius));
+    window.with_content_mask(
+        Some(ContentMask {
+            bounds: Bounds::from_corners(point(r.origin.x + outline, r.origin.y), r.bottom_right()),
+        }),
+        |window| window.paint_quad(rounded(with_alpha(color, 0.12))),
+    );
+    window.with_content_mask(
+        Some(ContentMask {
+            bounds: Bounds::from_corners(r.origin, point(r.origin.x + outline, r.bottom())),
+        }),
+        |window| window.paint_quad(rounded(with_alpha(color, 0.9))),
+    );
+    if quote_icon
+        && let Some((image, w, h, pad)) =
+            crate::icons::tinted_image(crate::icons::Icon::MiniQuote, color, window.scale_factor())
+    {
+        let left = r.right() - px(w) - px(scale::lg(BLOCKQUOTE_ICON_POSITION.0));
+        let top = r.origin.y + px(scale::lg(BLOCKQUOTE_ICON_POSITION.1));
+        let image_bounds = Bounds::new(
+            point(left - px(pad), top - px(pad)),
+            size(px(w + 2. * pad), px(h + 2. * pad)),
+        );
+        let _ = window.paint_image(image_bounds, Corners::default(), image, 0, false);
+    }
+}
+
 fn with_alpha(color: Color, alpha: f32) -> Hsla {
     let mut c = hsla(color);
     c.a = alpha;

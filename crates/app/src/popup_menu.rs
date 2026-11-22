@@ -94,7 +94,8 @@ pub enum MenuAction {
     FieldClearFormat,
     FieldLink,
     FieldDate,
-    Reply,
+    /// Reply to this message of this chat.
+    Reply(PeerKey, i32),
     QuoteReply,
     Edit,
     Pin,

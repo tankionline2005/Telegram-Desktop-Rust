@@ -209,6 +209,13 @@ impl MainView {
         let p = self.palette();
         let font = scale::font(TITLE_FONT);
         let colors = (p.menu_icon_fg, p.menu_icon_fg_over);
+        let unread = self
+            .accounts
+            .read(cx)
+            .active()
+            .map(|s| s.state)
+            .filter(|s| s.unread > 0)
+            .map(|s| (s.unread, s.unread_muted));
         div()
             .flex_none()
             .relative()
@@ -224,9 +231,23 @@ impl MainView {
                     .h_full()
                     .flex()
                     .items_center()
+                    .relative()
                     .pl(px(super::BACK_ICON_LEFT))
                     .cursor_pointer()
                     .child(icon(Icon::Back, p.box_title_close_fg, window))
+                    // `TopBarWidget::updateUnreadBadge`: the unread messages outside
+                    // the archive (`unreadBadgeIgnoreOne`).
+                    .children(unread.map(|(count, muted)| {
+                        div()
+                            .absolute()
+                            .right_0()
+                            .top(px(super::BACK_UNREAD_TOP))
+                            .child(self.count_badge(
+                                &super::main_menu::short_count(count),
+                                muted,
+                                window,
+                            ))
+                    }))
                     .on_click(cx.listener(|this, _, _, cx| this.close_archive(cx))),
             )
             .child(

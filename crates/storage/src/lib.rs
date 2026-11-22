@@ -408,6 +408,27 @@ impl Storage {
             .optional()
     }
 
+    /// One cached message (a replied one), wherever it is in the history.
+    pub fn message(&self, peer: PeerKey, id: i32) -> Result<Option<MessageRow>> {
+        self.conn
+            .prepare_cached(
+                "SELECT id, date, from_kind, from_id, out, text, raw_layer, raw FROM messages
+                 WHERE kind = ?1 AND peer_id = ?2 AND id = ?3",
+            )?
+            .query_row(params![peer.kind as i64, peer.id, id], |r| {
+                Ok(MessageRow {
+                    peer,
+                    id: r.get(0)?,
+                    date: r.get(1)?,
+                    from: peer_key(r.get(2)?, r.get(3)?),
+                    out: r.get(4)?,
+                    text: r.get(5)?,
+                    raw: raw(r.get(6)?, r.get(7)?),
+                })
+            })
+            .optional()
+    }
+
     /// The full info of a group or channel (`*.getFullChannel`): the TL blob.
     pub fn peer_full(&self, key: PeerKey) -> Result<Option<(i32, Vec<u8>)>> {
         self.conn

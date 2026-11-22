@@ -75,6 +75,22 @@ pub enum Service {
     Other,
 }
 
+/// What a message replies to (`messageReplyHeader`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplyTo {
+    pub msg_id: Option<i32>,
+    /// The chat of the replied message when it is another one.
+    pub peer: Option<PeerKey>,
+    /// The thread's root (a topic, a post's comments).
+    pub top_id: Option<i32>,
+    pub forum_topic: bool,
+    /// The quoted part (`quote_text`).
+    pub quote: Option<String>,
+    /// A reply to a message of a chat we can't see (`reply_from`): its sender.
+    pub from: Option<PeerKey>,
+    pub from_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MessageInfo {
     pub media: Option<Media>,
@@ -94,6 +110,11 @@ pub struct MessageInfo {
     /// A post with a discussion group: its comment count (`replies` with
     /// `comments`).
     pub comments: Option<i32>,
+    /// The last commenters (`recent_repliers`), for the comments button.
+    pub recent_repliers: Vec<PeerKey>,
+    /// The discussion group of a post's comments (`replies.channel_id`).
+    pub comments_channel: Option<i64>,
+    pub reply: Option<ReplyTo>,
     pub forward: Option<Forward>,
     /// Formatting and links of the text (`message.entities`).
     pub entities: Vec<Entity>,
@@ -307,6 +328,23 @@ pub fn message_info(row: &MessageRow) -> MessageInfo {
                 let enums::MessageReplies::MessageReplies(r) = r;
                 r.comments.then_some(r.replies)
             }),
+            recent_repliers: m
+                .replies
+                .as_ref()
+                .map(|r| {
+                    let enums::MessageReplies::MessageReplies(r) = r;
+                    r.recent_repliers
+                        .iter()
+                        .flatten()
+                        .map(crate::convert::peer_key)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            comments_channel: m.replies.as_ref().and_then(|r| {
+                let enums::MessageReplies::MessageReplies(r) = r;
+                r.channel_id.filter(|_| r.comments)
+            }),
+            reply: m.reply_to.as_ref().and_then(reply_to),
             forward: m.fwd_from.as_ref().map(|f| {
                 let enums::MessageFwdHeader::MessageFwdHeader(f) = f;
                 Forward {
@@ -332,6 +370,27 @@ pub fn message_info(row: &MessageRow) -> MessageInfo {
             ..Default::default()
         },
         _ => MessageInfo::default(),
+    }
+}
+
+fn reply_to(h: &enums::MessageReplyHeader) -> Option<ReplyTo> {
+    match h {
+        enums::MessageReplyHeader::MessageReplyHeader(h) => Some(ReplyTo {
+            msg_id: h.reply_to_msg_id,
+            peer: h.reply_to_peer_id.as_ref().map(crate::convert::peer_key),
+            top_id: h.reply_to_top_id,
+            forum_topic: h.forum_topic,
+            quote: h.quote_text.clone().filter(|_| h.quote),
+            from: h.reply_from.as_ref().and_then(|f| {
+                let enums::MessageFwdHeader::MessageFwdHeader(f) = f;
+                f.from_id.as_ref().map(crate::convert::peer_key)
+            }),
+            from_name: h.reply_from.as_ref().and_then(|f| {
+                let enums::MessageFwdHeader::MessageFwdHeader(f) = f;
+                f.from_name.clone()
+            }),
+        }),
+        _ => None,
     }
 }
 
@@ -523,6 +582,10 @@ pub struct PeerInfo {
     pub public: bool,
     /// Its content can't be forwarded or saved (`noforwards`).
     pub noforwards: bool,
+    /// Joining it needs an admin's approval (`join_request`).
+    pub join_request: bool,
+    /// A group with topics (`forum`).
+    pub forum: bool,
 }
 
 fn color(c: &Option<enums::PeerColor>) -> Option<u8> {
@@ -572,6 +635,8 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
                 delete_messages: false,
                 public: u.username.is_some() || u.usernames.as_ref().is_some_and(|l| !l.is_empty()),
                 noforwards: false,
+                join_request: false,
+                forum: false,
             },
             _ => PeerInfo::default(),
         },
@@ -619,6 +684,8 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
                     }),
                 public: c.username.is_some() || c.usernames.as_ref().is_some_and(|u| !u.is_empty()),
                 noforwards: c.noforwards,
+                join_request: c.join_request,
+                forum: c.forum,
                 members: c.participants_count,
                 photo: chat_photo(&c.photo),
                 verified: c.verified,
@@ -655,6 +722,8 @@ pub struct FullInfo {
     pub linked_chat: Option<i64>,
     pub pinned_msg_id: Option<i32>,
     pub online: Option<i32>,
+    /// `canViewMembers`.
+    pub can_view_participants: bool,
 }
 
 /// The cached full info (`Storage::peer_full`).
@@ -667,6 +736,7 @@ pub fn full_info(raw: &Option<(i32, Vec<u8>)>) -> Option<FullInfo> {
             linked_chat: c.linked_chat_id,
             pinned_msg_id: c.pinned_msg_id,
             online: c.online_count,
+            can_view_participants: c.can_view_participants,
         }),
         enums::ChatFull::ChatFull(c) => Some(FullInfo {
             pinned_msg_id: c.pinned_msg_id,

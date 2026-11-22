@@ -168,6 +168,31 @@ impl Applied {
 /// How many chats to load when the cache is empty.
 pub const INITIAL_DIALOGS: usize = 200;
 const DIALOGS_PAGE: i32 = 100;
+/// A forum's topic (`forumTopic`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Topic {
+    pub id: i32,
+    pub title: String,
+    /// `icon_color` (`ForumTopicIcons`), and whether it has a custom emoji
+    /// instead (drawn as the colored icon until custom emoji come).
+    pub icon_color: i32,
+    pub icon_emoji: bool,
+    pub top_message: i32,
+    pub unread: i32,
+    pub pinned: bool,
+    pub closed: bool,
+    pub hidden: bool,
+    pub muted: bool,
+}
+
+/// What a sent message replies to (`FullReplyTo`): the message and, in a thread
+/// (a topic, a post's comments), its root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutReply {
+    pub msg_id: i32,
+    pub top_id: Option<i32>,
+}
+
 /// The archive's folder id (`Data::Folder::kId`).
 pub const ARCHIVE_FOLDER: i32 = 1;
 /// `meta` keys: the archive's size on the server; the account's
@@ -477,6 +502,91 @@ impl Sync {
         self.store
             .write(|w| w.set_meta_i64(PHONE_HIDDEN_KEY, hidden.into()))?;
         Ok(())
+    }
+
+    /// Loads messages by id (`ApiWrap::requestMessageData`: `channels.getMessages`
+    /// or `messages.getMessages`), e.g. the replied ones, into the cache without
+    /// touching its history segments. Returns the ids that exist.
+    pub async fn fetch_messages(&mut self, peer: PeerKey, ids: &[i32]) -> Result<Vec<i32>> {
+        let id: Vec<enums::InputMessage> = ids
+            .iter()
+            .map(|&id| enums::InputMessage::ID(types::InputMessageID { id }))
+            .collect();
+        let answer = if peer.kind == PeerKind::Channel {
+            let Some(access_hash) = self.store.access_hash(peer)? else {
+                return Ok(Vec::new());
+            };
+            self.client
+                .invoke(&functions::channels::GetMessages {
+                    channel: types::InputChannel {
+                        channel_id: peer.id,
+                        access_hash,
+                    }
+                    .into(),
+                    id,
+                })
+                .await?
+        } else {
+            self.client
+                .invoke(&functions::messages::GetMessages { id })
+                .await?
+        };
+        let (messages, chats, users) = match answer {
+            enums::messages::Messages::Messages(m) => (m.messages, m.chats, m.users),
+            enums::messages::Messages::Slice(m) => (m.messages, m.chats, m.users),
+            enums::messages::Messages::ChannelMessages(m) => (m.messages, m.chats, m.users),
+            enums::messages::Messages::NotModified(_) => return Ok(Vec::new()),
+        };
+        let rows: Vec<MessageRow> = messages.iter().filter_map(convert::message_row).collect();
+        let peers: Vec<_> = users
+            .iter()
+            .filter_map(convert::user_row)
+            .chain(chats.iter().filter_map(convert::chat_row))
+            .collect();
+        self.store.write(|w| {
+            for p in &peers {
+                w.put_peer(p)?;
+            }
+            for m in &rows {
+                w.put_message(m)?;
+            }
+            Ok(())
+        })?;
+        Ok(rows
+            .iter()
+            .filter(|m| m.peer == peer)
+            .map(|m| m.id)
+            .collect())
+    }
+
+    /// Joins a channel or supergroup (`ApiWrap::joinChannel`: `channels.joinChannel`).
+    /// `Err` carries the server's error type for the window's message
+    /// (`INVITE_REQUEST_SENT`, `CHANNELS_TOO_MUCH`, ...).
+    pub async fn join(&mut self, peer: PeerKey) -> Result<std::result::Result<Applied, String>> {
+        let Some(access_hash) = self.store.access_hash(peer)? else {
+            return Ok(Err("CHANNEL_PRIVATE".into()));
+        };
+        let answer = self
+            .client
+            .invoke(&functions::channels::JoinChannel {
+                channel: types::InputChannel {
+                    channel_id: peer.id,
+                    access_hash,
+                }
+                .into(),
+            })
+            .await;
+        match answer {
+            Ok(enums::messages::ChatInviteJoinResult::Ok(ok)) => {
+                let mut applied = self.feed(ok.updates).await?;
+                applied.pinned_changed = true;
+                Ok(Ok(applied))
+            }
+            // A bot's web view before joining: not supported yet.
+            Ok(_) => Ok(Err("WEBVIEW".into())),
+            Err(ApiError::Rpc(e)) => Ok(Err(e.message.clone())),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Leaves a group or channel ("Leave group", "Leave channel", "Delete and
@@ -1127,6 +1237,88 @@ impl Sync {
         Ok(!rows.is_empty())
     }
 
+    /// Members of a group and how many of them are online now
+    /// (`TopBarWidget::updateOnlineDisplay`): a basic group's participants
+    /// (`messages.getFullChat`), a supergroup's last participants
+    /// (`channels.getParticipants`, recent) while it has no more than
+    /// `chatSizeMax` members. `(members, online, only we are online)`.
+    pub async fn online_members(
+        &mut self,
+        peer: PeerKey,
+        members: i32,
+    ) -> Result<Option<(i32, i32, bool)>> {
+        const CHAT_SIZE_MAX: i32 = 200;
+        let users: Vec<enums::User> = match peer.kind {
+            PeerKind::Chat => {
+                let enums::messages::ChatFull::ChatFull(full) = self
+                    .client
+                    .invoke(&functions::messages::GetFullChat { chat_id: peer.id })
+                    .await?;
+                let count = match &full.full_chat {
+                    enums::ChatFull::ChatFull(c) => match &c.participants {
+                        enums::ChatParticipants::ChatParticipants(p) => p.participants.len() as i32,
+                        _ => 0,
+                    },
+                    _ => 0,
+                };
+                if count == 0 {
+                    return Ok(None);
+                }
+                return Ok(Some(self.count_online(count, full.users)?));
+            }
+            PeerKind::Channel if members > 0 && members <= CHAT_SIZE_MAX => {
+                let Some(access_hash) = self.store.access_hash(peer)? else {
+                    return Ok(None);
+                };
+                let answer = self
+                    .client
+                    .invoke(&functions::channels::GetParticipants {
+                        channel: types::InputChannel {
+                            channel_id: peer.id,
+                            access_hash,
+                        }
+                        .into(),
+                        filter: enums::ChannelParticipantsFilter::ChannelParticipantsRecent,
+                        offset: 0,
+                        limit: CHAT_SIZE_MAX,
+                        hash: 0,
+                    })
+                    .await?;
+                match answer {
+                    enums::channels::ChannelParticipants::ChannelParticipants(p) => p.users,
+                    _ => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(self.count_online(members, users)?))
+    }
+
+    fn count_online(&mut self, members: i32, users: Vec<enums::User>) -> Result<(i32, i32, bool)> {
+        let now = self.client.server_time();
+        let rows: Vec<_> = users.iter().filter_map(convert::user_row).collect();
+        self.store.write(|w| {
+            for r in &rows {
+                w.put_peer(r)?;
+            }
+            Ok(())
+        })?;
+        let mut online = 0;
+        let mut only_me = true;
+        for u in &users {
+            if let enums::User::User(u) = u
+                && let Some(enums::UserStatus::Online(s)) = &u.status
+                && s.expires > now
+            {
+                online += 1;
+                if u.id != self.self_id {
+                    only_me = false;
+                }
+            }
+        }
+        Ok((members, online, only_me))
+    }
+
     /// The full info of a supergroup or channel (`ApiWrap::requestFullPeer` when it
     /// is opened: `channels.getFullChannel`): stored with the peers that came with
     /// it (the channel itself, its discussion group). Returns it.
@@ -1172,6 +1364,7 @@ impl Sync {
         peer: PeerKey,
         text: &str,
         entities: &[OutEntity],
+        reply_to: Option<OutReply>,
     ) -> Result<Applied> {
         // Sent with `clear_draft`: the server drops the cloud draft, we drop ours.
         self.drafts.message_sent(peer);
@@ -1193,7 +1386,21 @@ impl Sync {
                 invert_media: false,
                 allow_paid_floodskip: false,
                 peer: input,
-                reply_to: None,
+                reply_to: reply_to.map(|r| {
+                    types::InputReplyToMessage {
+                        reply_to_msg_id: r.msg_id,
+                        top_msg_id: r.top_id,
+                        reply_to_peer_id: None,
+                        quote_text: None,
+                        quote_entities: None,
+                        quote_offset: None,
+                        monoforum_peer_id: None,
+                        todo_item_id: None,
+                        poll_option: None,
+                        quote_rich: None,
+                    }
+                    .into()
+                }),
                 message: text.to_string(),
                 random_id,
                 reply_markup: None,
@@ -1804,6 +2011,143 @@ impl Sync {
             Ok(())
         })?;
         Ok(rows)
+    }
+
+    /// A page of a thread (a topic, a post's comments; `messages.getReplies`)
+    /// older than `offset_id` (0: its newest), newest first, with the thread's
+    /// message count. The messages go to the cache.
+    pub async fn replies_page(
+        &mut self,
+        peer: PeerKey,
+        root: i32,
+        offset_id: i32,
+        limit: i32,
+    ) -> Result<(Vec<MessageRow>, i32)> {
+        let access_hash = self.store.access_hash(peer)?;
+        let Some(input) = convert::input_peer(peer, access_hash) else {
+            return Ok((Vec::new(), 0));
+        };
+        let answer = self
+            .client
+            .invoke(&functions::messages::GetReplies {
+                peer: input,
+                msg_id: root,
+                offset_id,
+                offset_date: 0,
+                add_offset: 0,
+                limit,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            })
+            .await?;
+        let (messages, chats, users, count) = match answer {
+            enums::messages::Messages::Messages(m) => {
+                let count = m.messages.len() as i32;
+                (m.messages, m.chats, m.users, count)
+            }
+            enums::messages::Messages::Slice(m) => (m.messages, m.chats, m.users, m.count),
+            enums::messages::Messages::ChannelMessages(m) => {
+                (m.messages, m.chats, m.users, m.count)
+            }
+            enums::messages::Messages::NotModified(_) => return Ok((Vec::new(), 0)),
+        };
+        let mut rows: Vec<MessageRow> = messages.iter().filter_map(convert::message_row).collect();
+        rows.sort_by_key(|m| std::cmp::Reverse(m.id));
+        self.store_loaded(&rows, &users, &chats)?;
+        Ok((rows, count))
+    }
+
+    /// A post's discussion (`messages.getDiscussionMessage`): the group and the
+    /// root message there (the post's copy), newest first (an album has several).
+    pub async fn discussion(
+        &mut self,
+        channel: PeerKey,
+        post: i32,
+    ) -> Result<Option<(PeerKey, Vec<MessageRow>)>> {
+        let access_hash = self.store.access_hash(channel)?;
+        let Some(input) = convert::input_peer(channel, access_hash) else {
+            return Ok(None);
+        };
+        let enums::messages::DiscussionMessage::DiscussionMessage(d) = self
+            .client
+            .invoke(&functions::messages::GetDiscussionMessage {
+                peer: input,
+                msg_id: post,
+            })
+            .await?;
+        let mut rows: Vec<MessageRow> =
+            d.messages.iter().filter_map(convert::message_row).collect();
+        rows.sort_by_key(|m| std::cmp::Reverse(m.id));
+        self.store_loaded(&rows, &d.users, &d.chats)?;
+        Ok(rows.first().map(|m| m.peer).map(|group| (group, rows)))
+    }
+
+    /// A forum's topics (`messages.getForumTopics`), as the server orders them
+    /// (pinned first, then by their last message), with their last messages
+    /// stored.
+    pub async fn forum_topics(&mut self, peer: PeerKey, limit: i32) -> Result<Vec<Topic>> {
+        let access_hash = self.store.access_hash(peer)?;
+        let Some(input) = convert::input_peer(peer, access_hash) else {
+            return Ok(Vec::new());
+        };
+        let enums::messages::ForumTopics::ForumTopics(t) = self
+            .client
+            .invoke(&functions::messages::GetForumTopics {
+                peer: input,
+                q: None,
+                offset_date: 0,
+                offset_id: 0,
+                offset_topic: 0,
+                limit,
+            })
+            .await?;
+        let rows: Vec<MessageRow> = t.messages.iter().filter_map(convert::message_row).collect();
+        self.store_loaded(&rows, &t.users, &t.chats)?;
+        Ok(t.topics
+            .iter()
+            .filter_map(|topic| match topic {
+                enums::ForumTopic::ForumTopic(f) => Some(Topic {
+                    id: f.id,
+                    title: f.title.clone(),
+                    icon_color: f.icon_color,
+                    icon_emoji: f.icon_emoji_id.is_some(),
+                    top_message: f.top_message,
+                    unread: f.unread_count,
+                    pinned: f.pinned,
+                    closed: f.closed,
+                    hidden: f.hidden,
+                    muted: convert::mute_until(&f.notify_settings)
+                        .is_some_and(|u| u > self.client.server_time()),
+                }),
+                enums::ForumTopic::Deleted(_) => None,
+            })
+            .collect())
+    }
+
+    /// Stores what a request brought: its messages (no history segments change)
+    /// and peers.
+    fn store_loaded(
+        &mut self,
+        rows: &[MessageRow],
+        users: &[enums::User],
+        chats: &[enums::Chat],
+    ) -> Result<()> {
+        let peers: Vec<_> = users
+            .iter()
+            .filter_map(convert::user_row)
+            .chain(chats.iter().filter_map(convert::chat_row))
+            .collect();
+        self.store.write(|w| {
+            for p in &peers {
+                w.put_peer(p)?;
+            }
+            for m in rows {
+                w.put_message(m)?;
+            }
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// A window of history around `id` for a message the cached segment does not

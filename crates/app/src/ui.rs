@@ -39,6 +39,7 @@ mod main_menu;
 mod menus;
 mod message_text;
 mod settings;
+mod threads;
 
 gpui::actions!(main_view, [Escape]);
 
@@ -378,6 +379,7 @@ struct SavedPane {
     unread_bar: Option<i32>,
     read_till: i32,
     newer_available: bool,
+    thread: Option<threads::ThreadView>,
 }
 
 /// A chat sliding in from the right (forward) or out to the right (back), as
@@ -388,6 +390,26 @@ struct Slide {
     forward: bool,
     start: Instant,
 }
+
+/// The message the field replies to: shown over the field ("Reply to Name").
+#[derive(Clone)]
+struct ReplyDraft {
+    msg_id: i32,
+    name: String,
+    text: String,
+}
+
+/// `historyReplyPadding`, `historyReplyTop` / `historyReplyBottom`: a reply's box in
+/// a message.
+const REPLY_PADDING: [f32; 4] = [11., 2., 6., 2.];
+const REPLY_TOP: f32 = 2.;
+const REPLY_BOTTOM: f32 = 2.;
+/// `historyReplyHeight`, `historyReplySkip`, `historyReplyIconPosition`,
+/// `msgReplyPadding.top`: the bar over the field.
+const REPLY_BAR_HEIGHT: f32 = 49.;
+const REPLY_BAR_SKIP: f32 = 53.;
+const REPLY_BAR_ICON: (f32, f32) = (7., 7.);
+const REPLY_BAR_TEXT_TOP: f32 = 6.;
 
 /// `MainWindow::setupIntro` / `setupMain` with an animation: the login screens
 /// arrive over the account ("Add Account"), or the account over the leaving ones
@@ -421,6 +443,8 @@ struct PaneRef<'a> {
     highlight: Option<(i32, f32)>,
     /// Clicks act (the open chat); a sliding copy only shows.
     live: bool,
+    /// The thread shown (its replies to the root show no reply box).
+    thread_root: Option<i32>,
 }
 
 /// `slideDuration`: the "scroll to top" / "scroll down" animations.
@@ -815,6 +839,12 @@ pub struct MainView {
     /// The login screens (no account yet, or "Add Account"), with the id the new
     /// account gets.
     intro: Option<(Entity<crate::intro::IntroView>, u32)>,
+    /// A thread of the open chat shown instead of its history (comments, a topic).
+    thread: Option<threads::ThreadView>,
+    /// An open forum: its topics beside the narrowed chat list.
+    forum: Option<threads::ForumView>,
+    /// The message each chat's field replies to (`FullReplyTo` of the draft).
+    reply_to: HashMap<PeerKey, ReplyDraft>,
     /// The login screens sliding in over the account or out under it, with the
     /// leaving login view while it goes.
     pub(crate) intro_slide: Option<IntroSlide>,
@@ -881,10 +911,24 @@ impl MainView {
                     item_ix: this.messages.len(),
                     offset_in_item: px(0.),
                 });
+                // In a thread every message replies to its root, or under it.
+                let root = this.thread.as_ref().and_then(|t| t.root);
+                let reply_to = match (this.reply_to.remove(&peer), root) {
+                    (Some(r), root) => Some(tdr_data::OutReply {
+                        msg_id: r.msg_id,
+                        top_id: root,
+                    }),
+                    (None, Some(root)) => Some(tdr_data::OutReply {
+                        msg_id: root,
+                        top_id: Some(root),
+                    }),
+                    (None, None) => None,
+                };
                 let _ = this.commands.send(Command::Send {
                     peer,
                     text: text.clone(),
                     entities: crate::text_input::out_entities(text, tags),
+                    reply_to,
                 });
             }
             cx.notify();
@@ -984,6 +1028,9 @@ impl MainView {
             accounts,
             intro: None,
             intro_slide: None,
+            reply_to: HashMap::new(),
+            thread: None,
+            forum: None,
             folders: Vec::new(),
             active_folder: 0,
             connection: chrome::Connection::new(),
@@ -1081,12 +1128,17 @@ impl MainView {
             unread_bar: self.unread_bar.take(),
             read_till: self.read_till,
             newer_available: self.newer_available,
+            thread: self.thread.take(),
         })
     }
 
     /// Keeps a chat's place for when it is opened again, unless it was left at its
     /// bottom.
     fn remember(&mut self, pane: SavedPane) {
+        // A thread is not where its chat opens again.
+        if pane.thread.is_some() {
+            return;
+        }
         if pane.stick_to_bottom {
             self.remembered.remove(&pane.peer);
         } else {
@@ -1112,6 +1164,7 @@ impl MainView {
         self.unread_bar = pane.unread_bar;
         self.read_till = pane.read_till;
         self.newer_available = pane.newer_available;
+        self.thread = pane.thread;
         self.unread_target = None;
         self.loading_older = false;
         self.loading_newer = false;
@@ -1265,7 +1318,9 @@ impl MainView {
     /// The chat list shows userpics only (tdesktop's `narrow` row context; never in
     /// one column).
     fn narrow(&self, window: &Window) -> bool {
-        !self.one_column() && self.dialogs_width(window) < COLUMN_MIN_LEFT / 2.
+        // An open forum narrows the chat list to userpics beside its topics.
+        self.forum.is_some()
+            || (!self.one_column() && self.dialogs_width(window) < COLUMN_MIN_LEFT / 2.)
     }
 
     /// The open chat's width.
@@ -1798,14 +1853,39 @@ impl MainView {
                     self.start_opening(peer);
                 }
             }
+            Update::ThreadCount { peer, root, count } => {
+                if self.selected == Some(peer)
+                    && let Some(t) = &mut self.thread
+                    && t.root.is_none_or(|r| r == root)
+                {
+                    t.count = Some(count);
+                }
+            }
+            Update::Topics { peer, topics } => {
+                if let Some(forum) = &mut self.forum
+                    && forum.peer == peer
+                {
+                    forum.topics = Some(topics);
+                }
+            }
             Update::History {
                 peer,
                 messages,
                 complete,
                 newer,
                 focus,
+                thread,
             } => {
-                if self.selected == Some(peer) {
+                // A thread's history goes to the thread view, the chat's to the chat.
+                let ours = match (&mut self.thread, thread) {
+                    (None, None) => true,
+                    (Some(t), Some(root)) if t.root.is_none_or(|r| r == root) => {
+                        t.root = Some(root);
+                        true
+                    }
+                    _ => false,
+                };
+                if self.selected == Some(peer) && ours {
                     self.history_complete = complete;
                     self.loading_older = false;
                     self.loading_newer = false;
@@ -1979,6 +2059,9 @@ impl MainView {
     /// `readInboxTill`), if the window is active.
     fn mark_read(&mut self, visible_end: usize) {
         let Some(peer) = self.selected else { return };
+        if self.thread.is_some() {
+            return;
+        }
         if !self.window_active || visible_end == 0 {
             return;
         }
@@ -2182,6 +2265,10 @@ impl MainView {
         if self.hide_menu() || self.clear_text_selection() {
         } else if self.layers.any() {
             self.layers.hide_current();
+        } else if let Some(peer) = self.selected
+            && self.reply_to.remove(&peer).is_some()
+        {
+            // `HistoryWidget::escape`: the reply goes first (`cancelReply`).
         } else if !self.back_stack.is_empty() {
             self.go_back(window, cx);
             return;
@@ -2191,6 +2278,8 @@ impl MainView {
             } else {
                 self.close_chat(window, cx);
             }
+        } else if self.forum.is_some() {
+            self.close_forum(cx);
         } else if self.archive_open {
             // `Widget::escape` with an open folder: `closeFolder`.
             self.close_archive(cx);
@@ -2238,6 +2327,11 @@ impl MainView {
     }
 
     fn open(&mut self, peer: PeerKey, window: &mut Window, cx: &mut Context<Self>) {
+        // A forum shows its topics instead (`Widget::openForum`).
+        if self.chat_item(peer).is_some_and(|c| c.rights.forum) {
+            self.open_forum(peer, cx);
+            return;
+        }
         // From the chat list: the back stack is cleared (`Way::ClearStack`); its chats
         // keep their places like any chat left.
         for pane in std::mem::take(&mut self.back_stack) {
@@ -2953,6 +3047,7 @@ impl MainView {
             unread_bar: self.unread_bar,
             highlight: self.highlight_opacity(),
             live: true,
+            thread_root: self.thread.as_ref().and_then(|t| t.root),
         };
         self.render_message_in(pane, i, window, view)
     }
@@ -2973,6 +3068,7 @@ impl MainView {
             unread_bar: slide.pane.unread_bar,
             highlight: None,
             live: false,
+            thread_root: slide.pane.thread.as_ref().and_then(|t| t.root),
         };
         self.render_message_in(pane, i, window, view)
     }
@@ -3076,11 +3172,15 @@ impl MainView {
         let is_group = chat.is_some_and(|d| d.is_group());
         let is_saved = chat.is_some_and(|d| d.is_saved);
         let wide = chat_width >= CHAT_WIDE_WIDTH;
-        let right_side = item.out && !wide;
+        // `isCommentsRootView`: a post's copy over its comments is centered, as
+        // wide as a message can be, without a userpic or a name.
+        let comments_root = pane.thread_root == Some(item.id) && item.forwarded.is_some();
+        let right_side = item.out && !wide && !comments_root;
         // `hasFromPhoto`: groups, and forwards from others in Saved Messages; posts
         // hide their author (`isPostHidingAuthor`).
         let post = item.post.as_ref();
-        let with_userpic = post.is_none() && (wide || ((is_group || is_saved) && !item.out));
+        let with_userpic =
+            post.is_none() && !comments_root && (wide || ((is_group || is_saved) && !item.out));
 
         let prev_attached = i > 0 && Self::attached(pane, &pane.messages[i - 1], item);
         let next_attached = pane
@@ -3109,7 +3209,10 @@ impl MainView {
             (lg(MSG_MAX_WIDTH).min(chat_width - lg(reserved)) - 2. * pad_x).max(lg(120.));
         let text_font = scale::font(FONT_SIZE);
         let date_font = scale::font(DATE_FONT_SIZE);
-        let sender = item.sender.as_ref().filter(|_| !prev_attached);
+        let sender = item
+            .sender
+            .as_ref()
+            .filter(|_| !prev_attached && !comments_root);
         // Media is not drawn yet: its caption stands in ("Photo", "Voice message").
         let media = item.media.as_ref();
         let text = if item.text.is_empty() {
@@ -3138,10 +3241,15 @@ impl MainView {
         });
         let comments = post.and_then(|p| p.comments.clone());
         // The button is as wide as its parts at least (less the bubble's padding).
+        let repliers = post.map_or(&[][..], |p| p.repliers.as_slice());
         let comments_w = comments.as_ref().map_or(0., |t| {
             text_width(window, t, FONT_SIZE, FontWeight::SEMIBOLD)
                 + lg(COMMENTS_SKIP_LEFT + COMMENTS_SKIP_TEXT + COMMENTS_SKIP_RIGHT)
-                + icon_width(Icon::HistoryComments, window)
+                + if repliers.is_empty() {
+                    icon_width(Icon::HistoryComments, window)
+                } else {
+                    threads::commenters_width(repliers.len())
+                }
                 + icon_width(Icon::HistoryCommentsOpen, window)
                 - 2. * lg(MSG_PADDING_X)
         });
@@ -3185,12 +3293,38 @@ impl MainView {
         });
         let media_w =
             media_line.map_or(0., |m| text_width(window, m, FONT_SIZE, FontWeight::NORMAL));
+        // `Reply`: inside a thread its reply to the root is not shown.
+        let reply = item
+            .reply
+            .as_ref()
+            .filter(|r| pane.thread_root != Some(r.msg_id));
+        let reply_w = reply.map_or(0., |r| {
+            lg(REPLY_PADDING[0])
+                + text_width(window, &r.name, FONT_SIZE, FontWeight::SEMIBOLD).max(text_width(
+                    window,
+                    &r.text,
+                    FONT_SIZE,
+                    FontWeight::NORMAL,
+                ))
+                + lg(REPLY_PADDING[2])
+        });
+        let reply_h = if reply.is_some() {
+            lg(REPLY_TOP)
+                + lg(REPLY_PADDING[1])
+                + 2. * text_font.height
+                + lg(REPLY_PADDING[3])
+                + lg(REPLY_BOTTOM)
+        } else {
+            0.
+        };
         // Whole device pixels; the text is laid out at this width.
         let inner = (text_w
             .max(name_w)
             .max(media_w)
             .max(forwarded_w)
             .max(comments_w)
+            .max(reply_w)
+            .max(if comments_root { max_text } else { 0. })
             .min(max_text)
             * scale::get())
         .ceil()
@@ -3356,6 +3490,9 @@ impl MainView {
                     }))
                     .child(div().flex_1().min_w(px(0.)).child(one_line(f.name.clone())))
             }))
+            .children(
+                reply.map(|r| self.render_reply_box(r, item.out, inner, pane.live, window, view)),
+            )
             .children(media_line.map(|m| {
                 div()
                     .w(gpui::px(inner))
@@ -3367,7 +3504,19 @@ impl MainView {
             .child(info)
             .when(comments_h > 0., |d| d.pb(gpui::px(pad_y + comments_h)))
             .children(comments.map(|text| {
-                self.render_comments_button(item.id, text, inner + 2. * pad_x, window)
+                let discussion = post.and_then(|p| p.discussion);
+                let channel = pane.peer;
+                let post_id = item.id;
+                let live = pane.live;
+                let view = view.clone();
+                self.render_comments_button(item.id, text, repliers, bg, inner + 2. * pad_x, window)
+                    .on_click(move |_, _, cx| {
+                        if let (true, Some(channel)) = (live, channel) {
+                            let _ = view.update(cx, |this, cx| {
+                                this.open_comments(channel, post_id, discussion, cx);
+                            });
+                        }
+                    })
             }));
         // The tail (`bubble_tail`) hangs outside the square corner; the shadow line
         // continues under it (`PaintBubbleGeneric`).
@@ -3397,6 +3546,7 @@ impl MainView {
         // The bubble's height, for the button beside it.
         let bubble_h = 2. * pad_y
             + comments_h
+            + reply_h
             + text_h
             + text_font.height
                 * (sender.is_some() as u8 + forwarded.is_some() as u8 + media_line.is_some() as u8)
@@ -3457,6 +3607,7 @@ impl MainView {
             .live
             .then(|| {
                 let text_top = pad_y
+                    + reply_h
                     + text_font.height
                         * (sender.is_some() as u8
                             + forwarded.is_some() as u8
@@ -3554,9 +3705,207 @@ impl MainView {
             .children(highlight)
             .px(px(MSG_SIDE))
             .when(right_side, |d| d.justify_end())
+            // Centered in the messages' column, as the service lines are.
+            .when(comments_root, |d| {
+                d.justify_center()
+                    .max_w(gpui::px(service_column(chat_width)))
+            })
             .children(avatar_slot)
             .child(bubble)
             .into_any_element()
+    }
+
+    /// The replied message over the text (`Reply::paint`): a tinted box in the
+    /// sender's color with its outline, the sender's name and the first line; a
+    /// click shows the message.
+    fn render_reply_box(
+        &self,
+        r: &crate::bridge::ReplyLine,
+        out: bool,
+        width: f32,
+        live: bool,
+        _window: &Window,
+        view: &WeakEntity<Self>,
+    ) -> AnyElement {
+        let p = self.palette();
+        let font = scale::font(FONT_SIZE);
+        // `FromNameFg` for a colored sender in incoming messages, the message's
+        // reply colors otherwise.
+        let (bar, name_fg, text_fg) = match (out, r.color) {
+            (true, _) => (
+                p.msg_out_reply_bar_color,
+                p.msg_out_service_fg,
+                p.history_text_out_fg,
+            ),
+            (false, Some(color)) => {
+                let c = name_color(p, color);
+                (c, c, p.history_text_in_fg)
+            }
+            (false, None) => (
+                p.msg_in_reply_bar_color,
+                p.msg_in_service_fg,
+                p.history_text_in_fg,
+            ),
+        };
+        let quote = r.quote;
+        let (peer, msg_id) = (r.peer, r.msg_id);
+        let view = view.clone();
+        div()
+            .id(SharedString::from(format!("reply-{}-{}", peer.id, msg_id)))
+            .relative()
+            .w(gpui::px(width))
+            .mt(px(REPLY_TOP))
+            .mb(px(REPLY_BOTTOM))
+            .pl(px(REPLY_PADDING[0]))
+            .pr(px(REPLY_PADDING[2]))
+            .pt(px(REPLY_PADDING[1]))
+            .pb(px(REPLY_PADDING[3]))
+            .cursor_pointer()
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        crate::rich_text::paint_quote_box(bounds, bar, quote, window);
+                    },
+                )
+                .absolute()
+                .left_0()
+                .top_0()
+                .size_full(),
+            )
+            .child(
+                div()
+                    .h(font.line_height())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(c(name_fg))
+                    .child(one_line(r.name.clone())),
+            )
+            .child(
+                div()
+                    .h(font.line_height())
+                    .text_color(c(text_fg))
+                    .child(one_line(r.text.clone())),
+            )
+            .on_click(move |_, window, cx| {
+                if live {
+                    let _ = view.update(cx, |this, cx| {
+                        this.go_to_original(peer, Some(msg_id), window, cx);
+                    });
+                }
+            })
+            .into_any_element()
+    }
+
+    /// "Reply" in a message's menu: the field replies to it, the bar over the field
+    /// says to whom (`HistoryWidget::replyToMessage`).
+    fn start_reply(
+        &mut self,
+        peer: PeerKey,
+        msg_id: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.messages.iter().find(|m| m.id == msg_id) else {
+            return;
+        };
+        let name = match &item.sender {
+            Some((name, _)) => name.clone(),
+            None if item.out => self
+                .accounts
+                .read(cx)
+                .active()
+                .and_then(|s| s.me.as_ref().map(|m| m.name.clone()))
+                .unwrap_or_default(),
+            None => self
+                .chat_item(peer)
+                .map(|c| c.name.clone())
+                .unwrap_or_default(),
+        };
+        let text = item
+            .text
+            .lines()
+            .next()
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .or_else(|| item.media.clone())
+            .unwrap_or_default();
+        self.reply_to
+            .insert(peer, ReplyDraft { msg_id, name, text });
+        window.focus(&self.input.focus_handle(cx));
+        cx.notify();
+    }
+
+    /// The bar over the field while it replies (`HistoryWidget::drawField`): the
+    /// reply icon, "Reply to Name", the message's first line, the cancel cross.
+    fn render_reply_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let peer = self.selected?;
+        let draft = self.reply_to.get(&peer)?;
+        let p = self.palette();
+        let font = scale::font(FONT_SIZE);
+        let close = self
+            .icon_button(
+                "reply-cancel",
+                Icon::BoxButtonClose,
+                (REPLY_BAR_HEIGHT, REPLY_BAR_HEIGHT),
+                None,
+                ((4., 4.), 40.),
+                (p.history_reply_cancel_fg, p.history_reply_cancel_fg_over),
+                window,
+                cx,
+                move |this, _, cx| {
+                    this.reply_to.remove(&peer);
+                    cx.notify();
+                },
+            )
+            .absolute()
+            .right_0()
+            .top_0();
+        Some(
+            div()
+                .relative()
+                .flex_none()
+                .w_full()
+                .h(px(REPLY_BAR_HEIGHT))
+                .bg(c(p.history_reply_bg))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(REPLY_BAR_ICON.0))
+                        .top(px(REPLY_BAR_ICON.1))
+                        .child(icon(Icon::InputReply, p.history_reply_icon_fg, window)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(REPLY_BAR_SKIP))
+                        .right(px(REPLY_BAR_HEIGHT))
+                        .top(px(REPLY_BAR_TEXT_TOP))
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .h(font.line_height())
+                                .flex()
+                                .text_color(c(p.window_active_text_fg))
+                                .child(div().flex_none().child("Reply to\u{a0}"))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(one_line(draft.name.clone())),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .h(font.line_height())
+                                .text_color(c(p.history_compose_area_fg))
+                                .child(one_line(draft.text.clone())),
+                        ),
+                )
+                .child(close)
+                .into_any_element(),
+        )
     }
 
     /// A post's comments button (`Message::paintCommentsButton`): a faint line over
@@ -3566,6 +3915,8 @@ impl MainView {
         &self,
         id: i32,
         text: String,
+        repliers: &[crate::bridge::Author],
+        bubble_bg: tdr_theme::Color,
         width: f32,
         window: &Window,
     ) -> gpui::Stateful<gpui::Div> {
@@ -3600,7 +3951,12 @@ impl MainView {
                     .bottom_0()
                     .flex()
                     .items_center()
-                    .child(icon(Icon::HistoryComments, fg, window))
+                    .child(if repliers.is_empty() {
+                        icon(Icon::HistoryComments, fg, window).into_any_element()
+                    } else {
+                        self.render_commenters(repliers, bubble_bg)
+                            .into_any_element()
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -4009,9 +4365,11 @@ impl MainView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let p = self.palette();
-        let status = match chat.lastseen {
-            Some(lastseen) => present::lastseen_text(lastseen, chrono::Local::now()),
-            None => self
+        let thread_header = self.thread_header();
+        let status = match (&thread_header, chat.lastseen) {
+            (Some((_, status)), _) => status.clone(),
+            (None, Some(lastseen)) => present::lastseen_text(lastseen, chrono::Local::now()),
+            (None, None) => self
                 .members
                 .get(&chat.peer)
                 .cloned()
@@ -4073,7 +4431,12 @@ impl MainView {
                         div()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(c(p.window_bold_fg))
-                            .child(self.name_with_badge(&chat.name, chat.badge, false, window)),
+                            .child(match &thread_header {
+                                Some((title, _)) => one_line(title.clone()).into_any_element(),
+                                None => self
+                                    .name_with_badge(&chat.name, chat.badge, false, window)
+                                    .into_any_element(),
+                            }),
                     )
                     .when(!status.is_empty(), |d| {
                         d.child(div().text_color(c(status_fg)).child(one_line(status)))
@@ -4317,19 +4680,30 @@ impl Render for MainView {
         } else {
             self.render_folder_tabs(window, cx)
         };
-        let top_bar = if self.archive_open {
+        let forum_open = self.forum.is_some();
+        let top_bar = if forum_open {
+            self.render_forum_strip_header(window, cx)
+        } else if self.archive_open {
             self.render_archive_bar(window, cx)
         } else {
             top_bar
         };
+        let strip = lg(threads::FORUM_STRIP_WIDTH).min(dialogs_width);
         let live_list = div()
-            .size_full()
+            .when(forum_open, |d| d.w(gpui::px(strip)).flex_none().h_full())
+            .when(!forum_open, |d| d.size_full())
             .flex()
             .flex_col()
             .bg(c(p.dialogs_bg))
             .child(top_bar)
-            .children(tabs)
+            .children(tabs.filter(|_| !forum_open))
             .child(dialogs_area);
+        let live_list = if forum_open {
+            let topics = self.render_topics_column((dialogs_width - strip).max(0.), window, cx);
+            div().size_full().flex().child(live_list).child(topics)
+        } else {
+            live_list
+        };
         let list_content = self.archive_slide_view(live_list, dialogs_width, narrow, window, cx);
         let left = div()
             .w(gpui::px(dialogs_width))
@@ -4431,6 +4805,8 @@ impl Render for MainView {
                     .children(to_down);
                 let has_text = !self.input.read(cx).is_empty();
                 let field_extras = self.render_field_extras(self.chat_width(window), window, cx);
+                let reply_bar = self.render_reply_bar(window, cx);
+                let replying = reply_bar.is_some();
                 let composer = div()
                     .relative()
                     .flex_none()
@@ -4439,8 +4815,7 @@ impl Render for MainView {
                     .items_end()
                     .bg(c(p.history_compose_area_bg))
                     .text_color(c(p.history_compose_area_fg))
-                    .border_t_1()
-                    .border_color(border)
+                    .when(!replying, |d| d.border_t_1().border_color(border))
                     .child(self.render_attach(window, cx))
                     .child(
                         div()
@@ -4492,8 +4867,22 @@ impl Render for MainView {
                     .child(header)
                     .child(feed)
                     .child(
-                        self.render_compose_bar(&chat, self.chat_width(window), window, cx)
-                            .unwrap_or_else(|| composer.into_any_element()),
+                        self.thread
+                            .is_none()
+                            .then(|| {
+                                self.render_compose_bar(&chat, self.chat_width(window), window, cx)
+                            })
+                            .flatten()
+                            .unwrap_or_else(|| {
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .flex_col()
+                                    .when(replying, |d| d.border_t_1().border_color(border))
+                                    .children(reply_bar)
+                                    .child(composer)
+                                    .into_any_element()
+                            }),
                     );
                 self.with_slide(live, border, window, cx)
             }

@@ -46,6 +46,9 @@ pub enum Icon {
     /// "Hide with Spoiler" (`menuIconSpoiler`).
     PlayerCheck,
     MenuSpoiler,
+    /// The bar over the field while replying (`historyReplyIcon`) and its cross.
+    InputReply,
+    BoxButtonClose,
     /// The chat's "⋮" menu (`fillHistoryActions`, `FillMuteMenu`).
     MenuInfo,
     MenuReport,
@@ -333,6 +336,8 @@ impl Icon {
             Icon::ArchiveUserpic => icon_bytes!("archive_userpic"),
             Icon::ProxyOff => icon_bytes!("proxy_off"),
             Icon::PlayerCheck => icon_bytes!("player__player_check"),
+            Icon::InputReply => icon_bytes!("chat__input_reply_settings"),
+            Icon::BoxButtonClose => icon_bytes!("box_button_close"),
             Icon::MenuInfo => icon_bytes!("menu__info"),
             Icon::MenuReport => icon_bytes!("menu__report"),
             Icon::MenuColors => icon_bytes!("menu__colors"),
@@ -650,6 +655,120 @@ pub fn premium_star(colors: &[(f32, Color)], size: f32, window: &Window) -> Div 
             .top(px(-pad))
             .size(px(side + 2. * pad)),
     )
+}
+
+/// A forum topic's icon (`ForumTopicIconFrame`): the colored bubble of its
+/// `icon_color` (`ForumTopicIcons`, gray for others) with the title's first letter
+/// in white bold, or the "General" topic's "#" in `general_color`.
+pub fn topic_icon(
+    color_id: i32,
+    general: bool,
+    title: &str,
+    size: f32,
+    general_color: Color,
+    window: &Window,
+) -> gpui::AnyElement {
+    let scale = window.scale_factor();
+    let device = (crate::scale::lg(size) * scale).round().max(1.);
+    let name = if general {
+        "general"
+    } else {
+        match color_id {
+            0x6FB9F0 => "blue",
+            0xFFD67E => "yellow",
+            0xCB86DB => "violet",
+            0x8EEE98 => "green",
+            0xFF93B2 => "rose",
+            0xFB6F5F => "red",
+            _ => "gray",
+        }
+    };
+    let tint = general.then(|| general_color.rgba());
+    /// (icon, device size, tint) -> image.
+    type TopicIcons = HashMap<(&'static str, u32, Option<u32>), Arc<RenderImage>>;
+    static CACHE: LazyLock<Mutex<TopicIcons>> = LazyLock::new(Default::default);
+    let key = (name, device.to_bits(), tint);
+    let cached = CACHE.lock().unwrap().get(&key).cloned();
+    let image = cached.unwrap_or_else(|| {
+        let svg: &[u8] = match name {
+            "general" => include_bytes!("../../../assets/tdesktop-art/topic_icons__general.svg"),
+            "blue" => include_bytes!("../../../assets/tdesktop-art/topic_icons__blue.svg"),
+            "yellow" => include_bytes!("../../../assets/tdesktop-art/topic_icons__yellow.svg"),
+            "violet" => include_bytes!("../../../assets/tdesktop-art/topic_icons__violet.svg"),
+            "green" => include_bytes!("../../../assets/tdesktop-art/topic_icons__green.svg"),
+            "rose" => include_bytes!("../../../assets/tdesktop-art/topic_icons__rose.svg"),
+            "red" => include_bytes!("../../../assets/tdesktop-art/topic_icons__red.svg"),
+            _ => include_bytes!("../../../assets/tdesktop-art/topic_icons__gray.svg"),
+        };
+        let n = device as u32;
+        let mut out = image::RgbaImage::new(n + 2 * PAD, n + 2 * PAD);
+        if let (Ok(tree), Some(mut pixmap)) = (
+            resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default()),
+            resvg::tiny_skia::Pixmap::new(n, n),
+        ) {
+            let size = tree.size();
+            let transform = resvg::tiny_skia::Transform::from_scale(
+                n as f32 / size.width(),
+                n as f32 / size.height(),
+            );
+            resvg::render(&tree, transform, &mut pixmap.as_mut());
+            for (i, px) in pixmap.pixels().iter().enumerate() {
+                let c = px.demultiply();
+                let (x, y) = (i as u32 % n, i as u32 / n);
+                // `style::colorizeImage` for "General": its shape in the color.
+                let (r, g, b, a) = match tint {
+                    Some(t) => (
+                        (t >> 24) as u8,
+                        (t >> 16) as u8,
+                        (t >> 8) as u8,
+                        ((c.alpha() as u32 * (t & 0xff)) / 255) as u8,
+                    ),
+                    None => (c.red(), c.green(), c.blue(), c.alpha()),
+                };
+                // GPUI expects BGRA.
+                out.put_pixel(x + PAD, y + PAD, image::Rgba([b, g, r, a]));
+            }
+        }
+        let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+            out
+        )]));
+        CACHE.lock().unwrap().insert(key, image.clone());
+        image
+    });
+    let pad = PAD as f32 / scale;
+    let side = device / scale;
+    // `ExtractNonEmojiLetter`: the first letter or digit.
+    let letter = (!general)
+        .then(|| title.chars().find(|c| c.is_alphanumeric()))
+        .flatten()
+        .map(|c| c.to_uppercase().to_string());
+    let font = crate::scale::font(11.);
+    div()
+        .flex_none()
+        .relative()
+        .size(px(side))
+        .child(
+            img(image)
+                .absolute()
+                .left(px(-pad))
+                .top(px(-pad))
+                .size(px(side + 2. * pad)),
+        )
+        .children(letter.map(|l| {
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px(crate::scale::lg(2.)))
+                .flex()
+                .justify_center()
+                .text_size(font.size)
+                .line_height(font.line_height())
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(gpui::white())
+                .child(l)
+        }))
+        .into_any_element()
 }
 
 /// tdesktop's logo without margins (`Window::LogoNoMargin`, `art/logo_256_no_margin`):

@@ -56,7 +56,7 @@ pub(super) struct TextUi {
     hover: Option<(TextKey, u16)>,
     press: Option<TextPress>,
     /// Messages whose spoilers were clicked open (all of a text at once).
-    revealed: HashMap<TextKey, Instant>,
+    pub(super) revealed: HashMap<TextKey, Instant>,
     /// Open this chat at the next frame (a resolved username; needs the window).
     pub(super) pending_open: Option<(PeerKey, Option<i32>)>,
     pub(super) toast: Option<Toast>,
@@ -644,6 +644,7 @@ impl MainView {
                     peer: key.0,
                     text: command,
                     entities: Vec::new(),
+                    reply_to: None,
                 });
             }
             Link::Date(date) => self.open_date_menu(date, at),

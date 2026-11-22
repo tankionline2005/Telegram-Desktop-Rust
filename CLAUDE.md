@@ -155,3 +155,11 @@
   `MainView::intro_slide` (`Root::rebuild` hands over the leaving login view).
 - Demo test scripts: `uilib.ps1`'s `Click` waits 350 ms after the press; to catch an
   animation mid-way, press without the wait and shoot at once.
+- Replies: `MessageItem.reply` (`bridge::reply_line`; missing replied messages are
+  asked for by `resolve_replies` at the top of the data loop), drawn by
+  `render_reply_box`; the field's reply bar is `render_reply_bar` (`MainView::reply_to`).
+- Threads (comments, forum topics) are `Shown::Thread` in the bridge and
+  `MainView::thread` in the UI (`ui/threads.rs`); `Update::History.thread` says
+  whose history it is. Forums open their topics list (`MainView::forum`) beside the
+  chat list narrowed to userpics. Demo: Telegram Tips has comments, Design Team is a
+  forum.

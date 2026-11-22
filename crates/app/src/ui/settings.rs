@@ -1267,6 +1267,13 @@ impl MainView {
     }
 }
 
+impl MainView {
+    /// Covers the own number's spoiler again (a click showed it).
+    pub(super) fn hide_phone_spoiler(&mut self) {
+        self.text_ui.revealed.retain(|key, _| key.1 != LABEL_PHONE);
+    }
+}
+
 /// Which label of the cover a menu is for.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum CoverLabel {

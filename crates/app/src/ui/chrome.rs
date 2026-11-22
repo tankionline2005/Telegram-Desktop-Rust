@@ -268,9 +268,13 @@ impl MainView {
                 channel,
                 direct,
                 gift,
+                request,
             } => (
+                // `refreshJoinChannelText`.
                 if channel {
                     "JOIN CHANNEL"
+                } else if request {
+                    "APPLY TO JOIN GROUP"
                 } else {
                     "JOIN GROUP"
                 },
@@ -361,7 +365,9 @@ impl MainView {
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.release_buttons();
-                if !join {
+                if join {
+                    let _ = this.commands.send(Command::Join(peer));
+                } else {
                     this.set_chat_muted(peer, mute);
                     let _ = this.commands.send(Command::SetMuted { peer, mute });
                 }

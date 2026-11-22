@@ -425,7 +425,11 @@ impl MainView {
         let is_channel = kind == Some(tdr_data::describe::PeerKind::Channel);
         let is_group = kind == Some(tdr_data::describe::PeerKind::Group);
         let now = chrono::Local::now().timestamp();
-        let can_reply = !is_channel || item.out;
+        // `canReply`: where we can write (`CanSendAnything`).
+        let can_reply = item.service.is_none()
+            && self
+                .chat_item(key.0)
+                .is_some_and(|c| c.compose == crate::bridge::Compose::Field);
         let can_edit = item.out
             && item.forwarded.is_none()
             && (is_saved || now - i64::from(item.date) < EDIT_TIME_LIMIT);
@@ -465,7 +469,11 @@ impl MainView {
                 MenuAction::CopySelected,
             ));
         } else if can_reply {
-            e.push(Entry::action("Reply", Icon::MenuReply, MenuAction::Reply));
+            e.push(Entry::action(
+                "Reply",
+                Icon::MenuReply,
+                MenuAction::Reply(key.0, key.1),
+            ));
         }
         if can_edit {
             e.push(Entry::action("Edit", Icon::MenuEdit, MenuAction::Edit));
@@ -748,6 +756,8 @@ impl MainView {
                     .and_then(|s| s.me.as_ref())
                     .is_some_and(|m| m.phone_hidden);
                 let _ = self.commands.send(Command::SetPhoneHidden(!hidden));
+                // Turned on: the number is covered at once, even if it was shown.
+                self.hide_phone_spoiler();
             }
             MenuAction::LogOut => {
                 let id = self.accounts.read(cx).registry.active;
@@ -755,8 +765,8 @@ impl MainView {
             }
             // Replies, editing, pins, forwarding, deleting, selecting messages,
             // contacts, calendar export, profiles and notifications come later.
-            MenuAction::Reply
-            | MenuAction::QuoteReply
+            MenuAction::Reply(peer, msg_id) => self.start_reply(peer, msg_id, window, cx),
+            MenuAction::QuoteReply
             | MenuAction::Edit
             | MenuAction::Pin
             | MenuAction::Forward

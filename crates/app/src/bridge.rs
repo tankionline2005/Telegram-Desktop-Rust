@@ -65,6 +65,7 @@ pub enum Command {
         peer: PeerKey,
         text: String,
         entities: Vec<tdr_data::OutEntity>,
+        reply_to: Option<tdr_data::OutReply>,
     },
     /// The user saw the open chat's messages up to `max_id`: mark them read.
     Read {
@@ -102,6 +103,21 @@ pub enum Command {
     SetPhoneHidden(bool),
     /// "Leave group" / "Leave channel" / "Delete and leave" (confirmed).
     Leave(PeerKey),
+    /// "Join Channel" / "Join Group" / "Apply to Join Group".
+    Join(PeerKey),
+    /// A post's comments (`messages.getDiscussionMessage`), shown as a thread of
+    /// its discussion group over the open chat (Back returns).
+    OpenComments {
+        channel: PeerKey,
+        post: i32,
+    },
+    /// A forum topic's messages, as a thread (Back returns).
+    OpenThread {
+        peer: PeerKey,
+        root: i32,
+    },
+    /// A forum's topics list.
+    OpenForum(PeerKey),
 }
 
 /// The list id of the archive in `Update::Dialogs` (folders have positive ids).
@@ -139,6 +155,19 @@ pub enum Update {
         newer: bool,
         /// Show this message (and highlight it).
         focus: Option<i32>,
+        /// A thread of the chat (a topic, a post's comments): its root.
+        thread: Option<i32>,
+    },
+    /// How many messages a thread has (its header: "12 comments", "5 messages").
+    ThreadCount {
+        peer: PeerKey,
+        root: i32,
+        count: i32,
+    },
+    /// A forum's topics, for its list.
+    Topics {
+        peer: PeerKey,
+        topics: Vec<TopicItem>,
     },
     /// The draft of `peer` was changed from another device: the input field of that
     /// chat shows `text` now (`None`: empty).
@@ -245,6 +274,8 @@ pub struct ChatRights {
     pub discussion: bool,
     /// A channel we may post to: "Create poll".
     pub can_post: bool,
+    /// A group with topics: it opens its topics list.
+    pub forum: bool,
 }
 
 /// The bottom of a chat (`HistoryWidget::updateControlsVisibility`): the message
@@ -262,6 +293,8 @@ pub enum Compose {
         channel: bool,
         direct: bool,
         gift: bool,
+        /// A group asking an admin's approval: "Apply to Join Group".
+        request: bool,
     },
     MuteUnmute {
         direct: bool,
@@ -279,6 +312,7 @@ impl Compose {
                 channel,
                 direct,
                 gift,
+                request: !channel && info.join_request && !info.creator,
             }
         } else if channel && !info.can_post {
             Compose::MuteUnmute { direct, gift }
@@ -571,6 +605,10 @@ pub struct MessageItem {
     pub edit_date: Option<i32>,
     /// A channel post: its own bubble with the channel's name, no userpic.
     pub post: Option<Post>,
+    pub reply: Option<ReplyLine>,
+    /// The thread it belongs to (`reply_to_top_id`, or the replied message when
+    /// that is the root): its reply to the root is not shown inside the thread.
+    pub thread_root: Option<i32>,
 }
 
 /// What a channel post shows besides its text (`Message` with `isPost`).
@@ -582,6 +620,41 @@ pub struct Post {
     pub signature: Option<String>,
     /// The comments button under the text: "3 comments", "Leave a comment".
     pub comments: Option<String>,
+    /// The last commenters' userpics on it (`recent_repliers`).
+    pub repliers: Vec<Author>,
+    /// The discussion group its comments are in.
+    pub discussion: Option<PeerKey>,
+}
+
+/// A forum topic in its list (`Dialogs::Row` of a `ForumTopic`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopicItem {
+    pub id: i32,
+    pub title: String,
+    /// `icon_color`; the "General" topic (id 1) has its "#" icon.
+    pub icon_color: i32,
+    pub general: bool,
+    pub last: LastLine,
+    pub time: String,
+    pub unread: i32,
+    pub muted: bool,
+    pub pinned: bool,
+    pub closed: bool,
+}
+
+/// The replied message over a message's text (`HistoryView::Reply`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplyLine {
+    /// Where the replied message is (a click shows it there).
+    pub peer: PeerKey,
+    pub msg_id: i32,
+    /// Its sender's name and color (`None`: no color, the service color).
+    pub name: String,
+    pub color: Option<u8>,
+    /// Its first line, a media caption, "Loading..." or "Deleted message".
+    pub text: String,
+    /// The text is a quote of it (the quote icon).
+    pub quote: bool,
 }
 
 /// The "Forwarded from" line (`HistoryMessageForwarded::text`).
@@ -967,6 +1040,7 @@ fn dialog_item(store: &Storage, d: &DialogView, ctx: &Context) -> DialogItem {
             noforwards: info.noforwards,
             discussion: full.as_ref().is_some_and(|f| f.linked_chat.is_some()),
             can_post: info.can_post,
+            forum: info.forum,
         },
     }
 }
@@ -1113,7 +1187,24 @@ fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec
                     views: info.views.map(present::count_short),
                     signature: info.post_author.clone(),
                     comments: info.comments.map(present::comments_text),
+                    repliers: info
+                        .recent_repliers
+                        .iter()
+                        .take(3)
+                        .map(|&k| {
+                            authors
+                                .entry(k)
+                                .or_insert_with(|| author_of(store, k))
+                                .clone()
+                        })
+                        .collect(),
+                    discussion: info.comments_channel.map(PeerKey::channel),
                 }),
+                reply: info
+                    .reply
+                    .as_ref()
+                    .and_then(|r| reply_line(store, peer, r, &ctx)),
+                thread_root: info.reply.as_ref().and_then(|r| r.top_id.or(r.msg_id)),
                 media,
                 service: service.filter(|_| !call),
                 edited: info.edited,
@@ -1147,6 +1238,132 @@ fn demo_archive_row(archived: &[DialogItem], in_menu: bool) -> ArchiveInfo {
         more: archived.len() - shown,
         unread: archived.iter().filter(|d| d.unread > 0).count() as u32,
     }
+}
+
+/// Replied messages not in the cache yet, asked for once
+/// (`ApiWrap::requestMessageData`); those the server does not have are deleted.
+static PENDING_REPLIES: std::sync::Mutex<Vec<(PeerKey, i32)>> = std::sync::Mutex::new(Vec::new());
+static ASKED_REPLIES: std::sync::LazyLock<std::sync::Mutex<HashSet<(PeerKey, i32)>>> =
+    std::sync::LazyLock::new(Default::default);
+static DELETED_REPLIES: std::sync::LazyLock<std::sync::Mutex<HashSet<(PeerKey, i32)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The replied message's line (`Reply::update`): its sender and first line from
+/// the cache; "Loading..." while it is asked for, "Deleted message" if it is gone.
+fn reply_line(
+    store: &Storage,
+    chat: PeerKey,
+    reply: &describe::ReplyTo,
+    ctx: &Context,
+) -> Option<ReplyLine> {
+    let msg_id = reply.msg_id?;
+    let peer = reply.peer.unwrap_or(chat);
+    let quote = reply.quote.clone();
+    let Some(row) = store.message(peer, msg_id).ok().flatten() else {
+        // A reply to a chat we can't see: the sender only (`reply_from`).
+        if let Some(name) = reply
+            .from_name
+            .clone()
+            .or_else(|| reply.from.map(|k| peer_name(store, k)))
+        {
+            return Some(ReplyLine {
+                peer,
+                msg_id,
+                color: reply.from.map(|k| author_of(store, k).color),
+                name,
+                text: quote.clone().unwrap_or_default(),
+                quote: quote.is_some(),
+            });
+        }
+        let key = (peer, msg_id);
+        let deleted = DELETED_REPLIES.lock().unwrap().contains(&key);
+        if !deleted && ASKED_REPLIES.lock().unwrap().insert(key) {
+            PENDING_REPLIES.lock().unwrap().push(key);
+        }
+        return Some(ReplyLine {
+            peer,
+            msg_id,
+            name: if deleted {
+                "Deleted message".into()
+            } else {
+                "Loading...".into()
+            },
+            color: None,
+            text: String::new(),
+            quote: false,
+        });
+    };
+    let me = PeerKey::user(ctx.self_id);
+    let sender = if row.out && peer.kind != PeerKind::Channel {
+        me
+    } else {
+        row.from.unwrap_or(peer)
+    };
+    let is_channel = store
+        .peer(peer)
+        .ok()
+        .flatten()
+        .is_some_and(|p| describe::peer_info(&p).kind == ChatKind::Channel);
+    let (media, service, _) = message_content(store, &row, is_channel);
+    let text = match quote.clone() {
+        Some(q) => q,
+        None => {
+            let full = row_text(&row);
+            let first = full.lines().next().unwrap_or("").to_string();
+            if first.is_empty() {
+                media.or(service).unwrap_or_default()
+            } else {
+                first
+            }
+        }
+    };
+    Some(ReplyLine {
+        peer,
+        msg_id,
+        name: peer_name(store, sender),
+        color: Some(author_of(store, sender).color),
+        text,
+        quote: quote.is_some(),
+    })
+}
+
+/// Asks the server for the replied messages that were missing, then shows the
+/// open chat again with them.
+async fn resolve_replies(
+    sync: &mut Sync,
+    open: Option<PeerKey>,
+    shown: &Shown,
+    tx: &mpsc::UnboundedSender<Update>,
+) -> anyhow::Result<()> {
+    let pending: Vec<(PeerKey, i32)> = std::mem::take(&mut *PENDING_REPLIES.lock().unwrap());
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut by_peer: HashMap<PeerKey, Vec<i32>> = HashMap::new();
+    for (peer, id) in pending {
+        by_peer.entry(peer).or_default().push(id);
+    }
+    for (peer, ids) in by_peer {
+        match sync.fetch_messages(peer, &ids).await {
+            Ok(found) => {
+                let mut deleted = DELETED_REPLIES.lock().unwrap();
+                for id in ids.iter().filter(|id| !found.contains(id)) {
+                    deleted.insert((peer, *id));
+                }
+            }
+            Err(e) => {
+                error!("replied messages: {e}");
+                let mut deleted = DELETED_REPLIES.lock().unwrap();
+                for id in &ids {
+                    deleted.insert((peer, *id));
+                }
+            }
+        }
+    }
+    if let Some(peer) = open {
+        send_history(sync.store(), peer, shown, None, tx)?;
+    }
+    Ok(())
 }
 
 /// A hidden sender ("Forwarded from" a name only): initials and a color from the
@@ -1385,11 +1602,32 @@ async fn load_full(
     folders: &mut Folders,
     tx: &mpsc::UnboundedSender<Update>,
 ) -> anyhow::Result<()> {
+    // A basic group: its participants' online state only.
+    if peer.kind == PeerKind::Chat {
+        let members = sync
+            .store()
+            .peer(peer)
+            .ok()
+            .flatten()
+            .and_then(|p| describe::peer_info(&p).members)
+            .unwrap_or(0);
+        send_online(sync, peer, members, tx).await;
+        return Ok(());
+    }
     match sync.load_full(peer).await {
         Ok(Some(full)) => {
             if let Some(n) = full.members {
                 let text = members_text(sync.store(), peer, n);
                 let _ = tx.send(Update::Members { peer, text });
+                let group = sync
+                    .store()
+                    .peer(peer)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|p| describe::peer_info(&p).kind == ChatKind::Group);
+                if group && full.can_view_participants {
+                    send_online(sync, peer, n, tx).await;
+                }
             }
             send_dialogs(sync.store(), shown_dialogs, folders, tx)?;
             if let Some(item) = chat_info(sync.store(), peer) {
@@ -1400,6 +1638,49 @@ async fn load_full(
         Err(e) => error!("full info: {e}"),
     }
     Ok(())
+}
+
+/// The toast after a failed join (`ApiWrap::joinChannel`'s errors).
+fn join_error_text(kind: &str, channel: bool) -> Option<&'static str> {
+    Some(match kind {
+        "INVITE_REQUEST_SENT" if channel => {
+            "You will be added to the channel once its admins approve your request."
+        }
+        "INVITE_REQUEST_SENT" => {
+            "You will be added to the group once an admin approves your request."
+        }
+        "CHANNEL_PRIVATE" | "CHANNEL_PUBLIC_GROUP_NA" | "USER_BANNED_IN_CHANNEL" if channel => {
+            "Sorry, this channel is not accessible."
+        }
+        "CHANNEL_PRIVATE" | "CHANNEL_PUBLIC_GROUP_NA" | "USER_BANNED_IN_CHANNEL" => {
+            "Sorry, this group is not accessible."
+        }
+        "USERS_TOO_MUCH" => "Sorry, this group is full.",
+        // tdesktop shows `ChannelsLimitBox` here (not done yet).
+        "CHANNELS_TOO_MUCH" => "Too Many Communities. Please leave some before joining a new one.",
+        _ => return None,
+    })
+}
+
+/// "26 members, 3 online" (`lng_chat_status_members_online`) when someone besides
+/// us is online.
+async fn send_online(
+    sync: &mut Sync,
+    peer: PeerKey,
+    members: i32,
+    tx: &mpsc::UnboundedSender<Update>,
+) {
+    match sync.online_members(peer, members).await {
+        Ok(Some((members, online, only_me))) if online > 0 && !only_me => {
+            let text = format!(
+                "{}, {online} online",
+                present::count_text(members, "member", "members")
+            );
+            let _ = tx.send(Update::Members { peer, text });
+        }
+        Ok(_) => {}
+        Err(e) => error!("online: {e}"),
+    }
 }
 
 /// `History::shouldBeInChatList`: not a basic group upgraded to a supergroup, and
@@ -1587,6 +1868,15 @@ fn chat_info(store: &Storage, peer: PeerKey) -> Option<DialogItem> {
 enum Shown {
     /// The newest messages of the cached segment.
     Latest(usize),
+    /// A thread (`messages.getReplies`): its loaded messages, newest first; a
+    /// post's comments begin with the root (the post's copy in the group).
+    Thread {
+        root: i32,
+        rows: Vec<MessageRow>,
+        older_done: bool,
+        /// The roots of a post's comments (shown first, "Discussion started").
+        roots: Vec<MessageRow>,
+    },
     /// A window around a message the segment does not reach (newest first), grown by
     /// scrolling until it meets the newest messages.
     Window {
@@ -1600,6 +1890,102 @@ enum Shown {
 
 /// Messages per page of a window.
 const WINDOW_PAGE: i32 = 50;
+/// The "Discussion started" line of a post's comments (not a real message).
+pub const DISCUSSION_STARTED_ID: i32 = -100;
+/// Topics asked for at once.
+const TOPICS_PAGE: i32 = 100;
+
+/// What a chat left shows when it is opened again: a thread is not kept.
+fn keep_shown(shown: Shown) -> Shown {
+    match shown {
+        Shown::Thread { .. } => Shown::Latest(HISTORY),
+        other => other,
+    }
+}
+
+/// New messages of an open thread join it (they belong to it by their reply
+/// header: `reply_to_top_id`, or a reply to the root itself).
+fn absorb_into_thread(shown: &mut Shown, peer: PeerKey, new: &[MessageRow]) {
+    let Shown::Thread { root, rows, .. } = shown else {
+        return;
+    };
+    for m in new.iter().filter(|m| m.peer == peer) {
+        let in_thread = describe::message_info(m)
+            .reply
+            .is_some_and(|r| r.top_id == Some(*root) || r.msg_id == Some(*root));
+        if in_thread && !rows.iter().any(|r| r.id == m.id) {
+            rows.insert(0, m.clone());
+        }
+    }
+    rows.sort_by_key(|m| std::cmp::Reverse(m.id));
+}
+
+/// A forum's topics as its list shows them (`Dialogs::Ui::PaintRow` of a topic):
+/// the last message's sender and text, its time, the unread count.
+fn topic_items(
+    store: &Storage,
+    peer: PeerKey,
+    topics: &[tdr_data::Topic],
+    ctx: &Context,
+) -> Vec<TopicItem> {
+    let now = Local::now();
+    topics
+        .iter()
+        .filter(|t| !t.hidden || t.id == 1)
+        .map(|t| {
+            let top = store.message(peer, t.top_message).ok().flatten();
+            let last = top.as_ref().map_or_else(LastLine::default, |m| {
+                let (media, service, _) = message_content(store, m, false);
+                let full = row_text(m);
+                let text = full.lines().next().unwrap_or("").to_string();
+                let prefix = (service.is_none())
+                    .then(|| {
+                        if m.out {
+                            Some("You".to_string())
+                        } else {
+                            m.from.map(|f| short_name(store, f, ctx.self_id))
+                        }
+                    })
+                    .flatten();
+                match (service, media) {
+                    (Some(s), _) => LastLine {
+                        prefix: None,
+                        accent: Some(s),
+                        text: String::new(),
+                        spoilers: Vec::new(),
+                    },
+                    (None, Some(label)) if text.is_empty() => LastLine {
+                        prefix,
+                        accent: Some(label),
+                        text: String::new(),
+                        spoilers: Vec::new(),
+                    },
+                    _ => LastLine {
+                        prefix,
+                        accent: None,
+                        text,
+                        spoilers: Vec::new(),
+                    },
+                }
+            });
+            TopicItem {
+                id: t.id,
+                title: t.title.clone(),
+                icon_color: t.icon_color,
+                general: t.id == 1,
+                last,
+                time: top
+                    .as_ref()
+                    .map(|m| present::dialogs_date(m.date, now))
+                    .unwrap_or_default(),
+                unread: t.unread,
+                muted: t.muted,
+                pinned: t.pinned,
+                closed: t.closed,
+            }
+        })
+        .collect()
+}
 
 fn send_history(
     store: &Storage,
@@ -1619,6 +2005,7 @@ fn send_history(
                 complete,
                 newer: false,
                 focus,
+                thread: None,
             }
         }
         Shown::Window {
@@ -1631,7 +2018,56 @@ fn send_history(
             complete: *older_done,
             newer: !*newer_done,
             focus,
+            thread: None,
         },
+        Shown::Thread {
+            root,
+            rows,
+            older_done,
+            roots,
+        } => {
+            // Edited and deleted ones as the cache has them now.
+            let fresh = |r: &MessageRow| store.message(r.peer, r.id).ok().flatten();
+            let rows: Vec<MessageRow> = rows.iter().filter_map(fresh).collect();
+            let mut messages = Vec::new();
+            if *older_done {
+                let roots: Vec<MessageRow> = roots.iter().filter_map(fresh).collect();
+                messages = message_items(store, peer, &roots);
+                // `lng_replies_discussion_started` under the post.
+                if let Some(last) = messages.last().cloned() {
+                    messages.push(MessageItem {
+                        id: DISCUSSION_STARTED_ID,
+                        out: false,
+                        text: String::new(),
+                        media: None,
+                        service: Some("Discussion started".into()),
+                        edited: false,
+                        read: None,
+                        time: last.time.clone(),
+                        date: last.date,
+                        sender: None,
+                        author: last.author.clone(),
+                        forwarded: None,
+                        original: None,
+                        entities: Vec::new(),
+                        forward_date: None,
+                        edit_date: None,
+                        post: None,
+                        reply: None,
+                        thread_root: None,
+                    });
+                }
+            }
+            messages.extend(message_items(store, peer, &rows));
+            Update::History {
+                peer,
+                messages,
+                complete: *older_done,
+                newer: false,
+                focus,
+                thread: Some(*root),
+            }
+        }
     };
     let _ = tx.send(update);
     Ok(())
@@ -1792,6 +2228,7 @@ async fn run(
     let mut remembered: HashMap<PeerKey, Shown> = HashMap::new();
     let mut logging_out = false;
     loop {
+        resolve_replies(&mut sync, open, &shown, &tx).await?;
         tokio::select! {
             cmd = commands.recv() => {
                 let Some(cmd) = cmd else { break };
@@ -1809,7 +2246,7 @@ async fn run(
                         if let Some(previous) = open.take() {
                             remembered.insert(
                                 previous,
-                                std::mem::replace(&mut shown, Shown::Latest(HISTORY)),
+                                keep_shown(std::mem::replace(&mut shown, Shown::Latest(HISTORY))),
                             );
                         }
                         folders.active = 0;
@@ -1842,6 +2279,108 @@ async fn run(
                         }
                     }
                     Command::CloseArchive => folders.archive_open = false,
+                    Command::OpenComments { channel, post } => {
+                        match sync.discussion(channel, post).await {
+                            Ok(Some((group, roots))) => {
+                                let root = roots.last().map_or(0, |m| m.id);
+                                if let Some(previous) = open {
+                                    back.push((previous, std::mem::replace(&mut shown, Shown::Latest(HISTORY))));
+                                }
+                                open = Some(group);
+                                if let Some(item) = chat_info(sync.store(), group) {
+                                    let _ = tx.send(Update::ChatInfo(Box::new(item)));
+                                }
+                                let (rows, count, done) = match sync.replies_page(group, root, 0, WINDOW_PAGE).await {
+                                    Ok((rows, count)) => {
+                                        let done = (rows.len() as i32) < WINDOW_PAGE;
+                                        (rows, count, done)
+                                    }
+                                    Err(e) => {
+                                        error!("comments: {e}");
+                                        (Vec::new(), 0, true)
+                                    }
+                                };
+                                let _ = tx.send(Update::ThreadCount { peer: group, root, count });
+                                shown = Shown::Thread {
+                                    root,
+                                    rows,
+                                    older_done: done,
+                                    roots,
+                                };
+                                send_history(sync.store(), group, &shown, None, &tx)?;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                error!("discussion: {e}");
+                                let _ = tx.send(Update::Toast("Comments are not available.".into()));
+                            }
+                        }
+                    }
+                    Command::OpenThread { peer, root } => {
+                        // From the topics list, like a chat from the chat list: no
+                        // way back to the chat open before.
+                        if let Some(previous) = open.take() {
+                            remembered.insert(
+                                previous,
+                                keep_shown(std::mem::replace(&mut shown, Shown::Latest(HISTORY))),
+                            );
+                        }
+                        back.clear();
+                        open = Some(peer);
+                        if let Some(item) = chat_info(sync.store(), peer) {
+                            let _ = tx.send(Update::ChatInfo(Box::new(item)));
+                        }
+                        let (rows, count, done) = match sync.replies_page(peer, root, 0, WINDOW_PAGE).await {
+                            Ok((rows, count)) => {
+                                let done = (rows.len() as i32) < WINDOW_PAGE;
+                                (rows, count, done)
+                            }
+                            Err(e) => {
+                                error!("topic: {e}");
+                                (Vec::new(), 0, true)
+                            }
+                        };
+                        let _ = tx.send(Update::ThreadCount { peer, root, count });
+                        shown = Shown::Thread {
+                            root,
+                            rows,
+                            older_done: done,
+                            roots: Vec::new(),
+                        };
+                        send_history(sync.store(), peer, &shown, None, &tx)?;
+                    }
+                    Command::OpenForum(peer) => match sync.forum_topics(peer, TOPICS_PAGE).await {
+                        Ok(topics) => {
+                            let ctx = Context::load(sync.store());
+                            let topics = topic_items(sync.store(), peer, &topics, &ctx);
+                            let _ = tx.send(Update::Topics { peer, topics });
+                        }
+                        Err(e) => error!("topics: {e}"),
+                    },
+                    Command::Join(peer) => {
+                        match sync.join(peer).await {
+                            Ok(Ok(applied)) => send_draft_changes(&applied, &tx),
+                            Ok(Err(kind)) => {
+                                let channel = sync
+                                    .store()
+                                    .peer(peer)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|p| describe::peer_info(&p).kind == ChatKind::Channel);
+                                if let Some(text) = join_error_text(&kind, channel) {
+                                    let _ = tx.send(Update::Toast(text.into()));
+                                }
+                            }
+                            Err(e) => error!("join: {e}"),
+                        }
+                        send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
+                        if let Some(item) = chat_info(sync.store(), peer) {
+                            let _ = tx.send(Update::ChatInfo(Box::new(item)));
+                        }
+                        if open == Some(peer) {
+                            send_history(sync.store(), peer, &shown, None, &tx)?;
+                        }
+                    }
                     Command::Leave(peer) => {
                         match sync.leave(peer).await {
                             Ok(applied) => send_draft_changes(&applied, &tx),
@@ -1892,7 +2431,7 @@ async fn run(
                         if let Some(previous) = open.filter(|p| *p != peer) {
                             remembered.insert(
                                 previous,
-                                std::mem::replace(&mut shown, Shown::Latest(HISTORY)),
+                                keep_shown(std::mem::replace(&mut shown, Shown::Latest(HISTORY))),
                             );
                         }
                         open = Some(peer);
@@ -1944,7 +2483,7 @@ async fn run(
                         if let Some(previous) = open.take() {
                             remembered.insert(
                                 previous,
-                                std::mem::replace(&mut shown, Shown::Latest(HISTORY)),
+                                keep_shown(std::mem::replace(&mut shown, Shown::Latest(HISTORY))),
                             );
                         }
                     }
@@ -1959,6 +2498,24 @@ async fn run(
                         }
                     }
                     Command::LoadOlder(peer) if open == Some(peer) => match &mut shown {
+                        Shown::Thread {
+                            root,
+                            rows,
+                            older_done,
+                            ..
+                        } => {
+                            if !*older_done {
+                                let oldest = rows.last().map_or(0, |m| m.id);
+                                match sync.replies_page(peer, *root, oldest, WINDOW_PAGE).await {
+                                    Ok((page, _)) => {
+                                        *older_done = page.is_empty();
+                                        rows.extend(page.into_iter().filter(|m| oldest == 0 || m.id < oldest));
+                                    }
+                                    Err(e) => error!("thread: {e}"),
+                                }
+                            }
+                            send_history(sync.store(), peer, &shown, None, &tx)?;
+                        }
                         Shown::Latest(count) => {
                             *count += HISTORY;
                             let count = *count;
@@ -2024,7 +2581,10 @@ async fn run(
                     Command::Back => {
                         if let Some((peer, was)) = back.pop() {
                             if let Some(previous) = open {
-                                remembered.insert(previous, std::mem::replace(&mut shown, was));
+                                remembered.insert(
+                                    previous,
+                                    keep_shown(std::mem::replace(&mut shown, was)),
+                                );
                             } else {
                                 shown = was;
                             }
@@ -2140,9 +2700,11 @@ async fn run(
                         peer,
                         text,
                         entities,
+                        reply_to,
                     } => {
-                        match sync.send_text(peer, &text, &entities).await {
-                            Ok(_) => {
+                        match sync.send_text(peer, &text, &entities, reply_to).await {
+                            Ok(applied) => {
+                                absorb_into_thread(&mut shown, peer, &applied.new_messages);
                                 send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
                                 if open == Some(peer) {
                                     send_history(sync.store(), peer, &shown, None, &tx)?;
@@ -2186,6 +2748,7 @@ async fn run(
                     send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?;
                     send_draft_changes(&applied, &tx);
                     if let Some(peer) = open {
+                        absorb_into_thread(&mut shown, peer, &applied.new_messages);
                         let touched = applied.new_messages.iter().any(|m| m.peer == peer)
                             || applied.edited + applied.deleted > 0
                             || applied.marks_changed;
@@ -2459,7 +3022,10 @@ pub fn start_demo(
                     Compose::Field
                 },
                 mute_until: None,
-                rights: ChatRights::default(),
+                rights: ChatRights {
+                    forum: *name == "Design Team",
+                    ..ChatRights::default()
+                },
                 status: match kind {
                     ChatKind::Group => "906 members".into(),
                     ChatKind::Channel => "8 subscribers".into(),
@@ -2698,6 +3264,8 @@ pub fn start_demo(
                     forward_date: None,
                     edit_date: None,
                     post: None,
+                    reply: None,
+                    thread_root: None,
                 }
             })
             .collect();
@@ -2722,6 +3290,8 @@ pub fn start_demo(
                 forward_date: None,
                 edit_date: None,
                 post: None,
+                reply: None,
+                thread_root: None,
             });
         }
         // Older demo messages appear 20 at a time when the user scrolls up.
@@ -2813,6 +3383,128 @@ pub fn start_demo(
                     continue;
                 }
                 Command::CloseArchive => continue,
+                Command::Join(_) => continue,
+                Command::OpenForum(peer) => {
+                    let topic =
+                        |id: i32, title: &str, color: i32, text: &str, unread: i32| TopicItem {
+                            id,
+                            title: title.into(),
+                            icon_color: color,
+                            general: id == 1,
+                            last: line(Some("Bob"), None, text),
+                            time: present::dialogs_date(today(9, 0) - id * 3600, Local::now()),
+                            unread,
+                            muted: false,
+                            pinned: id == 2,
+                            closed: false,
+                        };
+                    let topics = vec![
+                        topic(2, "Chat rules", 0xFB6F5F, "Be nice to each other", 0),
+                        topic(1, "General", 0, "Hi everyone!", 12),
+                        topic(7, "Mockups", 0x6FB9F0, "New screens are up", 3),
+                        topic(9, "Releases", 0x8EEE98, "v0.2 is out", 0),
+                        topic(11, "Ideas", 0xFFD67E, "What about dark icons?", 0),
+                    ];
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    let _ = up_tx.send(Update::Topics { peer, topics });
+                    continue;
+                }
+                Command::OpenThread { peer, root } => {
+                    let mut messages: Vec<MessageItem> =
+                        history.iter().rev().take(6).rev().cloned().collect();
+                    for m in &mut messages {
+                        m.sender = (!m.out).then(|| ("Bob Smith".to_string(), m.author.color));
+                    }
+                    let _ = up_tx.send(Update::ThreadCount {
+                        peer,
+                        root,
+                        count: 7,
+                    });
+                    let _ = up_tx.send(Update::History {
+                        peer,
+                        messages,
+                        complete: true,
+                        newer: false,
+                        focus: None,
+                        thread: Some(root),
+                    });
+                    continue;
+                }
+                Command::OpenComments { channel, post } => {
+                    let group = PeerKey::user(2);
+                    let root = 5000;
+                    let original = history.iter().find(|m| m.id == post).cloned();
+                    let mut messages = Vec::new();
+                    if let Some(mut m) = original {
+                        m.id = root;
+                        m.out = false;
+                        m.post = None;
+                        m.sender = None;
+                        m.forwarded = Some(ForwardLine {
+                            name: "Telegram Tips".into(),
+                            author: None,
+                        });
+                        messages.push(m.clone());
+                        messages.push(MessageItem {
+                            id: DISCUSSION_STARTED_ID,
+                            text: String::new(),
+                            service: Some("Discussion started".into()),
+                            forwarded: None,
+                            reply: None,
+                            ..m
+                        });
+                    }
+                    for (k, text) in ["Great post!", "Thanks for the tips", "Agreed with Bob"]
+                        .iter()
+                        .enumerate()
+                    {
+                        let out = k == 2;
+                        let date = start + 2 * day + k as i32 * 600;
+                        messages.push(MessageItem {
+                            id: root + 1 + k as i32,
+                            out,
+                            text: text.to_string(),
+                            media: None,
+                            service: None,
+                            edited: false,
+                            read: out.then_some(true),
+                            time: present::message_time(date),
+                            date,
+                            sender: (!out).then(|| ("Bob Smith".to_string(), color_index(2))),
+                            author: demo_author(out),
+                            forwarded: None,
+                            original: None,
+                            entities: Vec::new(),
+                            forward_date: None,
+                            edit_date: None,
+                            post: None,
+                            reply: (k == 2).then(|| ReplyLine {
+                                peer: group,
+                                msg_id: root + 1,
+                                name: "Bob Smith".into(),
+                                color: Some(color_index(2)),
+                                text: "Great post!".into(),
+                                quote: false,
+                            }),
+                            thread_root: Some(root),
+                        });
+                    }
+                    let _ = channel;
+                    let _ = up_tx.send(Update::ThreadCount {
+                        peer: group,
+                        root,
+                        count: 3,
+                    });
+                    let _ = up_tx.send(Update::History {
+                        peer: group,
+                        messages,
+                        complete: true,
+                        newer: false,
+                        focus: None,
+                        thread: Some(root),
+                    });
+                    continue;
+                }
                 Command::Leave(peer) => {
                     dialogs.retain(|d| d.peer != peer);
                     let _ = up_tx.send(Update::Dialogs {
@@ -2882,6 +3574,8 @@ pub fn start_demo(
                                 forward_date: None,
                                 edit_date: None,
                                 post: None,
+                                reply: None,
+                                thread_root: None,
                             }
                         })
                         .collect();
@@ -2935,6 +3629,31 @@ pub fn start_demo(
                         forward_date: None,
                         edit_date: None,
                         post: None,
+                        reply: None,
+                        thread_root: None,
+                    });
+                }
+            }
+            // Replies: the last messages answer earlier ones.
+            let n = history.len();
+            for (at, to) in [
+                (n.saturating_sub(1), n.saturating_sub(4)),
+                (n.saturating_sub(3), n.saturating_sub(6)),
+            ] {
+                if at < n && to < n && at != to && history[to].service.is_none() {
+                    let target = history[to].clone();
+                    let name = if target.out {
+                        "Alex Morgan"
+                    } else {
+                        "Bob Smith"
+                    };
+                    history[at].reply = Some(ReplyLine {
+                        peer: PeerKey::user(1),
+                        msg_id: target.id,
+                        name: name.into(),
+                        color: Some(target.author.color),
+                        text: target.text.lines().next().unwrap_or("").to_string(),
+                        quote: false,
                     });
                 }
             }
@@ -3003,6 +3722,12 @@ pub fn start_demo(
                                 1 => Some(present::comments_text(0)),
                                 _ => None,
                             },
+                            repliers: if k % 3 == 0 {
+                                vec![demo_author(false), demo_author(true)]
+                            } else {
+                                Vec::new()
+                            },
+                            discussion: Some(PeerKey::user(2)),
                         });
                     }
                 }
@@ -3014,6 +3739,7 @@ pub fn start_demo(
                     focus: focus
                         .filter(|(p, _)| *p == PeerKey::user(i + 1))
                         .map(|(_, id)| id),
+                    thread: None,
                 });
             }
             focus = None;
