@@ -444,3 +444,38 @@ pub fn languages() -> Vec<String> {
     all.dedup();
     all
 }
+
+/// `SearchEmoji` of the panel: each word of `query` is an emoji itself or is
+/// looked up (`queryMine`, not exactly), 32 emoji at most; also the set of found
+/// emoji with their originals (for custom emoji).
+pub fn search_emoji(query: &str) -> (Vec<u16>, std::collections::HashSet<u16>) {
+    const LIMIT: usize = 32;
+    let recent = crate::emoji::recent_list();
+    let mut result = Vec::new();
+    let mut set = std::collections::HashSet::new();
+    let mut push = |emoji: u16, result: &mut Vec<u16>| {
+        if result.len() < LIMIT && set.insert(emoji) {
+            result.push(emoji);
+        }
+        if let Some(one) = tdr_emoji::get(emoji) {
+            set.insert(one.original());
+        }
+    };
+    for word in query.split_whitespace() {
+        if let Some(emoji) = tdr_emoji::by_text(word) {
+            push(emoji, &mut result);
+        } else {
+            for found in self::query(&word.to_lowercase(), false, &recent) {
+                push(crate::emoji::variant_of(found.emoji), &mut result);
+                if result.len() >= LIMIT {
+                    break;
+                }
+            }
+        }
+        if result.len() >= LIMIT {
+            break;
+        }
+    }
+    drop(push);
+    (result, set)
+}

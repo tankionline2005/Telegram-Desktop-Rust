@@ -185,7 +185,7 @@ pub(super) struct EmojiPanel {
     footer_from: (f32, Instant),
     pub(super) search: Option<Entity<TextInput>>,
     query: String,
-    results: Option<Vec<u16>>,
+    results: Option<Vec<Slot>>,
     /// The list's top left in the window at the last paint.
     origin: Rc<Cell<Point<Pixels>>>,
     pub(super) recent: tdr_emoji::recent::Recent,
@@ -618,7 +618,7 @@ impl MainView {
 
     fn cell_at(&self, section: usize, index: usize) -> Option<Slot> {
         match &self.emoji_panel.results {
-            Some(results) => results.get(index).copied().map(Slot::Emoji),
+            Some(results) => results.get(index).copied(),
             None => match self.emoji_panel.set(section) {
                 Some(set) => set.emoji.get(index).copied().map(Slot::Custom),
                 None => self
@@ -832,8 +832,8 @@ impl MainView {
             let query = field.read(cx).text();
             if query != this.emoji_panel.query {
                 this.emoji_panel.query = query.clone();
-                this.emoji_panel.results =
-                    (!query.trim().is_empty()).then(|| crate::emoji_search::search(&query));
+                let results = (!query.trim().is_empty()).then(|| this.search_emoji(&query, cx));
+                this.emoji_panel.results = results;
                 this.emoji_panel.over = Over::None;
                 this.emoji_panel.scroll.set_offset(point(gpx(0.), gpx(0.)));
             }
@@ -841,6 +841,32 @@ impl MainView {
         })
         .detach();
         self.emoji_panel.search = Some(field);
+    }
+
+    /// `applyNextSearchQuery`: `SearchEmoji` (keywords and short codes, 32 at
+    /// most), then with Premium the custom emoji of the sets for those emoji
+    /// (`appendPremiumSearchResults`, 256 at most).
+    fn search_emoji(&mut self, query: &str, cx: &mut Context<Self>) -> Vec<Slot> {
+        self.refresh_emoji_keywords();
+        let (plain, found) = crate::emoji_suggest::search_emoji(query);
+        let mut out: Vec<Slot> = plain.into_iter().map(Slot::Emoji).collect();
+        if !self.custom_emoji_locked(cx) {
+            const CUSTOM_LIMIT: usize = 256;
+            for set in &self.emoji_panel.sets {
+                for &id in &set.emoji {
+                    if out.len() >= CUSTOM_LIMIT {
+                        break;
+                    }
+                    let emoji = crate::custom_emoji::info(id)
+                        .and_then(|i| tdr_emoji::find(&i.alt).map(|(e, _)| e));
+                    if emoji.is_some_and(|e| found.contains(&e)) && !out.contains(&Slot::Custom(id))
+                    {
+                        out.push(Slot::Custom(id));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// `selectEmoji`: into the field at the caret; counted as recent.
@@ -1486,7 +1512,7 @@ impl MainView {
             .filter(|p| p.hiding.is_none())
             .map(|p| p.target);
         let lists: Vec<Vec<Slot>> = match &self.emoji_panel.results {
-            Some(r) => vec![r.iter().map(|e| Slot::Emoji(*e)).collect()],
+            Some(r) => vec![r.clone()],
             None => self
                 .emoji_panel
                 .lists
