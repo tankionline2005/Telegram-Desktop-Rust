@@ -17,6 +17,7 @@ members = [
     "crates/prism",
     "crates/emoji",
     "crates/lottie",
+    "crates/webm",
     "crates/app",
     "xtask",
 ]
@@ -41,6 +42,7 @@ tdr-theme = { path = "crates/theme" }
 tdr-prism = { path = "crates/prism" }
 tdr-emoji = { path = "crates/emoji" }
 tdr-lottie = { path = "crates/lottie" }
+tdr-webm = { path = "crates/webm" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

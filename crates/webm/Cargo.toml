@@ -1,0 +1,21 @@
+[package]
+name = "tdr-webm"
+version = "0.1.0"
+description = "WebM (VP9 with alpha) video stickers and emoji: Matroska demuxing and decoding"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Variant",
+] }
+
+[lints]
+workspace = true
