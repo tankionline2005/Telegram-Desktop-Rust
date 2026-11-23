@@ -81,6 +81,8 @@ pub enum Kind {
     Date(i32),
     /// A syntax color of code (1..=8, tdesktop's `Colorized` from libprisma).
     Syntax(u8),
+    /// A custom emoji drawn in place of its text (its fallback emoji).
+    CustomEmoji(i64),
 }
 
 /// What a click on a span does (tdesktop's click handlers).
@@ -136,7 +138,7 @@ pub struct Rich {
     links: Vec<Link>,
     pub has_spoilers: bool,
     /// The emoji, drawn as images (`emoji`).
-    pub emoji: Vec<(Range<usize>, u16)>,
+    pub emoji: Vec<(Range<usize>, crate::emoji::Glyph)>,
 }
 
 fn is_quote(kind: &Kind) -> bool {
@@ -182,6 +184,15 @@ pub fn prepare(text: &str, entities: &[TextEntity]) -> Rich {
     let mut links_in: Vec<(&TextEntity, Link)> = Vec::new();
     let mut styles: Vec<(&TextEntity, u8)> = Vec::new();
     let mut colors: Vec<(&TextEntity, u8)> = Vec::new();
+    let custom_in: Vec<(Range<usize>, i64)> = valid
+        .iter()
+        .filter_map(|e| match e.kind {
+            Kind::CustomEmoji(id) => Some((e.range.clone(), id)),
+            _ => None,
+        })
+        .collect();
+    // Where each character of `text` lands in `out` (line feeds may be inserted).
+    let mut moved: Vec<(usize, usize)> = Vec::new();
     for e in valid {
         if let Kind::Syntax(c) = e.kind {
             colors.push((e, c));
@@ -327,6 +338,9 @@ pub fn prepare(text: &str, entities: &[TextEntity]) -> Rich {
                 break;
             }
         }
+        if !custom_in.is_empty() {
+            moved.push((i, out.len()));
+        }
         if ch == '\n' {
             push(&mut out, &mut spans, '\n', (0, None, 0));
             para_quotes.push(open.map(|(q, _, _)| q));
@@ -349,7 +363,20 @@ pub fn prepare(text: &str, entities: &[TextEntity]) -> Rich {
         start += line.len() + 1;
     }
     let has_spoilers = spans.iter().any(|s| s.flags & SPOILER != 0);
-    let emoji = crate::emoji::find_all(&out);
+    let to_out = |i: usize| -> usize {
+        match moved.binary_search_by_key(&i, |m| m.0) {
+            Ok(k) => moved[k].1,
+            Err(_) => out.len(),
+        }
+    };
+    let custom: Vec<(Range<usize>, i64)> = custom_in
+        .iter()
+        .map(|(r, id)| (to_out(r.start)..to_out(r.end), *id))
+        .filter(|(r, _)| {
+            r.start < r.end && out.is_char_boundary(r.start) && out.is_char_boundary(r.end)
+        })
+        .collect();
+    let emoji = crate::emoji::with_custom(crate::emoji::find_all(&out), &custom);
     Rich {
         text: out,
         spans,
@@ -1814,7 +1841,7 @@ impl RichText {
                 let origin_y = baseline - (lh + ascent - descent) / 2.;
                 let _ = shaped.paint(point(left, origin_y), lh, window, cx);
                 // The emoji over their spaces; hidden spoilers keep theirs hidden.
-                for (r, index) in &rich.emoji {
+                for (r, glyph) in &rich.emoji {
                     if r.start < range.start || r.end > range.end {
                         continue;
                     }
@@ -1826,8 +1853,14 @@ impl RichText {
                     if hidden {
                         continue;
                     }
-                    let origin = crate::emoji::origin_in_line(left + x_of(r.start), top, lh);
-                    crate::emoji::paint(*index, origin, crate::emoji::size_normal(), window);
+                    crate::emoji::paint_glyph(
+                        *glyph,
+                        left + x_of(r.start),
+                        top,
+                        lh,
+                        hsla(colors.fg),
+                        window,
+                    );
                 }
             }
         }

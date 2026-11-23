@@ -17,6 +17,8 @@ tdr-data.workspace = true
 tdr-theme.workspace = true
 tdr-prism.workspace = true
 tdr-emoji.workspace = true
+tdr-lottie.workspace = true
+tdr-webm.workspace = true
 gpui = "0.2.2"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }

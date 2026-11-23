@@ -9,6 +9,7 @@
 mod accounts;
 mod anim;
 mod bridge;
+mod custom_emoji;
 mod emoji;
 mod emoji_font;
 mod emoji_search;

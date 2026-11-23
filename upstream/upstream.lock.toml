@@ -2630,3 +2630,23 @@ path = "assets/emoji/emoji_autocomplete.json"
 upstream = "emoji_suggestions/emoji_autocomplete.json"
 submodule = "Telegram/lib_ui"
 sha256 = "e5c6077389fa9c433987edbd0e53f9c00963ee27662759aa8a27dd5326bbfcec"
+
+[[vendored]]
+path = "assets/tdesktop-animations/demo__hello_status.tgs"
+upstream = "Telegram/Resources/animations/hello_status.tgs"
+sha256 = "566acf3bd1f1766a9568c4dae56c812225c5f042a62c3e39ace193c2e431a80b"
+
+[[vendored]]
+path = "assets/tdesktop-animations/demo__cake.tgs"
+upstream = "Telegram/Resources/animations/cake.tgs"
+sha256 = "11e5a99c2471f47a13fc5b0c13c0d67d5fc3ac366beb8d35124c881af6a513d5"
+
+[[vendored]]
+path = "assets/tdesktop-animations/demo__diamond.tgs"
+upstream = "Telegram/Resources/animations/diamond.tgs"
+sha256 = "b0c1b8de4d84a3840a27e182daa6b7e1045f34c29b62e5000e0f99092b06d533"
+
+[[vendored]]
+path = "assets/tdesktop-animations/demo__robot.tgs"
+upstream = "Telegram/Resources/animations/robot.tgs"
+sha256 = "a9aaab6c911ba51cf1f73781dcb060c2f7d2e8e36256fde650dcc43273f418bf"

@@ -1924,6 +1924,11 @@ impl MainView {
 
     pub(crate) fn apply(&mut self, update: Update, cx: &mut Context<Self>) {
         match update {
+            Update::CustomEmoji { doc, bytes } => {
+                crate::custom_emoji::loaded(&doc, bytes);
+                cx.notify();
+            }
+            Update::CustomEmojiFailed(id) => crate::custom_emoji::failed(id),
             Update::Archive(info) => {
                 // An emptied archive closes (`Widget::refreshFolderTopBar`).
                 if info.is_none() && self.archive_open {
@@ -4604,6 +4609,11 @@ impl Render for MainView {
         // Every size below is converted for this scale as tdesktop does.
         scale::set(window.scale_factor());
         self.update_quote_color(cx);
+        // Custom emoji painted in the last frame and not known yet.
+        let wanted = crate::custom_emoji::take_wanted();
+        if !wanted.is_empty() {
+            let _ = self.commands.send(Command::LoadCustomEmoji(wanted));
+        }
         if !self.first_list_frame_logged && !self.dialogs.is_empty() {
             self.first_list_frame_logged = true;
             tracing::info!(

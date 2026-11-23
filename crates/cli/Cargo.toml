@@ -17,6 +17,8 @@ tdr-crypto.workspace = true
 tdr-mtproto.workspace = true
 tdr-api.workspace = true
 tdr-data.workspace = true
+tdr-lottie.workspace = true
+tdr-webm.workspace = true
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 qrcode = { version = "0.14.1", default-features = false }
 rpassword = "7.5.4"

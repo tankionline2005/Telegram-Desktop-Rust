@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::io::Read;
 
 use serde_json::Value;
+pub use tiny_skia;
 use tiny_skia::{
     FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Mask, MaskType, Paint, PathBuilder,
     Pixmap, Point, RadialGradient, Shader, SpreadMode, Stroke, StrokeDash, Transform,

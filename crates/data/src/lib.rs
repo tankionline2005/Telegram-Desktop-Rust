@@ -11,6 +11,7 @@ pub mod countries;
 mod countries_fallback;
 pub mod describe;
 pub mod drafts;
+pub mod emoji_sets;
 pub mod filters;
 pub mod login;
 
@@ -44,6 +45,7 @@ pub enum OutKind {
     Blockquote,
     Spoiler,
     TextUrl(String),
+    CustomEmoji(i64),
 }
 
 fn out_entity(e: &OutEntity) -> enums::MessageEntity {
@@ -71,6 +73,12 @@ fn out_entity(e: &OutEntity) -> enums::MessageEntity {
             offset,
             length,
             url: url.clone(),
+        }
+        .into(),
+        OutKind::CustomEmoji(document_id) => types::MessageEntityCustomEmoji {
+            offset,
+            length,
+            document_id: *document_id,
         }
         .into(),
     }

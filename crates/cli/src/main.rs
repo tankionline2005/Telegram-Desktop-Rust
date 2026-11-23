@@ -120,6 +120,7 @@ async fn main() -> Result<()> {
         ["probe", "entities"] => probe_entities(),
         ["probe", "bank-card", number] => probe_bank_card(number).await,
         ["probe", "folders"] => probe_folders().await,
+        ["probe", "emoji"] => probe_emoji().await,
         ["probe", "login"] => probe_login().await,
         ["logout"] => logout().await,
         ["selftest", "reconnect"] => selftest_reconnect().await,
@@ -735,6 +736,79 @@ async fn probe_login() -> Result<()> {
 
 /// The account's folders: per folder its icon, rule sizes and how many cached chats
 /// it holds (no titles, no chat names).
+/// The custom emoji pipeline on real data: installed emoji sets, the first set's
+/// documents, a few files downloaded and decoded. Prints counts, formats and
+/// timings only.
+async fn probe_emoji() -> Result<()> {
+    use tdr_data::emoji_sets::{self, EmojiFormat, SetRef};
+    let client = logged_in()?;
+    let sets = emoji_sets::installed_emoji_sets(&client).await?;
+    println!("installed emoji sets: {}", sets.len());
+    let featured = emoji_sets::featured_emoji_sets(&client).await?;
+    println!("featured emoji sets: {}", featured.len());
+    let Some(first) = sets.first().or(featured.first().map(|f| &f.info)) else {
+        return Ok(());
+    };
+    let raw = emoji_sets::sticker_set(&client, &SetRef::Id(first.id, first.access_hash)).await?;
+    let full = emoji_sets::full_set(&raw).ok_or_else(|| anyhow::anyhow!("no set"))?;
+    println!(
+        "first set: {} documents, {} packs",
+        full.documents.len(),
+        full.packs.len()
+    );
+    let mut docs: Vec<_> = Vec::new();
+    for set in sets.iter().chain(featured.iter().map(|f| &f.info).take(30)) {
+        let raw = emoji_sets::sticker_set(&client, &SetRef::Id(set.id, set.access_hash)).await?;
+        if let Some(full) = emoji_sets::full_set(&raw) {
+            let all: Vec<_> = full
+                .documents
+                .iter()
+                .filter_map(emoji_sets::emoji_document)
+                .collect();
+            docs.extend(all.iter().take(1).cloned());
+            docs.extend(
+                all.iter()
+                    .filter(|d| d.format == EmojiFormat::Webm)
+                    .take(1)
+                    .cloned(),
+            );
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for doc in docs
+        .iter()
+        .filter(|d| seen.insert(format!("{:?}", d.format)))
+        .chain(docs.iter().take(2))
+    {
+        let t = std::time::Instant::now();
+        let bytes = emoji_sets::download_document(&client, doc).await?;
+        let downloaded = t.elapsed();
+        let t = std::time::Instant::now();
+        let frames = match doc.format {
+            EmojiFormat::Tgs => tdr_lottie::Animation::from_tgs(&bytes)
+                .map(|a| a.frame_count())
+                .map_err(|e| e.to_string()),
+            EmojiFormat::Webm => tdr_webm::decode(&bytes, 200)
+                .map(|d| {
+                    d.frames.len() * 1000 + tdr_webm::demux(&bytes).map_or(0, |v| v.blocks.len())
+                })
+                .map_err(|e| e.to_string()),
+            EmojiFormat::Webp => Ok(1),
+        };
+        println!(
+            "{:?} {} bytes in {downloaded:?}, text_color {}, decoded {frames:?} in {:?}",
+            doc.format,
+            bytes.len(),
+            doc.text_color,
+            t.elapsed()
+        );
+    }
+    let ids: Vec<i64> = docs.iter().take(3).map(|d| d.id).collect();
+    let again = emoji_sets::custom_emoji_documents(&client, &ids).await?;
+    println!("documents by id: {} of {}", again.len(), ids.len());
+    Ok(())
+}
+
 async fn probe_folders() -> Result<()> {
     use tdr_data::describe::PeerKind as K;
     use tdr_data::filters::{ChatTraits, FilterEntry};

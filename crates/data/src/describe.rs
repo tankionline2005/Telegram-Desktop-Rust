@@ -159,6 +159,8 @@ pub enum EntityKind {
     BotCommand,
     Phone,
     BankCard,
+    /// A custom emoji in place of the text (its fallback emoji).
+    CustomEmoji(i64),
     /// A date (`messageEntityFormattedDate`): with no flags the text stays and is a
     /// link; with flags the client shows the date in that format instead.
     FormattedDate {
@@ -238,6 +240,7 @@ fn entities(list: &[enums::MessageEntity]) -> Vec<Entity> {
                 E::MentionName(e) => (e.offset, e.length, EntityKind::MentionName(e.user_id)),
                 E::Hashtag(e) => (e.offset, e.length, EntityKind::Hashtag),
                 E::Cashtag(e) => (e.offset, e.length, EntityKind::Cashtag),
+                E::CustomEmoji(e) => (e.offset, e.length, EntityKind::CustomEmoji(e.document_id)),
                 E::BotCommand(e) => (e.offset, e.length, EntityKind::BotCommand),
                 E::Phone(e) => (e.offset, e.length, EntityKind::Phone),
                 E::BankCard(e) => (e.offset, e.length, EntityKind::BankCard),

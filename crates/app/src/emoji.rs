@@ -189,8 +189,17 @@ pub fn paint(index: u16, origin: gpui::Point<Pixels>, size_device: u32, window: 
     let _ = window.paint_image(bounds, Corners::default(), image, 0, false);
 }
 
+/// What takes an emoji's place in laid out text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Glyph {
+    /// One of Telegram's emoji images.
+    Emoji(u16),
+    /// A custom emoji (its document) drawn over its fallback text.
+    Custom(i64),
+}
+
 /// The emoji of a text: byte ranges and emoji.
-pub fn find_all(text: &str) -> Vec<(Range<usize>, u16)> {
+pub fn find_all(text: &str) -> Vec<(Range<usize>, Glyph)> {
     // Plain ASCII holds no emoji (the ones starting with a digit, '#' or '*' are
     // keycaps that need U+20E3).
     if text.is_ascii() {
@@ -198,8 +207,65 @@ pub fn find_all(text: &str) -> Vec<(Range<usize>, u16)> {
     }
     tdr_emoji::split(text)
         .into_iter()
-        .filter_map(|(range, emoji)| emoji.map(|e| (range, e)))
+        .filter_map(|(range, emoji)| emoji.map(|e| (range, Glyph::Emoji(e))))
         .collect()
+}
+
+/// `emoji` with the custom emoji of `custom` in place of what they cover.
+pub fn with_custom(
+    emoji: Vec<(Range<usize>, Glyph)>,
+    custom: &[(Range<usize>, i64)],
+) -> Vec<(Range<usize>, Glyph)> {
+    if custom.is_empty() {
+        return emoji;
+    }
+    // A custom emoji takes a space of three bytes at least.
+    let custom: Vec<(Range<usize>, Glyph)> = custom
+        .iter()
+        .filter(|(r, _)| r.len() >= 3)
+        .map(|(r, id)| (r.clone(), Glyph::Custom(*id)))
+        .collect();
+    let mut out: Vec<(Range<usize>, Glyph)> = emoji
+        .into_iter()
+        .filter(|(r, _)| {
+            !custom
+                .iter()
+                .any(|(c, _)| c.start < r.end && r.start < c.end)
+        })
+        .collect();
+    out.extend(custom);
+    out.sort_by_key(|(r, _)| r.start);
+    out
+}
+
+/// Paints a glyph whose space starts at `x` in a line at `line_top` of
+/// `line_height`; text colored custom emoji take `color`.
+pub fn paint_glyph(
+    glyph: Glyph,
+    x: Pixels,
+    line_top: Pixels,
+    line_height: Pixels,
+    color: gpui::Hsla,
+    window: &mut Window,
+) {
+    match glyph {
+        Glyph::Emoji(index) => {
+            paint(
+                index,
+                origin_in_line(x, line_top, line_height),
+                size_normal(),
+                window,
+            );
+        }
+        Glyph::Custom(id) => {
+            // `_customEmojiSkip`: centered on the emoji's place (a bit larger).
+            let at = origin_in_line(x, line_top, line_height);
+            let side = crate::custom_emoji::size_normal();
+            let skip = (size_normal() as f32 - side as f32) / 2. / scale::get();
+            let at = point(at.x + px(skip), at.y + px(skip));
+            crate::custom_emoji::paint(id, at, side, color, window);
+        }
+    }
 }
 
 /// The text to shape for `text` (a part of a longer text starting at byte `base`
@@ -209,7 +275,7 @@ pub fn find_all(text: &str) -> Vec<(Range<usize>, u16)> {
 pub fn shape_text(
     text: &str,
     base: usize,
-    emoji: &[(Range<usize>, u16)],
+    emoji: &[(Range<usize>, Glyph)],
     runs: Vec<TextRun>,
     font_size: Pixels,
 ) -> (String, Vec<TextRun>) {
@@ -281,7 +347,7 @@ pub fn shape_text(
 }
 
 /// `index` moved out of an emoji (to its end) if it falls inside one.
-pub fn snap(emoji: &[(Range<usize>, u16)], index: usize) -> usize {
+pub fn snap(emoji: &[(Range<usize>, Glyph)], index: usize) -> usize {
     match emoji.iter().find(|(r, _)| r.start < index && index < r.end) {
         Some((r, _)) => r.end,
         None => index,
@@ -289,7 +355,7 @@ pub fn snap(emoji: &[(Range<usize>, u16)], index: usize) -> usize {
 }
 
 /// `index` moved to the start of an emoji it falls inside.
-pub fn snap_down(emoji: &[(Range<usize>, u16)], index: usize) -> usize {
+pub fn snap_down(emoji: &[(Range<usize>, Glyph)], index: usize) -> usize {
     match emoji.iter().find(|(r, _)| r.start < index && index < r.end) {
         Some((r, _)) => r.start,
         None => index,

@@ -72,6 +72,10 @@ pub enum Command {
         peer: PeerKey,
         max_id: i32,
     },
+    /// Custom emoji are needed (their documents and files; once per id).
+    LoadCustomEmoji(Vec<i64>),
+    /// Not in the file cache (the file thread looked): fetch and download.
+    FetchCustomEmoji(Vec<i64>),
     /// A userpic is needed (once per photo).
     LoadUserpic {
         peer: PeerKey,
@@ -139,6 +143,13 @@ pub struct ArchiveInfo {
 
 #[derive(Debug, Clone)]
 pub enum Update {
+    /// A custom emoji's document and file.
+    CustomEmoji {
+        doc: tdr_data::emoji_sets::EmojiDocument,
+        bytes: Vec<u8>,
+    },
+    /// A custom emoji that could not be loaded.
+    CustomEmojiFailed(i64),
     /// The archive's row, `None` while the archive is empty.
     Archive(Option<ArchiveInfo>),
     /// The chat list of a folder (0: all chats); the window shows the open one's.
@@ -819,6 +830,7 @@ fn message_text(text: &str, entities: &[describe::Entity]) -> (String, Vec<TextE
                 E::BotCommand => TextKind::BotCommand,
                 E::Phone => TextKind::Phone,
                 E::BankCard => TextKind::BankCard,
+                E::CustomEmoji(id) => TextKind::CustomEmoji(*id),
                 E::FormattedDate { date, .. } => TextKind::Date(*date),
             };
             TextEntity {
@@ -1445,6 +1457,10 @@ enum PicJob {
         photo_id: i64,
         dc_id: i32,
     },
+    /// The UI wants these custom emoji.
+    WantEmoji(Vec<i64>),
+    /// A custom emoji's document and file were downloaded: store and show them.
+    EmojiDownloaded { doc_blob: Vec<u8>, bytes: Vec<u8> },
     /// It was downloaded: store it and show it.
     Downloaded {
         peer: PeerKey,
@@ -1461,12 +1477,17 @@ fn userpic_key(photo_id: i64) -> String {
 /// the data thread is busy catching up with the server at start (and once was the
 /// only one reading the cache, so cached userpics waited for that). Misses go to the
 /// data thread to download; downloads come back here to be stored.
+fn misses_tx_emoji(misses: &mpsc::UnboundedSender<Command>, ids: Vec<i64>) -> bool {
+    misses.send(Command::FetchCustomEmoji(ids)).is_ok()
+}
+
 fn spawn_userpics(
     files_dir: PathBuf,
     jobs: std::sync::mpsc::Receiver<PicJob>,
     misses: mpsc::UnboundedSender<Command>,
     tx: mpsc::UnboundedSender<Update>,
 ) {
+    let misses_cmd = misses.clone();
     std::thread::Builder::new()
         .name("userpics".into())
         .spawn(move || {
@@ -1508,6 +1529,40 @@ fn spawn_userpics(
                             });
                         }
                     },
+                    PicJob::WantEmoji(ids) => {
+                        let mut misses = Vec::new();
+                        for id in ids {
+                            let doc = files
+                                .get(&format!("emoji-doc:{id}"))
+                                .ok()
+                                .flatten()
+                                .and_then(|b| tdr_data::emoji_sets::decode_document(&b));
+                            let file = doc.as_ref().and_then(|_| {
+                                files.get(&format!("emoji-file:{id}")).ok().flatten()
+                            });
+                            match (doc, file) {
+                                (Some(doc), Some(bytes)) => {
+                                    let _ = tx.send(Update::CustomEmoji { doc, bytes });
+                                }
+                                _ => misses.push(id),
+                            }
+                        }
+                        if !misses.is_empty() {
+                            let _ = misses_tx_emoji(&misses_cmd, misses);
+                        }
+                    }
+                    PicJob::EmojiDownloaded { doc_blob, bytes } => {
+                        let Some(doc) = tdr_data::emoji_sets::decode_document(&doc_blob) else {
+                            continue;
+                        };
+                        if let Err(e) = files.put(&format!("emoji-doc:{}", doc.id), &doc_blob) {
+                            error!("file cache: {e}");
+                        }
+                        if let Err(e) = files.put(&format!("emoji-file:{}", doc.id), &bytes) {
+                            error!("file cache: {e}");
+                        }
+                        let _ = tx.send(Update::CustomEmoji { doc, bytes });
+                    }
                     PicJob::Downloaded {
                         peer,
                         photo_id,
@@ -1560,6 +1615,9 @@ pub fn start(
                                 photo_id,
                                 dc_id,
                             });
+                        }
+                        Command::LoadCustomEmoji(ids) => {
+                            let _ = pics_tx.send(PicJob::WantEmoji(ids));
                         }
                         cmd => {
                             if data_tx.send(cmd).is_err() {
@@ -2461,6 +2519,56 @@ async fn run(
                         Ok(_) => send_dialogs(sync.store(), shown_dialogs, &mut folders, &tx)?,
                         Err(e) => error!("read: {e}"),
                     },
+                    Command::LoadCustomEmoji(_) => {}
+                    // Not in the file cache (the file thread looked): fetch the
+                    // documents (`getCustomEmojiDocuments`) and download the files.
+                    Command::FetchCustomEmoji(ids) => {
+                        let ids: Vec<i64> = ids.into_iter().filter(|id| loading.insert(*id)).collect();
+                        if !ids.is_empty() {
+                            let client = client.clone();
+                            let done = pics.clone();
+                            let downloads = downloads.clone();
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let docs = match tdr_data::emoji_sets::custom_emoji_documents(&client, &ids).await {
+                                    Ok(docs) => docs,
+                                    Err(e) => {
+                                        tracing::debug!("custom emoji documents: {e}");
+                                        for id in ids {
+                                            let _ = tx.send(Update::CustomEmojiFailed(id));
+                                        }
+                                        return;
+                                    }
+                                };
+                                let mut tasks = Vec::new();
+                                for raw in docs {
+                                    let Some(doc) = tdr_data::emoji_sets::emoji_document(&raw) else {
+                                        continue;
+                                    };
+                                    let blob = tdr_data::emoji_sets::encode(&raw);
+                                    let client = client.clone();
+                                    let done = done.clone();
+                                    let downloads = downloads.clone();
+                                    let tx = tx.clone();
+                                    tasks.push(tokio::spawn(async move {
+                                        let _permit = downloads.acquire().await;
+                                        match tdr_data::emoji_sets::download_document(&client, &doc).await {
+                                            Ok(bytes) => {
+                                                let _ = done.send(PicJob::EmojiDownloaded { doc_blob: blob, bytes });
+                                            }
+                                            Err(e) => {
+                                                tracing::debug!("custom emoji file: {e}");
+                                                let _ = tx.send(Update::CustomEmojiFailed(doc.id));
+                                            }
+                                        }
+                                    }));
+                                }
+                                for t in tasks {
+                                    let _ = t.await;
+                                }
+                            });
+                        }
+                    }
                     // Not in the file cache (the userpic thread looked): download.
                     Command::LoadUserpic { peer, photo_id, dc_id } => {
                         if loading.insert(photo_id)
@@ -2777,6 +2885,50 @@ async fn run(
 const LOG_OUT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Demo messages with formatting: (outgoing, text, entities).
+/// The demo's custom emoji: ids and tdesktop's animations.
+const DEMO_CUSTOM_EMOJI: [(i64, &str, &[u8]); 4] = [
+    (
+        9001,
+        "👋",
+        include_bytes!("../../../assets/tdesktop-animations/demo__hello_status.tgs"),
+    ),
+    (
+        9002,
+        "🎂",
+        include_bytes!("../../../assets/tdesktop-animations/demo__cake.tgs"),
+    ),
+    (
+        9003,
+        "💎",
+        include_bytes!("../../../assets/tdesktop-animations/demo__diamond.tgs"),
+    ),
+    (
+        9004,
+        "🤖",
+        include_bytes!("../../../assets/tdesktop-animations/demo__robot.tgs"),
+    ),
+];
+
+fn demo_custom_emoji(id: i64) -> Option<Update> {
+    let (_, alt, bytes) = DEMO_CUSTOM_EMOJI.iter().find(|e| e.0 == id)?;
+    Some(Update::CustomEmoji {
+        doc: tdr_data::emoji_sets::EmojiDocument {
+            id,
+            access_hash: 0,
+            file_reference: Vec::new(),
+            dc_id: 0,
+            size: bytes.len() as i64,
+            format: tdr_data::emoji_sets::EmojiFormat::Tgs,
+            alt: (*alt).into(),
+            set: Some((1, 0)),
+            text_color: false,
+            free: false,
+            sticker: false,
+        },
+        bytes: bytes.to_vec(),
+    })
+}
+
 fn demo_formatted(date: i32) -> Vec<(bool, String, Vec<TextEntity>)> {
     use TextKind as K;
     let build = |parts: &[(&str, &[K])]| {
@@ -2844,7 +2996,18 @@ fn demo_formatted(date: i32) -> Vec<(bool, String, Vec<TextEntity>)> {
     ]);
     let mut be = be;
     add_syntax(&b, &mut be);
-    vec![(false, a, ae), (true, b, be)]
+    // Custom emoji (`--demo` answers them with tdesktop's own animations).
+    let (c, ce) = build(&[
+        ("Custom emoji: ", &[]),
+        ("👋", &[K::CustomEmoji(DEMO_CUSTOM_EMOJI[0].0)]),
+        (" hello ", &[]),
+        ("🎂", &[K::CustomEmoji(DEMO_CUSTOM_EMOJI[1].0)]),
+        ("💎", &[K::CustomEmoji(DEMO_CUSTOM_EMOJI[2].0)]),
+        (" and ", &[K::Bold]),
+        ("🤖", &[K::CustomEmoji(DEMO_CUSTOM_EMOJI[3].0)]),
+        (" next to 😀 a regular one", &[]),
+    ]);
+    vec![(false, a, ae), (true, b, be), (false, c, ce)]
 }
 
 fn demo_author(out: bool) -> Author {
@@ -3548,7 +3711,14 @@ pub fn start_demo(
                 | Command::CloseChat
                 | Command::SaveDraft { .. }
                 | Command::Read { .. }
-                | Command::LoadUserpic { .. } => {}
+                | Command::LoadUserpic { .. }
+                | Command::FetchCustomEmoji(_) => {}
+                Command::LoadCustomEmoji(ids) => {
+                    for id in ids {
+                        let _ = up_tx
+                            .send(demo_custom_emoji(id).unwrap_or(Update::CustomEmojiFailed(id)));
+                    }
+                }
                 Command::LoadOlder(_) if older_left > 0 => {
                     let first = history.first().map_or(1000, |m| m.id);
                     let first_date = history.first().map_or(start, |m| m.date);
@@ -3606,6 +3776,7 @@ pub fn start_demo(
                                     O::Blockquote => E::Blockquote { collapsed: false },
                                     O::Spoiler => E::Spoiler,
                                     O::TextUrl(url) => E::TextUrl(url.clone()),
+                                    O::CustomEmoji(id) => E::CustomEmoji(*id),
                                 },
                             }
                         })

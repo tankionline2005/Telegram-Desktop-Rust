@@ -81,7 +81,7 @@ pub struct Prepaint {
     /// The spoilers' x ranges in the shaped line.
     spoilers: Vec<(Pixels, Pixels)>,
     /// The emoji images: their spaces' x and the emoji.
-    emoji: Vec<(Pixels, u16)>,
+    emoji: Vec<(Pixels, crate::emoji::Glyph)>,
 }
 
 impl Element for OneLine {
@@ -260,10 +260,16 @@ impl Element for OneLine {
             let _ = prepaint
                 .line
                 .paint(origin, prepaint.line_height, window, cx);
-            for (x, index) in &prepaint.emoji {
-                let at =
-                    crate::emoji::origin_in_line(origin.x + *x, origin.y, prepaint.line_height);
-                crate::emoji::paint(*index, at, crate::emoji::size_normal(), window);
+            let color = window.text_style().color;
+            for (x, glyph) in &prepaint.emoji {
+                crate::emoji::paint_glyph(
+                    *glyph,
+                    origin.x + *x,
+                    origin.y,
+                    prepaint.line_height,
+                    color,
+                    window,
+                );
             }
             if let Some(color) = self.spoiler_color
                 && !prepaint.spoilers.is_empty()
