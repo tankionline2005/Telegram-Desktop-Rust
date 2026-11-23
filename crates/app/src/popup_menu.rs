@@ -84,6 +84,8 @@ pub enum MenuAction {
     None,
     /// The emoji panel's recent emoji: remove one, reset all (asks first).
     EmojiRemoveRecent(u16),
+    /// A custom emoji leaves the recent ones.
+    EmojiRemoveRecentCustom(i64),
     EmojiResetRecent,
     /// Opens an emoji set's box (id, access hash).
     OpenEmojiSet(i64, i64),

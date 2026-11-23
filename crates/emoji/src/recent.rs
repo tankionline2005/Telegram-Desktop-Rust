@@ -1,16 +1,23 @@
 //! Recent emoji and chosen skin tones (`Core::Settings`: `recentEmoji`,
 //! `incrementRecentEmoji`, `hideRecentEmoji`, `resetRecentEmoji`, `emojiVariants`).
-//! Custom emoji are not kept here yet.
+//! Custom emoji are kept among them by document id (`RecentEmojiDocument`).
 
 use std::collections::{HashMap, HashSet};
 
 /// `kRecentEmojiLimit`.
 pub const LIMIT: usize = 54;
 
+/// A recent emoji: one of Telegram's or a custom one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entry {
+    Emoji(u16),
+    Custom(i64),
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Recent {
     /// Emoji and their ratings, the most used first.
-    list: Vec<(u16, u32)>,
+    list: Vec<(Entry, u32)>,
     /// Default recent emoji the user removed (`_recentEmojiSkip`, by id).
     skip: HashSet<String>,
     /// Chosen variants by the uncolored emoji's id; "" for all emoji.
@@ -32,25 +39,44 @@ impl Recent {
             let id = crate::get(emoji)
                 .map(|e| e.id().to_string())
                 .unwrap_or_default();
-            if self.skip.contains(&id) || self.list.iter().any(|(e, _)| *e == emoji) {
+            if self.skip.contains(&id) || self.list.iter().any(|(e, _)| *e == Entry::Emoji(emoji)) {
                 continue;
             }
-            self.list.push((emoji, 1));
+            self.list.push((Entry::Emoji(emoji), 1));
         }
     }
 
+    /// The recent emoji of Telegram's (custom ones left out).
     pub fn list(&mut self) -> Vec<u16> {
+        self.entries()
+            .into_iter()
+            .filter_map(|e| match e {
+                Entry::Emoji(e) => Some(e),
+                Entry::Custom(_) => None,
+            })
+            .collect()
+    }
+
+    /// All recent emoji, custom ones too.
+    pub fn entries(&mut self) -> Vec<Entry> {
         self.resolve();
         self.list.iter().map(|(e, _)| *e).take(LIMIT).collect()
     }
 
-    /// `incrementRecentEmoji`.
-    pub fn increment(&mut self, emoji: u16) {
+    /// `incrementRecentEmoji` for a custom emoji.
+    pub fn increment_custom(&mut self, id: i64) {
         self.resolve();
-        if let Some(one) = crate::get(emoji) {
-            self.skip.remove(one.id());
-        }
-        if let Some(mut i) = self.list.iter().position(|(e, _)| *e == emoji) {
+        self.bump(Entry::Custom(id));
+    }
+
+    /// `hideRecentEmoji` for a custom emoji.
+    pub fn hide_custom(&mut self, id: i64) {
+        self.resolve();
+        self.list.retain(|(e, _)| *e != Entry::Custom(id));
+    }
+
+    fn bump(&mut self, entry: Entry) {
+        if let Some(mut i) = self.list.iter().position(|(e, _)| *e == entry) {
             self.list[i].1 += 1;
             if self.list[i].1 > 0x8000 {
                 for (_, rating) in &mut self.list {
@@ -62,7 +88,7 @@ impl Recent {
                 i -= 1;
             }
         } else {
-            self.list.push((emoji, 1));
+            self.list.push((entry, 1));
             let mut i = self.list.len() - 1;
             while i > 0 && self.list[i - 1].1 <= self.list[i].1 {
                 self.list.swap(i, i - 1);
@@ -74,10 +100,19 @@ impl Recent {
         }
     }
 
+    /// `incrementRecentEmoji`.
+    pub fn increment(&mut self, emoji: u16) {
+        self.resolve();
+        if let Some(one) = crate::get(emoji) {
+            self.skip.remove(one.id());
+        }
+        self.bump(Entry::Emoji(emoji));
+    }
+
     /// `hideRecentEmoji`: removed, and a default one is not added back.
     pub fn hide(&mut self, emoji: u16) {
         self.resolve();
-        self.list.retain(|(e, _)| *e != emoji);
+        self.list.retain(|(e, _)| *e != Entry::Emoji(emoji));
         if crate::default_recent().contains(&emoji)
             && let Some(one) = crate::get(emoji)
         {
@@ -145,9 +180,14 @@ impl Recent {
     /// The stored form: one entry per line.
     pub fn serialize(&self) -> String {
         let mut out = String::new();
-        for (emoji, rating) in &self.list {
-            if let Some(one) = crate::get(*emoji) {
-                out.push_str(&format!("recent\t{}\t{rating}\n", one.text()));
+        for (entry, rating) in &self.list {
+            match entry {
+                Entry::Emoji(emoji) => {
+                    if let Some(one) = crate::get(*emoji) {
+                        out.push_str(&format!("recent\t{}\t{rating}\n", one.text()));
+                    }
+                }
+                Entry::Custom(id) => out.push_str(&format!("custom\t{id}\t{rating}\n")),
             }
         }
         for id in &self.skip {
@@ -166,9 +206,16 @@ impl Recent {
             match parts.as_slice() {
                 ["recent", emoji, rating] => {
                     if let (Some(e), Ok(r)) = (crate::by_text(emoji), rating.parse())
-                        && !result.list.iter().any(|(x, _)| *x == e)
+                        && !result.list.iter().any(|(x, _)| *x == Entry::Emoji(e))
                     {
-                        result.list.push((e, r));
+                        result.list.push((Entry::Emoji(e), r));
+                    }
+                }
+                ["custom", id, rating] => {
+                    if let (Ok(id), Ok(r)) = (id.parse::<i64>(), rating.parse())
+                        && !result.list.iter().any(|(x, _)| *x == Entry::Custom(id))
+                    {
+                        result.list.push((Entry::Custom(id), r));
                     }
                 }
                 ["skip", id] => {
@@ -222,5 +269,18 @@ mod tests {
         r.save_all_variants(crate::get(thumbs).unwrap().variant(2));
         let wave = crate::by_text("👋").unwrap();
         assert_eq!(r.variant_of(wave), crate::get(wave).unwrap().variant(2));
+    }
+
+    #[test]
+    fn custom_emoji_are_recent_too() {
+        let mut r = Recent::default();
+        r.increment_custom(42);
+        r.increment_custom(42);
+        assert_eq!(r.entries()[0], Entry::Custom(42));
+        assert!(!r.list().is_empty());
+        let mut back = Recent::parse(&r.serialize());
+        assert_eq!(back.entries()[0], Entry::Custom(42));
+        back.hide_custom(42);
+        assert!(!back.entries().contains(&Entry::Custom(42)));
     }
 }

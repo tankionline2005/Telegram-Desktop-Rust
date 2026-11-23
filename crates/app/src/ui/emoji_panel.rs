@@ -186,6 +186,8 @@ pub(super) struct EmojiPanel {
     pub(super) search: Option<Entity<TextInput>>,
     query: String,
     results: Option<Vec<Slot>>,
+    /// The recent section, custom emoji too (`_recent`).
+    recent_slots: Vec<Slot>,
     /// The list's top left in the window at the last paint.
     origin: Rc<Cell<Point<Pixels>>>,
     pub(super) recent: tdr_emoji::recent::Recent,
@@ -235,6 +237,7 @@ impl EmojiPanel {
             search: None,
             query: String::new(),
             results: None,
+            recent_slots: Vec::new(),
             origin: Rc::new(Cell::new(Point::default())),
             recent,
             recent_path,
@@ -260,6 +263,20 @@ impl EmojiPanel {
 
     /// `fillRecent` and the sections with `lookupEmojiVariant`.
     fn refresh(&mut self) {
+        // Custom emoji that need Premium are left out without it.
+        let locked = self.locked;
+        self.recent_slots = self
+            .recent
+            .entries()
+            .into_iter()
+            .filter_map(|e| match e {
+                tdr_emoji::recent::Entry::Emoji(e) => Some(Slot::Emoji(e)),
+                tdr_emoji::recent::Entry::Custom(id) => {
+                    let free = crate::custom_emoji::info(id).is_some_and(|i| i.free);
+                    (!locked || free).then_some(Slot::Custom(id))
+                }
+            })
+            .collect();
         let mut lists = vec![self.recent.list()];
         for s in Section::ALL {
             lists.push(
@@ -598,7 +615,14 @@ impl MainView {
                 .emoji_panel
                 .lists
                 .iter()
-                .map(|l| (l.len(), false))
+                .enumerate()
+                .map(|(k, l)| {
+                    if k == 0 {
+                        (self.emoji_panel.recent_slots.len(), false)
+                    } else {
+                        (l.len(), false)
+                    }
+                })
                 .chain(
                     self.emoji_panel
                         .sets
@@ -621,6 +645,7 @@ impl MainView {
             Some(results) => results.get(index).copied(),
             None => match self.emoji_panel.set(section) {
                 Some(set) => set.emoji.get(index).copied().map(Slot::Custom),
+                None if section == 0 => self.emoji_panel.recent_slots.get(index).copied(),
                 None => self
                     .emoji_panel
                     .lists
@@ -693,6 +718,9 @@ impl MainView {
             .map(|i| i.alt)
             .filter(|a| !a.is_empty())
             .unwrap_or_else(|| "🙂".into());
+        self.emoji_panel.recent.increment_custom(id);
+        self.emoji_panel.save_recent();
+        self.emoji_panel.refresh();
         let input = self.input.clone();
         input.update(cx, |i, cx| i.insert_custom_emoji(&alt, id, cx));
         window.focus(&input.focus_handle(cx));
@@ -1099,29 +1127,44 @@ impl MainView {
         if self.emoji_panel.results.is_some() {
             return;
         }
-        let Some(emoji) = self.emoji_at(0, index) else {
-            return;
-        };
-        let text = tdr_emoji::get(emoji).map(|e| e.text()).unwrap_or_default();
-        let entries = vec![
-            Entry::action("Copy emoji", Icon::MenuCopy, MenuAction::Copy(text, None)),
-            Entry::action(
+        let mut entries = match self.cell_at(0, index) {
+            Some(Slot::Emoji(emoji)) => {
+                let text = tdr_emoji::get(emoji).map(|e| e.text()).unwrap_or_default();
+                vec![
+                    Entry::action("Copy emoji", Icon::MenuCopy, MenuAction::Copy(text, None)),
+                    Entry::action(
+                        "Remove from Recent",
+                        Icon::MenuCancel,
+                        MenuAction::EmojiRemoveRecent(emoji),
+                    ),
+                ]
+            }
+            Some(Slot::Custom(id)) => vec![Entry::action(
                 "Remove from Recent",
                 Icon::MenuCancel,
-                MenuAction::EmojiRemoveRecent(emoji),
-            ),
+                MenuAction::EmojiRemoveRecentCustom(id),
+            )],
+            None => return,
+        };
+        entries.extend([
             Entry::WideSeparator,
             Entry::attention(
                 "Reset recents",
                 Icon::MenuRestore,
                 MenuAction::EmojiResetRecent,
             ),
-        ];
+        ]);
         self.open_popup(PopupMenu::new(entries, true, at));
     }
 
     pub(super) fn emoji_remove_recent(&mut self, emoji: u16) {
         self.emoji_panel.recent.hide(emoji);
+        self.emoji_panel.save_recent();
+        self.emoji_panel.refresh();
+    }
+
+    pub(super) fn emoji_remove_recent_custom(&mut self, id: i64) {
+        self.emoji_panel.recent.hide_custom(id);
         self.emoji_panel.save_recent();
         self.emoji_panel.refresh();
     }
@@ -1517,7 +1560,14 @@ impl MainView {
                 .emoji_panel
                 .lists
                 .iter()
-                .map(|l| l.iter().map(|e| Slot::Emoji(*e)).collect())
+                .enumerate()
+                .map(|(k, l)| {
+                    if k == 0 {
+                        self.emoji_panel.recent_slots.clone()
+                    } else {
+                        l.iter().map(|e| Slot::Emoji(*e)).collect()
+                    }
+                })
                 .chain(
                     self.emoji_panel
                         .sets

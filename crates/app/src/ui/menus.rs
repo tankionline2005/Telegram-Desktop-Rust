@@ -765,6 +765,7 @@ impl MainView {
             }
             MenuAction::OpenUrl(url) => cx.open_url(&url),
             MenuAction::EmojiRemoveRecent(emoji) => self.emoji_remove_recent(emoji),
+            MenuAction::EmojiRemoveRecentCustom(id) => self.emoji_remove_recent_custom(id),
             MenuAction::OpenEmojiSet(id, access_hash) => {
                 self.open_emoji_set_box(tdr_data::emoji_sets::SetRef::Id(id, access_hash));
             }
