@@ -188,6 +188,8 @@ pub(super) struct EmojiPanel {
     results: Option<Vec<Slot>>,
     /// The recent section, custom emoji too (`_recent`).
     recent_slots: Vec<Slot>,
+    /// The mouse is over the search's cancel cross.
+    cancel_over: bool,
     /// The list's top left in the window at the last paint.
     origin: Rc<Cell<Point<Pixels>>>,
     pub(super) recent: tdr_emoji::recent::Recent,
@@ -238,6 +240,7 @@ impl EmojiPanel {
             query: String::new(),
             results: None,
             recent_slots: Vec::new(),
+            cancel_over: false,
             origin: Rc::new(Cell::new(Point::default())),
             recent,
             recent_path,
@@ -1909,6 +1912,12 @@ impl MainView {
                     .justify_center()
                     .child(icon(Icon::EmojiSkin, skin_color, window))
             });
+        let has_query = !self.emoji_panel.query.is_empty();
+        let cancel_color = if self.emoji_panel.cancel_over {
+            p.emoji_sub_icon_fg_active
+        } else {
+            p.emoji_icon_fg
+        };
         let search = self.emoji_panel.search.clone().map(|field| {
             let [ml, mt, mr, _] = SEARCH_MARGIN;
             div()
@@ -1939,7 +1948,37 @@ impl MainView {
                         .justify_center()
                         .child(icon(Icon::EmojiSearch, p.emoji_icon_fg, window)),
                 )
-                .child(div().flex_1().min_w(px(0.)).child(field))
+                .child(div().flex_1().min_w(px(0.)).child(field.clone()))
+                .when(has_query, |d| {
+                    // `TabbedSearch`'s cancel: clears the query.
+                    let field = field.clone();
+                    d.child(
+                        div()
+                            .id("emoji-search-cancel")
+                            .flex_none()
+                            .size(px(SEARCH_HEIGHT))
+                            .cursor_pointer()
+                            .child(
+                                canvas(
+                                    |_, _, _| {},
+                                    move |bounds, _, window, _| {
+                                        super::chrome::paint_cross(bounds, cancel_color, window)
+                                    },
+                                )
+                                .size_full(),
+                            )
+                            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                this.emoji_panel.cancel_over = *hovered;
+                                cx.notify();
+                            }))
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                window.prevent_default();
+                                cx.stop_propagation();
+                                field.update(cx, |f, cx| f.set_text(String::new(), cx));
+                                window.focus(&field.focus_handle(cx));
+                            }),
+                    )
+                })
         });
         div()
             .id("emoji-list")

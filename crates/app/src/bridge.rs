@@ -624,6 +624,24 @@ pub struct LastLine {
     /// Byte ranges of `text` under spoilers: its spoiler entities, and the login code
     /// of a "Telegram" notification (`SpoilerLoginCode`).
     pub spoilers: Vec<std::ops::Range<usize>>,
+    /// Byte ranges of `text` drawn as custom emoji.
+    pub custom: Vec<(std::ops::Range<usize>, i64)>,
+}
+
+/// The custom emoji entities of a message within its first line `text`.
+fn custom_in_line(
+    info: &describe::MessageInfo,
+    full: &str,
+    text: &str,
+) -> Vec<(std::ops::Range<usize>, i64)> {
+    info.entities
+        .iter()
+        .filter_map(|e| match e.kind {
+            describe::EntityKind::CustomEmoji(id) => e.byte_range(full).map(|r| (r, id)),
+            _ => None,
+        })
+        .filter(|(r, _)| r.end <= text.len())
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -995,16 +1013,19 @@ fn dialog_item(store: &Storage, d: &DialogView, ctx: &Context) -> DialogItem {
                 accent: Some(s),
                 text: String::new(),
                 spoilers: Vec::new(),
+                custom: Vec::new(),
             },
             (None, Some(label)) if text.is_empty() => LastLine {
                 prefix,
                 accent: Some(label),
                 text: String::new(),
                 spoilers: Vec::new(),
+                custom: Vec::new(),
             },
             _ => LastLine {
                 prefix,
                 accent: None,
+                custom: custom_in_line(&info, &full, &text),
                 text,
                 spoilers,
             },
@@ -2091,7 +2112,7 @@ fn topic_items(
         .map(|t| {
             let top = store.message(peer, t.top_message).ok().flatten();
             let last = top.as_ref().map_or_else(LastLine::default, |m| {
-                let (media, service, _) = message_content(store, m, false);
+                let (media, service, info) = message_content(store, m, false);
                 let full = row_text(m);
                 let text = full.lines().next().unwrap_or("").to_string();
                 let prefix = (service.is_none())
@@ -2109,16 +2130,19 @@ fn topic_items(
                         accent: Some(s),
                         text: String::new(),
                         spoilers: Vec::new(),
+                        custom: Vec::new(),
                     },
                     (None, Some(label)) if text.is_empty() => LastLine {
                         prefix,
                         accent: Some(label),
                         text: String::new(),
                         spoilers: Vec::new(),
+                        custom: Vec::new(),
                     },
                     _ => LastLine {
                         prefix,
                         accent: None,
+                        custom: custom_in_line(&info, &full, &text),
                         text,
                         spoilers: Vec::new(),
                     },
@@ -3261,6 +3285,7 @@ pub fn start_demo(
         accent: accent.map(Into::into),
         text: text.into(),
         spoilers: Vec::new(),
+        custom: Vec::new(),
     };
     // name, kind, last line, unread, muted, pinned, our last message read
     let rows = [

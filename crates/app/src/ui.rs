@@ -1593,6 +1593,7 @@ impl MainView {
             || self.history_bar.drag.is_some()
             || self.dialogs_bar.drag.is_some()
             || self.settings_bar.drag.is_some()
+            || self.emoji_bar.drag.is_some()
     }
 
     /// The mouse moved while something is dragged: wherever it is, like Qt's mouse grab
@@ -3201,7 +3202,9 @@ impl MainView {
                         .text_color(c(service_fg))
                         .child(one_line(accent.clone())),
                     None => div().flex_1().min_w(px(0.)).text_color(c(text_fg)).child(
-                        one_line(last.text.clone()).spoilers(last.spoilers.clone(), text_fg),
+                        one_line(last.text.clone())
+                            .spoilers(last.spoilers.clone(), text_fg)
+                            .custom_emoji(last.custom.clone()),
                     ),
                 };
                 div()

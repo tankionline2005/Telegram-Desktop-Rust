@@ -1956,7 +1956,7 @@ impl MainView {
 }
 
 /// `CrossAnimation` at rest: an X in a `CANCEL_SIZE` square, 1.5 px strokes.
-fn paint_cross(bounds: gpui::Bounds<Pixels>, color: Color, window: &mut Window) {
+pub(super) fn paint_cross(bounds: gpui::Bounds<Pixels>, color: Color, window: &mut Window) {
     let size = f32::from(bounds.size.width);
     let skip = scale::lg(CANCEL_SKIP) * size / scale::lg(CANCEL_SIZE);
     let (l, t) = (f32::from(bounds.left()), f32::from(bounds.top()));

@@ -26,6 +26,8 @@ pub struct OneLine {
     /// `Colorized`: the archive row's unread chats).
     marked: Vec<std::ops::Range<usize>>,
     marked_color: Option<tdr_theme::Color>,
+    /// Byte ranges drawn as custom emoji.
+    custom: Vec<(std::ops::Range<usize>, i64)>,
 }
 
 /// One line of `text` in the current text style, as wide as its parent, cut with "…".
@@ -37,6 +39,7 @@ pub fn one_line(text: impl Into<SharedString>) -> OneLine {
         spoiler_color: None,
         marked: Vec::new(),
         marked_color: None,
+        custom: Vec::new(),
     }
 }
 
@@ -56,6 +59,12 @@ impl OneLine {
     ) -> Self {
         self.spoilers = ranges;
         self.spoiler_color = Some(color);
+        self
+    }
+
+    /// Draws these byte ranges as custom emoji (over their fallback emoji).
+    pub fn custom_emoji(mut self, ranges: Vec<(std::ops::Range<usize>, i64)>) -> Self {
+        self.custom = ranges;
         self
     }
 
@@ -130,6 +139,16 @@ impl Element for OneLine {
         } else {
             self.text.clone()
         };
+        let custom: Vec<(std::ops::Range<usize>, i64)> = self
+            .custom
+            .iter()
+            .filter(|(r, _)| {
+                r.end <= text.len()
+                    && text.is_char_boundary(r.start)
+                    && text.is_char_boundary(r.end)
+            })
+            .cloned()
+            .collect();
         // Spoiler text is shaped transparent: the particles take its place.
         let spoilers: Vec<std::ops::Range<usize>> = self
             .spoilers
@@ -185,7 +204,14 @@ impl Element for OneLine {
             if runs.is_empty() {
                 runs.push(style.to_run(text.len()));
             }
-            let emoji = crate::profile::time("OneLine find_all", || crate::emoji::find_all(&text));
+            let emoji = crate::profile::time("OneLine find_all", || {
+                let custom: Vec<_> = custom
+                    .iter()
+                    .filter(|(r, _)| r.end <= limit)
+                    .cloned()
+                    .collect();
+                crate::emoji::with_custom(crate::emoji::find_all(&text), &custom)
+            });
             let (display, runs) = crate::profile::time("OneLine shape_text", || {
                 crate::emoji::shape_text(&text, 0, &emoji, runs, font_size)
             });
@@ -227,7 +253,7 @@ impl Element for OneLine {
         let ellipsis_width = shape(window, ELLIPSIS.into(), 0).0.width;
         let room = (width - ellipsis_width).max(px(0.));
         let mut cut = full.closest_index_for_x(room).min(text.len());
-        let all_emoji = crate::emoji::find_all(&text);
+        let all_emoji = crate::emoji::with_custom(crate::emoji::find_all(&text), &custom);
         cut = crate::emoji::snap_down(&all_emoji, cut);
         while cut > 0 && (!text.is_char_boundary(cut) || full.x_for_index(cut) > room) {
             cut -= 1;
