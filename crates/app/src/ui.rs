@@ -297,6 +297,9 @@ const TAIL_SIZE: (f32, f32) = (6., 10.);
 
 /// The bubble tail filled in `bounds` (mirrored for the right side).
 fn paint_tail(bounds: gpui::Bounds<Pixels>, right_side: bool, fill: Rgba, window: &mut Window) {
+    if crate::profile::off("tails") {
+        return;
+    }
     let outline = crate::icons::bubble_tail_outline();
     let sx = f32::from(bounds.size.width) / TAIL_SIZE.0;
     let sy = f32::from(bounds.size.height) / TAIL_SIZE.1;
@@ -920,6 +923,25 @@ impl MainView {
             field
         });
         cx.observe(&search, |_, _, cx| cx.notify()).detach();
+        // Custom emoji animations and loads repaint the window when their next frame
+        // is due (at most `FRAME_MS` apart), instead of on every vsync.
+        cx.spawn(async move |this, cx| {
+            loop {
+                let wait = match crate::repaint::due() {
+                    Some(due) => due.saturating_duration_since(Instant::now()),
+                    None => Duration::from_millis(50),
+                };
+                cx.background_executor()
+                    .timer(wait.max(Duration::from_millis(4)))
+                    .await;
+                if crate::repaint::due().is_some_and(|d| d <= Instant::now())
+                    && this.update(cx, |_, cx| cx.notify()).is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.observe(&input, |this: &mut Self, _, cx| this.input_changed(cx))
             .detach();
         cx.subscribe(&input, |this: &mut Self, _, FieldMenu(at), cx| {
@@ -3603,12 +3625,14 @@ impl MainView {
             .relative()
             .flex_none()
             // `msgShadow` under the bubble and its rounded corners.
-            .shadow(vec![gpui::BoxShadow {
-                color: c(shadow).into(),
-                offset: point(gpui::px(0.), px(MSG_SHADOW)),
-                blur_radius: gpui::px(0.),
-                spread_radius: gpui::px(0.),
-            }])
+            .when(!crate::profile::off("shadows"), |d| {
+                d.shadow(vec![gpui::BoxShadow {
+                    color: c(shadow).into(),
+                    offset: point(gpui::px(0.), px(MSG_SHADOW)),
+                    blur_radius: gpui::px(0.),
+                    spread_radius: gpui::px(0.),
+                }])
+            })
             .w(gpui::px(inner + 2. * pad_x))
             .px(gpui::px(pad_x))
             .py(gpui::px(pad_y))
@@ -4624,9 +4648,26 @@ impl Focusable for MainView {
 
 impl Render for MainView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if crate::profile::off("view") {
+            // Performance experiment: an empty frame, every vsync.
+            window.request_animation_frame();
+            return div().size_full().bg(c(self.palette().window_bg)).into_any_element();
+        }
+        crate::profile::time("MainView::render", || self.render_view(window, cx))
+    }
+}
+
+impl MainView {
+    fn render_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         // Every size below is converted for this scale as tdesktop does.
         scale::set(window.scale_factor());
         self.update_quote_color(cx);
+        // Custom emoji: last frame's replaced images leave the GPU atlas; the next
+        // animation frame (or a look at a loading emoji) is a timer, not every
+        // vsync.
+        crate::repaint::begin();
+        crate::repaint::set_paused(!window.is_window_active());
+        crate::custom_emoji::begin_frame(window);
         // Custom emoji painted in the last frame and not known yet.
         let wanted = crate::custom_emoji::take_wanted();
         if !wanted.is_empty() {
@@ -5269,5 +5310,6 @@ impl Render for MainView {
                     window,
                 )
             }))
+            .into_any_element()
     }
 }

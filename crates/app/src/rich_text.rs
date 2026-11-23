@@ -1306,7 +1306,7 @@ impl RichText {
                 };
                 crate::spoiler::fill(rect, bounds.origin, color, frame, window);
             }
-            window.request_animation_frame();
+            crate::spoiler::schedule();
         }
     }
 
@@ -1385,6 +1385,7 @@ impl Element for RichText {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let _timer = crate::profile::Timer::new("RichText::paint");
         let origin = bounds.origin;
         let layout = self.layout.clone();
         let local =
@@ -1839,7 +1840,9 @@ impl RichText {
                 let descent = shaped.descent;
                 let baseline = top + px(f.ascent);
                 let origin_y = baseline - (lh + ascent - descent) / 2.;
-                let _ = shaped.paint(point(left, origin_y), lh, window, cx);
+                if !crate::profile::off("text") {
+                    let _ = shaped.paint(point(left, origin_y), lh, window, cx);
+                }
                 // The emoji over their spaces; hidden spoilers keep theirs hidden.
                 for (r, glyph) in &rich.emoji {
                     if r.start < range.start || r.end > range.end {
@@ -1864,7 +1867,8 @@ impl RichText {
                 }
             }
         }
-        if rich.has_spoilers && reveal < 1. {
+        // The hidden text fades in while a spoiler is revealed.
+        if rich.has_spoilers && self.state.revealed.is_some() && reveal < 1. {
             window.request_animation_frame();
         }
     }
@@ -1915,7 +1919,7 @@ pub fn view(
                                 let color = if *sel { selected } else { normal };
                                 crate::spoiler::fill(rect, bounds.origin, color, frame, window);
                             }
-                            window.request_animation_frame();
+                            crate::spoiler::schedule();
                         },
                     )
                     .w(px(w))

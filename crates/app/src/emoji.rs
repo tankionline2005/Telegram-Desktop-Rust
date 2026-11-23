@@ -176,6 +176,10 @@ pub fn image(index: u16, size: u32, window: &mut Window) -> Option<Arc<RenderIma
 /// Paints emoji `index` as a `size` device pixels square with its top left at
 /// `origin`.
 pub fn paint(index: u16, origin: gpui::Point<Pixels>, size_device: u32, window: &mut Window) {
+    let _timer = crate::profile::Timer::new("emoji::paint");
+    if crate::profile::off("emoji") {
+        return;
+    }
     let Some(image) = image(index, size_device, window) else {
         return;
     };

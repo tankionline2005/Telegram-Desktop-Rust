@@ -85,6 +85,8 @@ pub enum MenuAction {
     /// The emoji panel's recent emoji: remove one, reset all (asks first).
     EmojiRemoveRecent(u16),
     EmojiResetRecent,
+    /// Opens an emoji set's box (id, access hash).
+    OpenEmojiSet(i64, i64),
     // The message field's menu.
     FieldUndo,
     FieldRedo,

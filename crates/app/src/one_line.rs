@@ -120,6 +120,7 @@ impl Element for OneLine {
         window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
+        let _timer = crate::profile::Timer::new("OneLine::prepaint");
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = style.line_height_in_pixels(window.rem_size());
@@ -184,11 +185,15 @@ impl Element for OneLine {
             if runs.is_empty() {
                 runs.push(style.to_run(text.len()));
             }
-            let emoji = crate::emoji::find_all(&text);
-            let (display, runs) = crate::emoji::shape_text(&text, 0, &emoji, runs, font_size);
-            let line = window
-                .text_system()
-                .shape_line(display.into(), font_size, &runs, None);
+            let emoji = crate::profile::time("OneLine find_all", || crate::emoji::find_all(&text));
+            let (display, runs) = crate::profile::time("OneLine shape_text", || {
+                crate::emoji::shape_text(&text, 0, &emoji, runs, font_size)
+            });
+            let line = crate::profile::time("OneLine shape_line", || {
+                window
+                    .text_system()
+                    .shape_line(display.into(), font_size, &runs, None)
+            });
             // Emoji under a spoiler stay hidden.
             let images = emoji
                 .iter()
@@ -257,9 +262,11 @@ impl Element for OneLine {
                 .floor();
         }
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-            let _ = prepaint
-                .line
-                .paint(origin, prepaint.line_height, window, cx);
+            if !crate::profile::off("text") {
+                let _ = prepaint
+                    .line
+                    .paint(origin, prepaint.line_height, window, cx);
+            }
             let color = window.text_style().color;
             for (x, glyph) in &prepaint.emoji {
                 crate::emoji::paint_glyph(
@@ -282,7 +289,7 @@ impl Element for OneLine {
                     );
                     crate::spoiler::fill(rect, origin, color, frame, window);
                 }
-                window.request_animation_frame();
+                crate::spoiler::schedule();
             }
         });
     }

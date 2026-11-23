@@ -176,3 +176,11 @@
   images with `emoji::paint`; snap hit-test indices with `emoji::snap`. The panel is
   `ui/emoji_panel.rs` (`Area::Emoji` scroll), recent emoji and skin tones
   `tdr_emoji::recent` (`data/emoji.txt`).
+- GPUI repaints the whole window every frame, and on the author's laptop (AMD Radeon
+  Vega 3) even an empty frame at 60 fps fills the GPU: continuous animations must not
+  call `request_animation_frame` every vsync. Spoilers and custom emoji ask
+  `repaint::at` for their next frame (a ticker in `MainView::new` notifies then),
+  animations pause while the window is inactive, and custom emoji keep only the frame
+  on screen as a GPU image (`custom_emoji`: frames in memory, old images dropped from
+  the atlas each frame). Performance switches: `TDR_PROFILE=1` prints timings to stderr,
+  `TDR_OFF=tails,spoilers,emoji,shadows,text,view` turns parts off (`profile.rs`).

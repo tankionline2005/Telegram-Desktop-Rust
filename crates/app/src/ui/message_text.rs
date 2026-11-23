@@ -99,6 +99,8 @@ enum LocalLink {
         id: i64,
         post: Option<i32>,
     },
+    /// `t.me/addemoji/<name>`: an emoji set's box.
+    EmojiSet(String),
 }
 
 fn is_username(s: &str) -> bool {
@@ -109,6 +111,13 @@ fn is_username(s: &str) -> bool {
 
 fn local_link(url: &str) -> Option<LocalLink> {
     let lower = url.to_ascii_lowercase();
+    if let Some(query) = lower.strip_prefix("tg://addemoji?") {
+        return query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("set="))
+            .filter(|n| !n.is_empty())
+            .map(|n| LocalLink::EmojiSet(n.to_string()));
+    }
     if let Some(query) = lower.strip_prefix("tg://resolve?") {
         let mut name = None;
         let mut post = None;
@@ -137,6 +146,7 @@ fn local_link(url: &str) -> Option<LocalLink> {
     let path = path.split(['?', '#']).next().unwrap_or("");
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     match parts.as_slice() {
+        ["addemoji", name, ..] => Some(LocalLink::EmojiSet(name.to_string())),
         ["c", id, post, ..] => Some(LocalLink::Channel {
             id: id.parse().ok()?,
             post: post.parse().ok(),
@@ -667,6 +677,9 @@ impl MainView {
             }
             Some(LocalLink::Channel { id, post }) => {
                 self.go_to_original(PeerKey::channel(id), post, window, cx);
+            }
+            Some(LocalLink::EmojiSet(name)) => {
+                self.open_emoji_set_box(tdr_data::emoji_sets::SetRef::ShortName(name));
             }
             None => {
                 let has_scheme = url.split_once(':').is_some_and(|(scheme, _)| {

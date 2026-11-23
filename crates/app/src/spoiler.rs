@@ -35,6 +35,13 @@ pub fn current_frame() -> usize {
     (EPOCH.elapsed().as_millis() / FRAME_MS) as usize % FRAMES
 }
 
+/// Particles are on screen: paint again at their next frame.
+pub fn schedule() {
+    let elapsed = EPOCH.elapsed().as_millis();
+    let next = FRAME_MS - elapsed % FRAME_MS;
+    crate::repaint::after_ms(next as u64);
+}
+
 /// `base::BufferedRandom` stand-in: any uniform generator gives the same look.
 struct Random(u64);
 
@@ -248,7 +255,7 @@ pub fn fill(
     frame: usize,
     window: &mut Window,
 ) {
-    if rect.size.width <= px(0.) || rect.size.height <= px(0.) {
+    if rect.size.width <= px(0.) || rect.size.height <= px(0.) || crate::profile::off("spoilers") {
         return;
     }
     let scale = window.scale_factor();

@@ -529,6 +529,31 @@ impl MainView {
                 text: crate::present::read_date(date, chrono::Local::now()).into(),
             });
         }
+        // `AddEmojiPacksAction`: the sets of the message's custom emoji.
+        let mut sets: Vec<(i64, i64)> = Vec::new();
+        for entity in &item.entities {
+            if let crate::rich_text::Kind::CustomEmoji(id) = entity.kind
+                && let Some(set) = crate::custom_emoji::info(id).and_then(|i| i.set)
+                && !sets.contains(&set)
+            {
+                sets.push(set);
+            }
+        }
+        if let Some(&(id, access_hash)) = sets.first() {
+            let text = if sets.len() == 1 {
+                match self.emoji_panel.set_title(id) {
+                    Some(title) => format!("This message contains emoji from {title} pack."),
+                    None => "This message contains emoji from 1 pack.".to_string(),
+                }
+            } else {
+                format!("This message contains emoji from {} packs.", sets.len())
+            };
+            e.push(Entry::WideSeparator);
+            e.push(Entry::Title {
+                text: text.into(),
+                action: MenuAction::OpenEmojiSet(id, access_hash),
+            });
+        }
         self.open_menu(e, at, MenuTag::Message);
     }
 
@@ -740,6 +765,9 @@ impl MainView {
             }
             MenuAction::OpenUrl(url) => cx.open_url(&url),
             MenuAction::EmojiRemoveRecent(emoji) => self.emoji_remove_recent(emoji),
+            MenuAction::OpenEmojiSet(id, access_hash) => {
+                self.open_emoji_set_box(tdr_data::emoji_sets::SetRef::Id(id, access_hash));
+            }
             MenuAction::EmojiResetRecent => {
                 self.layers
                     .show_layer(super::layers::LayerBox::ResetRecentEmoji);

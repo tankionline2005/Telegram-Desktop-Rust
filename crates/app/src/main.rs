@@ -23,6 +23,8 @@ mod one_line;
 mod placement;
 mod popup_menu;
 mod present;
+mod profile;
+mod repaint;
 mod rich_text;
 mod root;
 mod scale;
@@ -235,6 +237,7 @@ fn main() {
 
     Application::new().run(move |cx: &mut App| {
         tracing::info!(elapsed = ?STARTED.elapsed(), "ui: platform ready");
+        profile::init();
         cx.text_system()
             .add_fonts(vec![
                 Cow::Borrowed(

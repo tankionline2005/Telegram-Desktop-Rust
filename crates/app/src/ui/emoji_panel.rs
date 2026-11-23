@@ -296,6 +296,14 @@ impl EmojiPanel {
         self.sets = sets;
     }
 
+    /// A known set's title (the user's and the featured ones).
+    pub(super) fn set_title(&self, id: i64) -> Option<String> {
+        self.sets
+            .iter()
+            .find(|s| s.info.id == id)
+            .map(|s| s.info.title.clone())
+    }
+
     /// The set is among the user's.
     pub(super) fn has_installed(&self, id: i64) -> bool {
         self.sets.iter().any(|s| s.installed && s.info.id == id)
