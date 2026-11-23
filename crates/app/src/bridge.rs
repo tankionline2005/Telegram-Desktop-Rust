@@ -372,24 +372,31 @@ impl DialogItem {
     }
 }
 
-/// What `Ui::PeerBadge` draws after a name: the verified check, else the Premium
-/// star of a user without an emoji status (emoji statuses come with custom emoji).
+/// What `Ui::PeerBadge` draws after a name: the verified check, then the emoji
+/// status (a custom emoji), or the Premium star of a user without one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PeerBadge {
     #[default]
     None,
     Verified,
     Premium,
+    /// An emoji status, after the verified check when `verified`.
+    Status {
+        id: i64,
+        verified: bool,
+    },
 }
 
 impl PeerBadge {
     pub fn of(info: &describe::PeerInfo) -> Self {
-        if info.verified {
-            PeerBadge::Verified
-        } else if info.premium && !info.emoji_status {
-            PeerBadge::Premium
-        } else {
-            PeerBadge::None
+        match info.emoji_status {
+            Some(id) => PeerBadge::Status {
+                id,
+                verified: info.verified,
+            },
+            None if info.verified => PeerBadge::Verified,
+            None if info.premium => PeerBadge::Premium,
+            None => PeerBadge::None,
         }
     }
 }
@@ -3360,10 +3367,15 @@ pub fn start_demo(
                 photo: None,
                 kind: *kind,
                 is_saved: *name == "Saved Messages",
-                // The demo shows both badges.
+                // The demo shows every badge (an emoji status of a demo
+                // custom emoji).
                 badge: match *name {
                     "Telegram Tips" => PeerBadge::Verified,
                     "Alice Johnson" => PeerBadge::Premium,
+                    "Mom" => PeerBadge::Status {
+                        id: DEMO_CUSTOM_EMOJI[1].0,
+                        verified: false,
+                    },
                     _ => PeerBadge::None,
                 },
                 last: last.clone(),

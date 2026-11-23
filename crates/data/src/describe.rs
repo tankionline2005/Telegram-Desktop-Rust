@@ -555,8 +555,9 @@ pub struct PeerInfo {
     /// Small userpic: photo id and the DC that stores it.
     pub photo: Option<(i64, i32)>,
     pub verified: bool,
-    /// An emoji status is set (drawn instead of the Premium star).
-    pub emoji_status: bool,
+    /// The emoji status's custom emoji, while it lasts (drawn instead of the
+    /// Premium star).
+    pub emoji_status: Option<i64>,
     /// A group or channel we are not in (left, kicked, never joined): tdesktop
     /// keeps it out of the chat list (`amIn`).
     pub left: bool,
@@ -621,10 +622,7 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
                     _ => None,
                 },
                 verified: u.verified,
-                emoji_status: u
-                    .emoji_status
-                    .as_ref()
-                    .is_some_and(|s| !matches!(s, enums::EmojiStatus::Empty)),
+                emoji_status: u.emoji_status.as_ref().and_then(status_document),
                 premium: u.premium,
                 first_name: u.first_name.clone(),
                 contact: u.contact,
@@ -692,10 +690,7 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
                 members: c.participants_count,
                 photo: chat_photo(&c.photo),
                 verified: c.verified,
-                emoji_status: c
-                    .emoji_status
-                    .as_ref()
-                    .is_some_and(|s| !matches!(s, enums::EmojiStatus::Empty)),
+                emoji_status: c.emoji_status.as_ref().and_then(status_document),
                 ..Default::default()
             },
             // `chatForbidden`, `channelForbidden`: not ours any more.
@@ -821,6 +816,23 @@ pub fn login_code(text: &str, min_length: usize) -> Option<std::ops::Range<usize
         }
     }
     None
+}
+
+/// The custom emoji of an emoji status, unless it has expired
+/// (`emojiStatusUntil`; collectible gifts show their emoji too).
+pub fn status_document(status: &enums::EmojiStatus) -> Option<i64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    match status {
+        enums::EmojiStatus::EmojiStatus(s) => {
+            (s.until.is_none_or(|u| i64::from(u) > now)).then_some(s.document_id)
+        }
+        enums::EmojiStatus::Collectible(s) => {
+            (s.until.is_none_or(|u| i64::from(u) > now)).then_some(s.document_id)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

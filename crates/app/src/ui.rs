@@ -2781,6 +2781,41 @@ impl MainView {
                     window,
                 ))),
             crate::bridge::PeerBadge::Premium => div().child(icon(Icon::PremiumStar, bg, window)),
+            crate::bridge::PeerBadge::Status { id, verified } => {
+                // The status's custom emoji in the star's place; text colored
+                // ones take the star's color (`premiumFg`).
+                let side = crate::custom_emoji::size_normal();
+                let side_l = side as f32 / scale::get();
+                let line_h = f32::from(scale::font(FONT_SIZE).line_height());
+                let color: gpui::Hsla = c(bg).into();
+                let status = div()
+                    .w(gpui::px(side_l + lg(4.)))
+                    .h(gpui::px(line_h))
+                    .child(
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                let at = point(
+                                    bounds.origin.x + gpui::px(lg(2.)),
+                                    bounds.origin.y + gpui::px(((line_h - side_l) / 2.).floor()),
+                                );
+                                crate::custom_emoji::paint(id, at, side, color, window);
+                            },
+                        )
+                        .size_full(),
+                    );
+                let check = verified.then(|| {
+                    div()
+                        .relative()
+                        .child(icon(Icon::VerifiedStar, bg, window))
+                        .child(div().absolute().left_0().top_0().child(icon(
+                            Icon::VerifiedCheck,
+                            fg,
+                            window,
+                        )))
+                });
+                div().flex().children(check).child(status)
+            }
         };
         let name_w = text_width(window, name, FONT_SIZE, FontWeight::SEMIBOLD);
         div()
