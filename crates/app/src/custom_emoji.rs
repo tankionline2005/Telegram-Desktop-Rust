@@ -1,17 +1,25 @@
 //! Custom emoji in the UI (tdesktop's `Data::CustomEmojiManager` with
 //! `Ui::CustomEmoji::Instance`): asked for by id wherever they are painted, their
-//! documents and files come from the data thread (`Update::CustomEmoji`), they are
-//! decoded on worker threads (`.tgs` by `tdr-lottie`, `.webm` by `tdr-webm`, `.webp`
-//! by `image`) and rendered once per size into all their frames; painting shows the
-//! frame of the moment (all copies of one emoji play in step).
+//! documents and files come from the data thread (`Update::CustomEmoji`), and each
+//! (emoji, size) is one instance shared by every place that paints it, as there.
+//!
+//! Like tdesktop's `Renderer`, an instance shows its first frame as soon as it is
+//! rendered and plays from it at the animation's own rate (one frame per paint at
+//! most, `Cache::paintCurrentFrame`), while workers render ahead of the frame on
+//! screen (`kPreloadFrames`) until all frames (at most `kMaxFrames`) are kept.
+//! Differences that make it faster and lighter:
+//! - the workers serve the emoji painted last first (a stack, not a queue) and
+//!   skip the ones scrolled away, so the visible ones never wait behind them;
+//! - kept frames are compressed in memory (each frame XOR the previous one, zero
+//!   runs, decoded in microseconds; text colored emoji keep only alpha): about
+//!   2.5 times less than tdesktop's uncompressed frames (deflate gains little
+//!   more on these frames and unpacks several times slower), so scrolling back
+//!   shows them at once instead of rendering them again; only the frame on
+//!   screen is a GPU image.
 
-// The panel and the sets use the rest (next steps of this module).
-#![allow(dead_code)]
-
-use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::collections::HashMap;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use gpui::{Bounds, Corners, Pixels, Point, RenderImage, Window, point, px, size};
 use tdr_data::emoji_sets::{EmojiDocument, EmojiFormat};
@@ -25,283 +33,507 @@ pub struct Info {
     pub free: bool,
 }
 
-enum Source {
-    Lottie(tdr_lottie::Animation),
-    /// Straight RGBA frames and how long each is shown (ms).
-    Frames {
-        width: u32,
-        height: u32,
-        frames: Vec<(Vec<u8>, u32)>,
-    },
-}
-
-enum Entry {
+enum Doc {
     Requested,
-    Decoding,
-    Ready(Arc<Source>),
+    File {
+        format: EmojiFormat,
+        bytes: Arc<[u8]>,
+    },
     Failed,
 }
 
-/// One emoji's frames at one size and color, in memory (BGRA): only the frame on
-/// screen is a GPU image (`shown`), so an animation never fills the GPU atlas.
-struct Rendered {
-    frames: Vec<Vec<u8>>,
-    side: u32,
-    /// Frame end times (ms from the start), the last one is the loop length.
-    ends: Vec<u32>,
+/// `kMaxFrames`: longer animations are cut (and then loop).
+const MAX_FRAMES: usize = 180;
+/// `kPreloadFrames`, a bit more: frames rendered ahead of the one on screen.
+const PRELOAD_FRAMES: usize = 8;
+/// A frame is stored whole every this many frames (the rest as differences).
+const KEY_EVERY: usize = 8;
+/// Compressed frames kept for emoji off screen, in bytes.
+const BUDGET: usize = 48 << 20;
+/// Files kept in memory for emoji without frames (they come back from the
+/// file cache when painted again).
+const FILES_BUDGET: usize = 8 << 20;
+/// Workers stop rendering an emoji that was not painted for this long.
+const IDLE: Duration = Duration::from_millis(400);
+/// GPU images of emoji not painted for this long are dropped.
+const SHOWN_KEEP: Duration = Duration::from_secs(2);
+
+/// What a worker renders from (parsed once per instance, dropped when done).
+enum Source {
+    Lottie(tdr_lottie::Animation),
 }
 
-/// The frame on screen of one emoji at one size and color.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Job {
+    Idle,
+    Queued,
+    Running,
+}
+
+/// One emoji at one size (`Ui::CustomEmoji::Instance`).
+struct Instance {
+    /// Frames packed one after another (`pack`), `offsets[k]..offsets[k + 1]`.
+    data: Vec<u8>,
+    offsets: Vec<usize>,
+    durations: Vec<u16>,
+    finished: bool,
+    /// Text colored emoji keep only alpha (1 byte a pixel), others BGRA.
+    alpha_only: bool,
+    side: u32,
+    /// The frame on screen and when it was shown.
+    frame: usize,
+    shown_at: Option<Instant>,
+    /// The paint counter of the last advance (once per window paint).
+    advanced: u64,
+    painted: Instant,
+    job: Job,
+    source: Option<Arc<Source>>,
+    /// The last unpacked frame (the next one is a difference to it).
+    unpacked: Option<(usize, Vec<u8>)>,
+}
+
+impl Instance {
+    fn new(side: u32) -> Self {
+        Self {
+            data: Vec::new(),
+            offsets: vec![0],
+            durations: Vec::new(),
+            finished: false,
+            alpha_only: false,
+            side,
+            frame: 0,
+            shown_at: None,
+            advanced: 0,
+            painted: Instant::now(),
+            job: Job::Idle,
+            source: None,
+            unpacked: None,
+        }
+    }
+
+    fn frames(&self) -> usize {
+        self.durations.len()
+    }
+
+    fn bytes(&self) -> usize {
+        self.data.capacity() + self.offsets.capacity() * 8 + self.durations.capacity() * 2
+    }
+
+    fn push(&mut self, raw: &[u8], duration: u32) {
+        let k = self.frames();
+        let prev = if k.is_multiple_of(KEY_EVERY) {
+            None
+        } else {
+            self.unpack(k - 1).map(|p| p.to_vec())
+        };
+        pack(raw, prev.as_deref(), &mut self.data);
+        self.offsets.push(self.data.len());
+        self.durations
+            .push(duration.clamp(1, u16::MAX as u32) as u16);
+        self.unpacked = Some((k, raw.to_vec()));
+    }
+
+    /// The pixels of frame `k` (alpha or BGRA).
+    fn unpack(&mut self, k: usize) -> Option<&[u8]> {
+        if k >= self.frames() {
+            return None;
+        }
+        let len = (self.side * self.side) as usize * if self.alpha_only { 1 } else { 4 };
+        let mut from = match &self.unpacked {
+            Some((at, _)) if *at == k => return self.unpacked.as_ref().map(|u| &u.1[..]),
+            Some((at, _)) if *at < k && k - at < KEY_EVERY && k / KEY_EVERY == at / KEY_EVERY => {
+                at + 1
+            }
+            _ => k - k % KEY_EVERY,
+        };
+        let mut buf = match self.unpacked.take() {
+            Some((_, b)) if b.len() == len => b,
+            _ => vec![0; len],
+        };
+        if from.is_multiple_of(KEY_EVERY) {
+            buf.fill(0);
+        }
+        while from <= k {
+            let packed = &self.data[self.offsets[from]..self.offsets[from + 1]];
+            unpack_into(packed, &mut buf);
+            from += 1;
+        }
+        self.unpacked = Some((k, buf));
+        self.unpacked.as_ref().map(|u| &u.1[..])
+    }
+
+    /// `Cache::paintCurrentFrame`: the next frame once the current one has been
+    /// shown for its duration (one step a paint), back to the first after the last.
+    fn advance(&mut self, now: Instant, counter: u64) {
+        if self.advanced == counter || self.frames() == 0 {
+            return;
+        }
+        self.advanced = counter;
+        let Some(shown) = self.shown_at else {
+            self.shown_at = Some(now);
+            return;
+        };
+        let ends = shown + Duration::from_millis(u64::from(self.durations[self.frame]));
+        if now < ends {
+            return;
+        }
+        if self.frame + 1 < self.frames() {
+            self.frame += 1;
+            self.shown_at = Some(now);
+        } else if self.finished {
+            if self.frames() > 1 {
+                self.frame = 0;
+            }
+            self.shown_at = Some(now);
+        }
+    }
+
+    fn next_due(&self) -> Option<Instant> {
+        if self.frames() <= 1 && self.finished {
+            return None;
+        }
+        let shown = self.shown_at?;
+        Some(shown + Duration::from_millis(u64::from(self.durations[self.frame])))
+    }
+}
+
+/// The frame on screen of one emoji at one size and color, as a GPU image.
 struct Shown {
     frame: usize,
     image: Arc<RenderImage>,
-    /// The paint counter when it was last painted (unused ones are dropped).
-    painted: u64,
+    painted: Instant,
 }
 
-/// Animations play at most this often (a frame of the whole window each time).
-const FRAME_MS: u32 = 33;
-/// Frames kept for emoji not painted for this long are dropped.
-const KEEP_UNUSED: u64 = 150;
-
-type RenderKey = (i64, u32, u32);
+type Key = (i64, u32);
 
 #[derive(Default)]
 struct State {
-    entries: HashMap<i64, Entry>,
+    docs: HashMap<i64, Doc>,
     info: HashMap<i64, Info>,
     wanted: Vec<i64>,
-    rendered: HashMap<RenderKey, Arc<Rendered>>,
-    rendering: HashSet<RenderKey>,
-    shown: HashMap<RenderKey, Shown>,
+    instances: HashMap<Key, Instance>,
+    shown: HashMap<(i64, u32, u32), Shown>,
     /// Images replaced or dropped, removed from the atlas at the next frame.
     retired: Vec<Arc<RenderImage>>,
-    /// Paints so far (`begin_frame`).
+    /// Window paints so far (`begin_frame`).
     counter: u64,
-    /// The paint counter when each emoji was last painted.
-    touched: HashMap<i64, u64>,
+    /// New instances (served last in, first out) and ones that need more frames.
+    fresh: Vec<Key>,
+    more: std::collections::VecDeque<Key>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+static WAKE: Condvar = Condvar::new();
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let mut guard = STATE.lock().unwrap();
     f(guard.get_or_insert_with(State::default))
 }
 
-fn clock() -> u32 {
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_millis() as u32
-}
-
-/// The animations' clock: it stands still while they are paused.
-fn paused_clock() -> u32 {
-    static FROZEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if crate::repaint::paused() {
-        FROZEN.load(std::sync::atomic::Ordering::Relaxed)
-    } else {
-        let now = clock();
-        FROZEN.store(now, std::sync::atomic::Ordering::Relaxed);
-        now
+fn queue(s: &mut State, key: Key, fresh: bool) {
+    let Some(i) = s.instances.get_mut(&key) else {
+        return;
+    };
+    if i.job != Job::Idle {
+        return;
     }
+    i.job = Job::Queued;
+    if fresh {
+        s.fresh.push(key);
+    } else {
+        s.more.push_back(key);
+    }
+    start_workers();
+    WAKE.notify_one();
 }
 
-enum Job {
-    Decode {
-        id: i64,
-        format: EmojiFormat,
-        bytes: Vec<u8>,
-    },
-    Render {
-        key: RenderKey,
-        source: Arc<Source>,
-    },
-}
-
-/// Decoding and rendering threads (`kWorkersCount` in spirit).
-fn jobs() -> &'static Mutex<Sender<Job>> {
-    static JOBS: OnceLock<Mutex<Sender<Job>>> = OnceLock::new();
-    JOBS.get_or_init(|| {
-        let (tx, rx) = channel::<Job>();
-        let rx = Arc::new(Mutex::new(rx));
-        for k in 0..4 {
-            let rx = rx.clone();
+fn start_workers() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let n = std::thread::available_parallelism().map_or(2, |n| n.get());
+        for k in 0..(n.saturating_sub(1)).clamp(1, 4) {
             std::thread::Builder::new()
                 .name(format!("custom-emoji-{k}"))
-                .spawn(move || worker(&rx))
+                .spawn(worker)
                 .expect("spawn custom emoji worker");
         }
-        Mutex::new(tx)
-    })
+    });
 }
 
-fn worker(rx: &Mutex<Receiver<Job>>) {
+/// What a worker took: the instance, its file and source, where to go on.
+struct Task {
+    key: Key,
+    file: Option<(EmojiFormat, Arc<[u8]>)>,
+    source: Option<Arc<Source>>,
+    from: usize,
+    alpha_only: bool,
+}
+
+fn take_task(s: &mut State) -> Option<Task> {
+    let now = Instant::now();
     loop {
-        let job = {
-            let guard = rx.lock().unwrap();
-            match guard.recv() {
-                Ok(job) => job,
-                Err(_) => return,
-            }
+        let key = s.fresh.pop().or_else(|| s.more.pop_front())?;
+        let Some(i) = s.instances.get_mut(&key) else {
+            continue;
         };
-        match job {
-            Job::Decode { id, format, bytes } => {
-                let source = decode(format, &bytes);
-                with(|s| {
-                    s.entries.insert(
-                        id,
-                        match source {
-                            Some(source) => Entry::Ready(Arc::new(source)),
-                            None => Entry::Failed,
-                        },
-                    );
-                });
-            }
-            Job::Render { key, source } => {
-                let rendered = render(&source, key.1, key.2);
-                with(|s| {
-                    s.rendering.remove(&key);
-                    if let Some(r) = rendered {
-                        s.rendered.insert(key, Arc::new(r));
-                    }
-                });
-            }
+        if i.job != Job::Queued {
+            continue;
         }
+        // Scrolled away: left for when it is painted again.
+        if now.duration_since(i.painted) > IDLE {
+            i.job = Job::Idle;
+            continue;
+        }
+        i.job = Job::Running;
+        let task = Task {
+            key,
+            file: None,
+            source: i.source.clone(),
+            from: i.frames(),
+            alpha_only: s.info.get(&key.0).is_some_and(|f| f.text_color),
+        };
+        let file = match s.docs.get(&key.0) {
+            Some(Doc::File { format, bytes }) => Some((*format, bytes.clone())),
+            _ => None,
+        };
+        return Some(Task { file, ..task });
     }
 }
 
-/// At most 3 seconds of video (Telegram's limit for emoji and stickers).
-const MAX_FRAMES: usize = 200;
+fn worker() {
+    loop {
+        let task = {
+            let mut guard = STATE.lock().unwrap();
+            loop {
+                if let Some(task) = take_task(guard.get_or_insert_with(State::default)) {
+                    break task;
+                }
+                guard = WAKE.wait(guard).unwrap();
+            }
+        };
+        run(task);
+        crate::repaint::after_ms(0);
+    }
+}
 
-fn decode(format: EmojiFormat, bytes: &[u8]) -> Option<Source> {
+fn finish_job(key: Key, f: impl FnOnce(&mut Instance)) {
+    with(|s| {
+        if let Some(i) = s.instances.get_mut(&key) {
+            f(i);
+            i.job = Job::Idle;
+        }
+    });
+}
+
+fn run(task: Task) {
+    let key = task.key;
+    let side = key.1.max(1);
+    let source = match (task.source, &task.file) {
+        (Some(source), _) => source,
+        (None, Some((EmojiFormat::Tgs, bytes))) => match tdr_lottie::Animation::from_tgs(bytes) {
+            Ok(anim) => Arc::new(Source::Lottie(anim)),
+            Err(_) => return fail(key),
+        },
+        (None, Some((format, bytes))) => {
+            // Videos and images: all frames at once (decoding is the cost).
+            let frames = match decode_frames(*format, bytes, side, task.alpha_only) {
+                Some(f) if !f.is_empty() => f,
+                _ => return fail(key),
+            };
+            return finish_job(key, |i| {
+                if i.frames() == 0 {
+                    i.alpha_only = task.alpha_only;
+                    for (raw, duration) in &frames {
+                        i.push(raw, *duration);
+                    }
+                    i.finished = true;
+                    i.unpacked = None;
+                }
+            });
+        }
+        (None, None) => return finish_job(key, |_| {}),
+    };
+    let Source::Lottie(anim) = &*source;
+    let count = anim.frame_count().min(MAX_FRAMES);
+    let step = (1000. / anim.frame_rate.max(1.)).round().max(1.) as u32;
+    let Some(mut pixmap) = tdr_lottie::tiny_skia::Pixmap::new(side, side) else {
+        return fail(key);
+    };
+    let mut k = task.from;
+    let mut raw = Vec::with_capacity((side * side * 4) as usize);
+    while k < count {
+        pixmap.fill(tdr_lottie::tiny_skia::Color::TRANSPARENT);
+        anim.render_into(k, &mut pixmap);
+        raw.clear();
+        for p in pixmap.pixels() {
+            let c = p.demultiply();
+            if task.alpha_only {
+                raw.push(c.alpha());
+            } else {
+                raw.extend_from_slice(&[c.blue(), c.green(), c.red(), c.alpha()]);
+            }
+        }
+        k += 1;
+        // Stored at once (the first frame shows as soon as it is ready); goes on
+        // while the emoji is on screen and not far enough ahead.
+        let go_on = with(|s| {
+            let Some(i) = s.instances.get_mut(&key) else {
+                return false;
+            };
+            if i.frames() + 1 != k {
+                return false;
+            }
+            i.alpha_only = task.alpha_only;
+            i.push(&raw, step);
+            if k == count {
+                i.finished = true;
+                i.source = None;
+                return false;
+            }
+            let ahead = i.frames() > i.frame + PRELOAD_FRAMES;
+            let first = i.frames() == 1;
+            !first && !ahead && i.painted.elapsed() <= IDLE
+        });
+        if !go_on {
+            break;
+        }
+    }
+    let keep = source.clone();
+    finish_job(key, move |i| {
+        if !i.finished {
+            i.source = Some(keep);
+        }
+    });
+}
+
+fn fail(key: Key) {
+    with(|s| {
+        s.docs.insert(key.0, Doc::Failed);
+        s.instances.remove(&key);
+    });
+}
+
+/// All frames of a video or image at `side` (BGRA or alpha) with their durations.
+fn decode_frames(
+    format: EmojiFormat,
+    bytes: &[u8],
+    side: u32,
+    alpha_only: bool,
+) -> Option<Vec<(Vec<u8>, u32)>> {
+    let convert = |img: image::RgbaImage| -> Vec<u8> {
+        let img = if img.width() == side && img.height() == side {
+            img
+        } else {
+            image::imageops::resize(&img, side, side, image::imageops::FilterType::Triangle)
+        };
+        if alpha_only {
+            img.pixels().map(|p| p.0[3]).collect()
+        } else {
+            let mut raw = img.into_raw();
+            for p in raw.as_chunks_mut::<4>().0 {
+                p.swap(0, 2);
+            }
+            raw
+        }
+    };
     match format {
-        EmojiFormat::Tgs => tdr_lottie::Animation::from_tgs(bytes)
-            .ok()
-            .map(Source::Lottie),
         EmojiFormat::Webm => {
             let d = tdr_webm::decode(bytes, MAX_FRAMES)
                 .map_err(|e| tracing::debug!("custom emoji video: {e}"))
                 .ok()?;
-            // Kept small: an emoji is shown at about 27 px (up to 54 on 200 %).
-            const KEEP: u32 = 64;
-            let (w, h) = if d.width > KEEP || d.height > KEEP {
-                (KEEP, KEEP)
-            } else {
-                (d.width, d.height)
-            };
-            (!d.frames.is_empty()).then(|| Source::Frames {
-                width: w,
-                height: h,
-                frames: d
-                    .frames
+            Some(
+                d.frames
                     .into_iter()
                     .filter_map(|f| {
                         let img = image::RgbaImage::from_raw(d.width, d.height, f.rgba)?;
-                        let img = if (w, h) == (d.width, d.height) {
-                            img
-                        } else {
-                            image::imageops::resize(
-                                &img,
-                                w,
-                                h,
-                                image::imageops::FilterType::Triangle,
-                            )
-                        };
-                        Some((img.into_raw(), f.duration_ms))
+                        Some((convert(img), f.duration_ms))
                     })
                     .collect(),
-            })
+            )
         }
         EmojiFormat::Webp => {
-            let image = image::load_from_memory_with_format(bytes, image::ImageFormat::WebP)
+            let img = image::load_from_memory_with_format(bytes, image::ImageFormat::WebP)
                 .ok()?
                 .to_rgba8();
-            Some(Source::Frames {
-                width: image.width(),
-                height: image.height(),
-                frames: vec![(image.into_raw(), 1000)],
-            })
+            Some(vec![(convert(img), 1000)])
         }
+        EmojiFormat::Tgs => None,
     }
 }
 
-/// All frames at `side` device pixels, in BGRA for GPUI; `color` (0xRRGGBBAA, 0:
-/// keep) recolors the emoji that follow the text color.
-fn render(source: &Source, side: u32, color: u32) -> Option<Rendered> {
-    let side = side.max(1);
-    let mut frames = Vec::new();
-    let mut ends = Vec::new();
-    let mut at = 0u32;
-    let mut push = |mut rgba: Vec<u8>, duration: u32, frames: &mut Vec<Vec<u8>>| {
-        if rgba.len() != (side * side * 4) as usize {
-            return None;
-        }
-        for p in rgba.as_chunks_mut::<4>().0 {
-            let [r, g, b, a] = *p;
-            *p = if color != 0 {
-                [
-                    (color >> 8) as u8,
-                    (color >> 16) as u8,
-                    (color >> 24) as u8,
-                    a,
-                ]
-            } else {
-                [b, g, r, a]
-            };
-        }
-        frames.push(rgba);
-        at += duration.max(1);
-        ends.push(at);
-        Some(())
-    };
-    match source {
-        Source::Lottie(anim) => {
-            let count = anim.frame_count().min(600);
-            let step = (1000. / anim.frame_rate).round().max(1.) as u32;
-            let mut pixmap = tdr_lottie::tiny_skia::Pixmap::new(side, side)?;
-            for k in 0..count {
-                pixmap.fill(tdr_lottie::tiny_skia::Color::TRANSPARENT);
-                anim.render_into(k, &mut pixmap);
-                let mut rgba = Vec::with_capacity((side * side * 4) as usize);
-                for p in pixmap.pixels() {
-                    let c = p.demultiply();
-                    rgba.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
-                }
-                push(rgba, step, &mut frames)?;
-            }
-        }
-        Source::Frames {
-            width,
-            height,
-            frames: list,
-        } => {
-            for (rgba, duration) in list {
-                let img = image::RgbaImage::from_raw(*width, *height, rgba.clone())?;
-                let scaled = if *width == side && *height == side {
-                    img
-                } else {
-                    image::imageops::resize(&img, side, side, image::imageops::FilterType::Triangle)
-                };
-                push(scaled.into_raw(), *duration, &mut frames)?;
-            }
-        }
+fn varint(mut v: usize, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
     }
-    if frames.is_empty() {
-        return None;
+    out.push(v as u8);
+}
+
+fn read_varint(data: &[u8], at: &mut usize) -> usize {
+    let mut v = 0usize;
+    let mut shift = 0;
+    while let Some(&b) = data.get(*at) {
+        *at += 1;
+        v |= usize::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
     }
-    Some(Rendered { frames, side, ends })
+    v
+}
+
+/// Packs `cur` (XOR `prev`, if any) as runs: zeros count, literals count, literals.
+fn pack(cur: &[u8], prev: Option<&[u8]>, out: &mut Vec<u8>) {
+    let byte = |i: usize| cur[i] ^ prev.map_or(0, |p| p[i]);
+    let n = cur.len();
+    let mut i = 0;
+    while i < n {
+        let start = i;
+        while i < n && byte(i) == 0 {
+            i += 1;
+        }
+        let zeros = i - start;
+        let lit = i;
+        // Literals until a run of at least 3 zeros (or the end).
+        while i < n {
+            if byte(i) == 0 && i + 2 < n && byte(i + 1) == 0 && byte(i + 2) == 0 {
+                break;
+            }
+            i += 1;
+        }
+        varint(zeros, out);
+        varint(i - lit, out);
+        out.extend((lit..i).map(byte));
+    }
+}
+
+/// Applies a packed frame to `buf` (the previous frame, or zeros for a whole one).
+fn unpack_into(packed: &[u8], buf: &mut [u8]) {
+    let mut at = 0;
+    let mut i = 0;
+    while at < packed.len() && i < buf.len() {
+        i += read_varint(packed, &mut at);
+        let lits = read_varint(packed, &mut at);
+        let end = (i + lits).min(buf.len());
+        for (b, x) in buf[i..end].iter_mut().zip(&packed[at..]) {
+            *b ^= x;
+        }
+        at += lits;
+        i = end;
+    }
 }
 
 /// Called once per frame of the window, before painting: drops from the GPU
-/// atlas the frames replaced since, and the emoji not painted for a while.
+/// atlas the images replaced since, and the emoji not painted for a while.
 pub fn begin_frame(window: &mut Window) {
     let retired = with(|s| {
         s.counter += 1;
-        let counter = s.counter;
-        let stale: Vec<RenderKey> = s
+        let now = Instant::now();
+        let stale: Vec<_> = s
             .shown
             .iter()
-            .filter(|(_, v)| counter - v.painted > KEEP_UNUSED)
+            .filter(|(_, v)| now.duration_since(v.painted) > SHOWN_KEEP)
             .map(|(k, _)| *k)
             .collect();
         for key in stale {
@@ -309,20 +541,8 @@ pub fn begin_frame(window: &mut Window) {
                 s.retired.push(v.image);
             }
         }
-        // Emoji not painted for a while: their frames and decoded data go (they
-        // come back from the file cache when painted again).
-        let old: Vec<i64> = s
-            .touched
-            .iter()
-            .filter(|(_, at)| counter - **at > KEEP_UNUSED)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in old {
-            s.touched.remove(&id);
-            s.rendered.retain(|k, _| k.0 != id);
-            if matches!(s.entries.get(&id), Some(Entry::Ready(_))) {
-                s.entries.remove(&id);
-            }
+        if s.counter.is_multiple_of(60) {
+            trim(s, now);
         }
         std::mem::take(&mut s.retired)
     });
@@ -331,8 +551,46 @@ pub fn begin_frame(window: &mut Window) {
     }
 }
 
-fn due_in(_: &mut State, ms: u32) {
-    crate::repaint::after_ms(u64::from(ms));
+/// Keeps the frames of emoji off screen within `BUDGET`, the least recently
+/// painted go first; sources of unfinished ones off screen are dropped.
+fn trim(s: &mut State, now: Instant) {
+    let mut total = 0;
+    let mut off: Vec<(Instant, Key, usize)> = Vec::new();
+    for (key, i) in s.instances.iter_mut() {
+        let bytes = i.bytes();
+        total += bytes;
+        if now.duration_since(i.painted) > SHOWN_KEEP && i.job == Job::Idle {
+            i.source = None;
+            i.unpacked = None;
+            off.push((i.painted, *key, bytes));
+        }
+    }
+    off.sort_by_key(|o| o.0);
+    for (_, key, bytes) in off {
+        if total <= BUDGET {
+            break;
+        }
+        s.instances.remove(&key);
+        total -= bytes;
+    }
+    let with_frames: std::collections::HashSet<i64> = s.instances.keys().map(|k| k.0).collect();
+    let mut files = 0;
+    let mut spare = Vec::new();
+    for (id, doc) in &s.docs {
+        if let Doc::File { bytes, .. } = doc {
+            files += bytes.len();
+            if !with_frames.contains(id) {
+                spare.push((*id, bytes.len()));
+            }
+        }
+    }
+    for (id, len) in spare {
+        if files <= FILES_BUDGET {
+            break;
+        }
+        s.docs.remove(&id);
+        files -= len;
+    }
 }
 
 /// The ids to ask the data thread for (since the last call).
@@ -341,18 +599,16 @@ pub fn take_wanted() -> Vec<i64> {
 }
 
 /// Asks for an emoji's document and file (once).
-pub fn want(id: i64) {
-    with(|s| {
-        if let std::collections::hash_map::Entry::Vacant(e) = s.entries.entry(id) {
-            e.insert(Entry::Requested);
-            s.wanted.push(id);
-        }
-    });
+fn want_in(s: &mut State, id: i64) {
+    if let std::collections::hash_map::Entry::Vacant(e) = s.docs.entry(id) {
+        e.insert(Doc::Requested);
+        s.wanted.push(id);
+    }
 }
 
-/// The document and file came: decode it.
+/// The document and file came.
 pub fn loaded(doc: &EmojiDocument, bytes: Vec<u8>) {
-    let start = with(|s| {
+    with(|s| {
         s.info.insert(
             doc.id,
             Info {
@@ -362,27 +618,21 @@ pub fn loaded(doc: &EmojiDocument, bytes: Vec<u8>) {
                 free: doc.free,
             },
         );
-        match s.entries.get(&doc.id) {
-            Some(Entry::Ready(_)) | Some(Entry::Decoding) => false,
-            _ => {
-                s.entries.insert(doc.id, Entry::Decoding);
-                true
-            }
-        }
+        s.docs.insert(
+            doc.id,
+            Doc::File {
+                format: doc.format,
+                bytes: bytes.into(),
+            },
+        );
     });
-    if start {
-        let _ = jobs().lock().unwrap().send(Job::Decode {
-            id: doc.id,
-            format: doc.format,
-            bytes,
-        });
-    }
+    crate::repaint::after_ms(0);
 }
 
 /// The document could not be loaded.
 pub fn failed(id: i64) {
     with(|s| {
-        s.entries.insert(id, Entry::Failed);
+        s.docs.insert(id, Doc::Failed);
     });
 }
 
@@ -404,8 +654,7 @@ pub fn remember(doc: &EmojiDocument) {
 }
 
 /// Paints emoji `id` as a `side` device pixels square at `origin` (logical); text
-/// colored emoji take `color`. False while it is not ready (it is asked for, and
-/// another frame is requested).
+/// colored emoji take `color`. False while it is not ready (it is asked for).
 pub fn paint(
     id: i64,
     origin: Point<Pixels>,
@@ -414,90 +663,87 @@ pub fn paint(
     window: &mut Window,
 ) -> bool {
     let _timer = crate::profile::Timer::new("custom_emoji::paint");
-    want(id);
-    let text_color = with(|s| {
-        let counter = s.counter;
-        s.touched.insert(id, counter);
-        s.info.get(&id).is_some_and(|i| i.text_color)
-    });
-    let color_key = if text_color {
-        let c = gpui::Rgba::from(color);
-        let to = |v: f32| (v.clamp(0., 1.) * 255.).round() as u32;
-        (to(c.r) << 24) | (to(c.g) << 16) | (to(c.b) << 8) | 0xff
-    } else {
-        0
-    };
-    let key = (id, side, color_key);
-    let found = with(|s| {
-        if let Some(r) = s.rendered.get(&key) {
-            return Ok(Some(r.clone()));
-        }
-        match s.entries.get(&id) {
-            Some(Entry::Ready(source)) => {
-                if s.rendering.insert(key) {
-                    Err(Some(source.clone()))
-                } else {
-                    Ok(None)
-                }
-            }
-            Some(Entry::Failed) => Err(None),
-            _ => Ok(None),
-        }
-    });
-    let rendered = match found {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            with(|s| due_in(s, 50));
-            return false;
-        }
-        Err(Some(source)) => {
-            let _ = jobs().lock().unwrap().send(Job::Render { key, source });
-            with(|s| due_in(s, 50));
-            return false;
-        }
-        Err(None) => return false,
-    };
-    let total = *rendered.ends.last().unwrap_or(&1);
-    // The frame of this moment, at most `FRAME_MS` apart.
-    let t = if rendered.ends.len() > 1 {
-        (paused_clock() / FRAME_MS * FRAME_MS) % total.max(1)
-    } else {
-        0
-    };
-    let frame = rendered
-        .ends
-        .partition_point(|end| *end <= t)
-        .min(rendered.ends.len() - 1);
+    let paused = crate::repaint::paused();
     let image = with(|s| {
+        want_in(s, id);
+        let has_file = matches!(s.docs.get(&id), Some(Doc::File { .. }));
+        let text_color = s.info.get(&id).is_some_and(|i| i.text_color);
         let counter = s.counter;
-        if rendered.ends.len() > 1 {
-            let next = rendered.ends[frame].saturating_sub(t).max(FRAME_MS);
-            due_in(s, next);
-        }
-        if let Some(v) = s.shown.get_mut(&key) {
-            v.painted = counter;
-            if v.frame == frame {
-                return v.image.clone();
+        let now = Instant::now();
+        let key = (id, side);
+        let i = s
+            .instances
+            .entry(key)
+            .or_insert_with(|| Instance::new(side));
+        i.painted = now;
+        let (frames, job, finished) = (i.frames(), i.job, i.finished);
+        if frames == 0 {
+            if has_file && job == Job::Idle {
+                queue(s, key, true);
             }
+            return None;
         }
-        let side = rendered.side;
-        let img = image::RgbaImage::from_raw(side, side, rendered.frames[frame].clone())
-            .unwrap_or_else(|| image::RgbaImage::new(side, side));
-        let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
-            img
-        )]));
-        if let Some(old) = s.shown.insert(
-            key,
-            Shown {
-                frame,
-                image: image.clone(),
-                painted: counter,
-            },
-        ) {
-            s.retired.push(old.image);
+        if !paused {
+            i.advance(now, counter);
         }
-        image
+        if let Some(due) = i.next_due() {
+            crate::repaint::at(due.max(now + Duration::from_millis(8)));
+        }
+        let frame = i.frame;
+        let more = !finished && i.frames() < frame + PRELOAD_FRAMES && job == Job::Idle;
+        let color_key = if text_color && i.alpha_only {
+            let c = gpui::Rgba::from(color);
+            let to = |v: f32| (v.clamp(0., 1.) * 255.).round() as u32;
+            (to(c.r) << 24) | (to(c.g) << 16) | (to(c.b) << 8) | 0xff
+        } else {
+            0
+        };
+        let shown_key = (id, side, color_key);
+        let image = match s.shown.get_mut(&shown_key) {
+            Some(v) if v.frame == frame => {
+                v.painted = now;
+                v.image.clone()
+            }
+            _ => {
+                let i = s.instances.get_mut(&key)?;
+                let alpha_only = i.alpha_only;
+                let pixels = i.unpack(frame)?;
+                let bgra: Vec<u8> = if alpha_only {
+                    let (r, g, b) = (
+                        (color_key >> 24) as u8,
+                        (color_key >> 16) as u8,
+                        (color_key >> 8) as u8,
+                    );
+                    pixels.iter().flat_map(|&a| [b, g, r, a]).collect()
+                } else {
+                    pixels.to_vec()
+                };
+                let img = image::RgbaImage::from_raw(side, side, bgra)
+                    .unwrap_or_else(|| image::RgbaImage::new(side, side));
+                let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+                    img
+                )]));
+                if let Some(old) = s.shown.insert(
+                    shown_key,
+                    Shown {
+                        frame,
+                        image: image.clone(),
+                        painted: now,
+                    },
+                ) {
+                    s.retired.push(old.image);
+                }
+                image
+            }
+        };
+        if more {
+            queue(s, key, false);
+        }
+        Some(image)
     });
+    let Some(image) = image else {
+        return false;
+    };
     let scale = window.scale_factor();
     let x = (f32::from(origin.x) * scale).round() / scale;
     let y = (f32::from(origin.y) * scale).round() / scale;
@@ -517,4 +763,56 @@ pub fn size_normal() -> u32 {
 pub fn size_large() -> u32 {
     let esize = (crate::emoji::size_large() as f32 / crate::scale::get()).floor();
     ((esize * 1.12).round() * crate::scale::get()).round() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frames_pack_and_unpack() {
+        let side = 5u32;
+        let mut i = Instance::new(side);
+        let frames: Vec<Vec<u8>> = (0..20u8)
+            .map(|k| {
+                (0..side * side * 4)
+                    .map(|p| {
+                        if p % 7 == 0 {
+                            k.wrapping_mul(p as u8)
+                        } else {
+                            0
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        for f in &frames {
+            i.push(f, 16);
+        }
+        i.unpacked = None;
+        for k in [0usize, 1, 2, 9, 3, 19, 18, 8, 7] {
+            assert_eq!(i.unpack(k).unwrap(), &frames[k][..], "frame {k}");
+        }
+    }
+
+    #[test]
+    fn plays_from_the_first_frame_one_step_a_paint() {
+        let mut i = Instance::new(1);
+        for _ in 0..3 {
+            i.push(&[0, 0, 0, 0], 10);
+        }
+        let t = Instant::now();
+        i.advance(t, 1);
+        assert_eq!(i.frame, 0);
+        i.advance(t + Duration::from_millis(50), 2);
+        assert_eq!(i.frame, 1);
+        i.advance(t + Duration::from_millis(100), 3);
+        assert_eq!(i.frame, 2);
+        // Not finished: waits for the next frame.
+        i.advance(t + Duration::from_millis(150), 4);
+        assert_eq!(i.frame, 2);
+        i.finished = true;
+        i.advance(t + Duration::from_millis(200), 5);
+        assert_eq!(i.frame, 0);
+    }
 }

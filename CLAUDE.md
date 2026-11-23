@@ -181,8 +181,10 @@
   call `request_animation_frame` every vsync. Spoilers and custom emoji ask
   `repaint::at` for their next frame (a ticker in `MainView::new` notifies then),
   animations pause while the window is inactive, and custom emoji keep only the frame
-  on screen as a GPU image (`custom_emoji`: frames in memory, old images dropped from
-  the atlas each frame). Performance switches: `TDR_PROFILE=1` prints timings to stderr,
+  on screen as a GPU image (`custom_emoji`: an instance per emoji and size, frames
+  packed in memory, rendered ahead by workers that serve the last painted first,
+  old images dropped from the atlas each frame). `tdr probe emoji-speed` times
+  downloads, decoding and rendering on real sets (counts and timings only). Performance switches: `TDR_PROFILE=1` prints timings to stderr,
   `TDR_OFF=tails,spoilers,emoji,shadows,text,view` turns parts off (`profile.rs`).
 - Never call `window.paint_path`: GPUI 0.2.2 draws every batch of paths through a
   window-sized 4x MSAA texture (cleared and resolved per batch), and paths between

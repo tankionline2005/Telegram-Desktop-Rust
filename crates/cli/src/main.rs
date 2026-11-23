@@ -121,6 +121,7 @@ async fn main() -> Result<()> {
         ["probe", "bank-card", number] => probe_bank_card(number).await,
         ["probe", "folders"] => probe_folders().await,
         ["probe", "emoji"] => probe_emoji().await,
+        ["probe", "emoji-speed"] => probe_emoji_speed().await,
         ["probe", "login"] => probe_login().await,
         ["logout"] => logout().await,
         ["selftest", "reconnect"] => selftest_reconnect().await,
@@ -807,6 +808,174 @@ async fn probe_emoji() -> Result<()> {
     let again = emoji_sets::custom_emoji_documents(&client, &ids).await?;
     println!("documents by id: {} of {}", again.len(), ids.len());
     Ok(())
+}
+
+/// Times the stages of custom emoji loading on the first installed sets (counts
+/// and timings only): documents, downloads at a few concurrencies, decoding and
+/// rendering every frame at the panel's size, and whether the frames cover the
+/// animation's whole length.
+async fn probe_emoji_speed() -> Result<()> {
+    use std::time::{Duration, Instant};
+    use tdr_data::emoji_sets::{self, EmojiFormat, SetRef};
+    let client = logged_in()?;
+    let sets = emoji_sets::installed_emoji_sets(&client).await?;
+    let mut docs = Vec::new();
+    let webm_only = std::env::var("PROBE_WEBM").is_ok();
+    let featured = emoji_sets::featured_emoji_sets(&client).await?;
+    let all_sets: Vec<_> = sets
+        .iter()
+        .cloned()
+        .chain(featured.iter().map(|f| f.info.clone()))
+        .collect();
+    for set in all_sets.iter().take(if webm_only { 40 } else { 3 }) {
+        let t = Instant::now();
+        let raw = emoji_sets::sticker_set(&client, &SetRef::Id(set.id, set.access_hash)).await?;
+        if let Some(full) = emoji_sets::full_set(&raw) {
+            println!(
+                "set: {} documents in {:?}",
+                full.documents.len(),
+                t.elapsed()
+            );
+            let list = full.documents.iter().filter_map(emoji_sets::emoji_document);
+            if webm_only {
+                docs.extend(list.filter(|d| d.format == EmojiFormat::Webm).take(2));
+            } else {
+                docs.extend(list.take(24));
+            }
+        }
+        if webm_only && docs.len() >= 24 {
+            break;
+        }
+    }
+    let ids: Vec<i64> = docs.iter().map(|d| d.id).collect();
+    let t = Instant::now();
+    let again = emoji_sets::custom_emoji_documents(&client, &ids).await?;
+    println!(
+        "getCustomEmojiDocuments: {} in {:?}",
+        again.len(),
+        t.elapsed()
+    );
+    let dcs: std::collections::BTreeSet<i32> = docs.iter().map(|d| d.dc_id).collect();
+    println!("document dcs: {dcs:?}");
+    let mut files: Vec<Vec<u8>> = vec![Vec::new(); docs.len()];
+    for concurrency in [1usize, 4, 16] {
+        let chunk: Vec<usize> = (0..docs.len()).collect();
+        let t = Instant::now();
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let mut tasks = Vec::new();
+        for &k in chunk.iter().take(16) {
+            let client = client.clone();
+            let doc = docs[k].clone();
+            let sem = sem.clone();
+            tasks.push(tokio::spawn(async move {
+                let _p = sem.acquire().await;
+                let t = Instant::now();
+                let r = emoji_sets::download_document(&client, &doc).await;
+                (k, r, t.elapsed())
+            }));
+        }
+        let mut lat: Vec<Duration> = Vec::new();
+        for task in tasks {
+            let (k, r, d) = task.await?;
+            lat.push(d);
+            if let Ok(bytes) = r {
+                files[k] = bytes;
+            }
+        }
+        lat.sort();
+        println!(
+            "download 16 at concurrency {concurrency}: total {:?}, latency min {:?} median {:?} max {:?}",
+            t.elapsed(),
+            lat[0],
+            lat[lat.len() / 2],
+            lat[lat.len() - 1]
+        );
+    }
+    for (k, doc) in docs.iter().enumerate().skip(16) {
+        files[k] = emoji_sets::download_document(&client, doc)
+            .await
+            .unwrap_or_default();
+    }
+    let side = 34u32;
+    for (doc, bytes) in docs.iter().zip(&files) {
+        if bytes.is_empty() {
+            continue;
+        }
+        let t = Instant::now();
+        match doc.format {
+            EmojiFormat::Tgs => {
+                let Ok(anim) = tdr_lottie::Animation::from_tgs(bytes) else {
+                    println!("tgs: bad");
+                    continue;
+                };
+                let parsed = t.elapsed();
+                let mut pixmap = tdr_lottie::tiny_skia::Pixmap::new(side, side).unwrap();
+                let t1 = Instant::now();
+                anim.render_into(0, &mut pixmap);
+                let first = t1.elapsed();
+                let mut prev: Vec<u8> = Vec::new();
+                let (mut raw_total, mut packed_total) = (0usize, 0usize);
+                for k in 0..anim.frame_count() {
+                    pixmap.fill(tdr_lottie::tiny_skia::Color::TRANSPARENT);
+                    anim.render_into(k, &mut pixmap);
+                    let cur = pixmap.data().to_vec();
+                    raw_total += cur.len();
+                    packed_total += packed_size(&cur, (k % 8 != 0).then_some(&prev[..]));
+                    prev = cur;
+                }
+                println!("  frames {raw_total} B raw, {packed_total} B packed");
+                println!(
+                    "tgs {} B: ip {} op {} fr {} -> {} frames {:.0} ms; parse {parsed:?}, first frame {first:?}, all {:?}",
+                    bytes.len(),
+                    anim.in_point,
+                    anim.out_point,
+                    anim.frame_rate,
+                    anim.frame_count(),
+                    anim.frame_count() as f64 * 1000. / anim.frame_rate,
+                    t1.elapsed()
+                );
+            }
+            EmojiFormat::Webm => {
+                let video = tdr_webm::demux(bytes);
+                match tdr_webm::decode(bytes, 200) {
+                    Ok(d) => println!(
+                        "webm {} B {}x{}: blocks {} container {} ms, decoded {} frames {} ms in {:?}",
+                        bytes.len(),
+                        d.width,
+                        d.height,
+                        video.as_ref().map_or(0, |v| v.blocks.len()),
+                        video.as_ref().map_or(0, |v| v.duration_ms),
+                        d.frames.len(),
+                        d.frames.iter().map(|f| f.duration_ms).sum::<u32>(),
+                        t.elapsed()
+                    ),
+                    Err(e) => println!("webm: {e}"),
+                }
+            }
+            EmojiFormat::Webp => println!("webp {} B", bytes.len()),
+        }
+    }
+    Ok(())
+}
+
+/// The size of a frame packed like the app's custom emoji frames (XOR the previous
+/// frame, zero runs with varint counts).
+fn packed_size(cur: &[u8], prev: Option<&[u8]>) -> usize {
+    let byte = |i: usize| cur[i] ^ prev.map_or(0, |p| p[i]);
+    let var = |v: usize| (usize::BITS - v.max(1).leading_zeros()).div_ceil(7) as usize;
+    let (n, mut i, mut size) = (cur.len(), 0, 0);
+    while i < n {
+        let start = i;
+        while i < n && byte(i) == 0 {
+            i += 1;
+        }
+        let lit = i;
+        while i < n && !(byte(i) == 0 && i + 2 < n && byte(i + 1) == 0 && byte(i + 2) == 0) {
+            i += 1;
+        }
+        size += var(lit - start) + var(i - lit) + (i - lit);
+    }
+    size
 }
 
 async fn probe_folders() -> Result<()> {

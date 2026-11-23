@@ -716,9 +716,9 @@ impl Area {
     fn bar_style(self) -> (f32, f32) {
         match self {
             Area::History => (12., 3.),
-            Area::Dialogs | Area::Settings => (10., 2.),
-            // `emojiScroll`.
-            Area::Emoji => (7., 1.5),
+            // The emoji panel's too: tdesktop's `emojiScroll` (7 px, a 3 px bar)
+            // is too thin to grab (docs/ARCHITECTURE.md).
+            Area::Dialogs | Area::Settings | Area::Emoji => (10., 2.),
         }
     }
 }

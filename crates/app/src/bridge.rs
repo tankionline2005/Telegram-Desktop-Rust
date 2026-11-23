@@ -2350,6 +2350,9 @@ async fn run(
     // Userpics: from the file cache, or downloaded in the background (a few at once).
     let (pics_tx, mut pics_rx) = mpsc::unbounded_channel::<(PeerKey, i64, Option<Vec<u8>>)>();
     let downloads = Arc::new(tokio::sync::Semaphore::new(4));
+    // Custom emoji files are small and many on screen at once: their own, wider
+    // limit, so they never wait behind userpics (8 at a time measured best).
+    let emoji_downloads = Arc::new(tokio::sync::Semaphore::new(8));
     let mut loading: HashSet<i64> = HashSet::new();
 
     // 3. Commands and live updates.
@@ -2645,7 +2648,7 @@ async fn run(
                         if !ids.is_empty() {
                             let client = client.clone();
                             let done = pics.clone();
-                            let downloads = downloads.clone();
+                            let downloads = emoji_downloads.clone();
                             let tx = tx.clone();
                             tokio::spawn(async move {
                                 let docs = match tdr_data::emoji_sets::custom_emoji_documents(&client, &ids).await {

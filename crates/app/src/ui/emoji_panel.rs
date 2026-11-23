@@ -112,6 +112,8 @@ enum Over {
 
 /// Recent emoji and the seven sections come first (`_staticCount`).
 const STATIC_SECTIONS: usize = 8;
+/// `stickerIconMove`: the footer scrolls to a newly selected icon in this time.
+const ICON_MOVE_MS: f32 = 400.;
 /// `kCollapsedRows`.
 const COLLAPSED_ROWS: usize = 3;
 // emojiPanButton, stickerPanRemoveSet, emojiPanExpand.
@@ -203,6 +205,10 @@ pub(super) struct EmojiPanel {
     locked: bool,
     /// The footer's horizontal scroll (when the sets' icons do not fit).
     footer_scroll: f32,
+    /// The section the footer was last centered on, and its scroll animation
+    /// (from, to, start): `setSelectedIcon`, `stickerIconMove` linear.
+    footer_centered: usize,
+    footer_move: Option<(f32, f32, Instant)>,
     /// The sets' header buttons at the last frame (list coordinates).
     button_rects: std::collections::HashMap<usize, Bounds<Pixels>>,
 }
@@ -240,6 +246,8 @@ impl EmojiPanel {
             expanded: std::collections::HashSet::new(),
             locked: true,
             footer_scroll: 0.,
+            footer_centered: usize::MAX,
+            footer_move: None,
             button_rects: std::collections::HashMap::new(),
         }
     }
@@ -1121,6 +1129,10 @@ impl MainView {
             return None;
         }
         self.emoji_panel.menu_open = self.text_ui.menu.as_ref().is_some_and(|m| !m.menu.gone());
+        // Dragging its scrollbar may take the mouse out of the panel.
+        if self.emoji_bar.drag.is_some() {
+            self.emoji_panel.hide_at = None;
+        }
         if self.emoji_panel.step() {
             window.request_animation_frame();
         }
@@ -2040,15 +2052,33 @@ impl MainView {
         let p = self.palette();
         let items = self.footer_items(w);
         let single_w = items.first().map_or(lg(ICON_WIDTH), |i| i.w);
-        // Keep the selected icon in view.
+        // A newly selected icon is centered (`setSelectedIcon`), in 400 ms; the
+        // wheel scrolls freely in between.
         let total = items.last().map_or(0., |i| i.x + i.w) + lg(ICON_SKIP);
         let max_scroll = (total - w).max(0.);
-        if let Some(sel) = items.iter().find(|i| i.section == self.emoji_panel.footer) {
-            let scroll = &mut self.emoji_panel.footer_scroll;
-            if sel.x - *scroll < 0. {
-                *scroll = sel.x - lg(ICON_SKIP);
-            } else if sel.x + sel.w - *scroll > w {
-                *scroll = sel.x + sel.w - w + lg(ICON_SKIP);
+        let footer = self.emoji_panel.footer;
+        if footer != self.emoji_panel.footer_centered
+            && let Some(sel) = items.iter().find(|i| i.section == footer)
+        {
+            let first = self.emoji_panel.footer_centered == usize::MAX;
+            self.emoji_panel.footer_centered = footer;
+            let to = (sel.x + sel.w / 2. - w / 2.).clamp(0., max_scroll);
+            if first {
+                self.emoji_panel.footer_scroll = to;
+                self.emoji_panel.footer_move = None;
+            } else {
+                self.emoji_panel.footer_move =
+                    Some((self.emoji_panel.footer_scroll, to, Instant::now()));
+            }
+        }
+        if let Some((from, to, start)) = self.emoji_panel.footer_move {
+            let t = start.elapsed().as_secs_f32() * 1000. / ICON_MOVE_MS;
+            if t >= 1. {
+                self.emoji_panel.footer_scroll = to;
+                self.emoji_panel.footer_move = None;
+            } else {
+                self.emoji_panel.footer_scroll = from + (to - from) * t;
+                window.request_animation_frame();
             }
         }
         self.emoji_panel.footer_scroll = self.emoji_panel.footer_scroll.clamp(0., max_scroll);
@@ -2162,6 +2192,7 @@ impl MainView {
                 cx.listener(move |this, e: &gpui::ScrollWheelEvent, window, cx| {
                     let d = e.delta.pixel_delta(window.line_height());
                     let delta = if d.x.abs() > d.y.abs() { d.x } else { d.y };
+                    this.emoji_panel.footer_move = None;
                     this.emoji_panel.footer_scroll =
                         (this.emoji_panel.footer_scroll - f32::from(delta)).clamp(0., max_scroll);
                     cx.notify();
