@@ -75,6 +75,10 @@ pub(super) enum LayerBox {
     Leave(tdr_data::tdr_storage::PeerKey),
     /// "Do you want to reset recent emoji?" (the emoji panel's menu).
     ResetRecentEmoji,
+    /// An emoji set (`MainView::emoji_set_box`).
+    EmojiSet,
+    /// "Remove "<set>"?" (`MainView::emoji_set_removing`).
+    RemoveEmojiSet,
 }
 
 /// `LayerStackWidget::BackgroundWidget::Action`.
@@ -982,6 +986,8 @@ impl MainView {
                 LayerBox::Leave(peer) => self.render_leave(peer, window, cx),
                 LayerBox::ResetRecentEmoji => self.render_reset_recent_emoji(window, cx),
                 LayerBox::Countries => self.render_country_box(window, cx),
+                LayerBox::EmojiSet => self.render_emoji_set_box(window, cx),
+                LayerBox::RemoveEmojiSet => self.render_remove_emoji_set(window, cx),
             };
             root = root.child(
                 div()

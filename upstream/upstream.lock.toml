@@ -2650,3 +2650,36 @@ sha256 = "b0c1b8de4d84a3840a27e182daa6b7e1045f34c29b62e5000e0f99092b06d533"
 path = "assets/tdesktop-animations/demo__robot.tgs"
 upstream = "Telegram/Resources/animations/robot.tgs"
 sha256 = "a9aaab6c911ba51cf1f73781dcb060c2f7d2e8e36256fde650dcc43273f418bf"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__premium_lock.png"
+upstream = "Telegram/Resources/icons/emoji/premium_lock.png"
+sha256 = "92db48c7d062ad3529de7a9da5935cfca8ceb5ca23ff1fa3fa742a2fae7a3916"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__premium_lock@2x.png"
+upstream = "Telegram/Resources/icons/emoji/premium_lock@2x.png"
+sha256 = "ece1d6d23fff8f1d7962e86342e7a1792e73b3a7a3a859ffac61dbfc197988ed"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__premium_lock@3x.png"
+upstream = "Telegram/Resources/icons/emoji/premium_lock@3x.png"
+sha256 = "43e049807abfb0f9a9d0651999cb059fcb379c0da677e0e091facbc3e0b3c5ad"
+
+[[vendored]]
+path = "assets/tdesktop-icons/simple_close.png"
+upstream = "icons/simple_close.png"
+submodule = "Telegram/lib_ui"
+sha256 = "41d5b700ea006ab4a2f5592a45c048594b5506370e0f840f1d12bfa327c41220"
+
+[[vendored]]
+path = "assets/tdesktop-icons/simple_close@2x.png"
+upstream = "icons/simple_close@2x.png"
+submodule = "Telegram/lib_ui"
+sha256 = "62e96038732c78afdebb8816c95ef5fa1be1bc164a11797f2f2c83add736ae84"
+
+[[vendored]]
+path = "assets/tdesktop-icons/simple_close@3x.png"
+upstream = "icons/simple_close@3x.png"
+submodule = "Telegram/lib_ui"
+sha256 = "59f0e5be3cac0542ed6e627533ccb3fc76e780597637eb6958acb3eae968014a"

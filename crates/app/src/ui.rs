@@ -35,6 +35,7 @@ mod archive;
 mod chrome;
 mod country_box;
 mod emoji_panel;
+mod emoji_set_box;
 mod layers;
 mod main_menu;
 mod menus;
@@ -758,6 +759,10 @@ pub struct MainView {
     emoji_bar: Scrollbar,
     /// The emoji panel or the docked selector.
     emoji_panel: emoji_panel::EmojiPanel,
+    /// The open emoji set box.
+    emoji_set_box: Option<emoji_set_box::SetBox>,
+    /// The set the "Remove" box asks about.
+    emoji_set_removing: Option<(tdr_data::emoji_sets::SetRef, String)>,
     /// The chat list's share of the window (tdesktop's dialogs width ratios).
     columns: Columns,
     columns_path: Option<PathBuf>,
@@ -1010,6 +1015,8 @@ impl MainView {
             settings_bar: Scrollbar::default(),
             emoji_bar: Scrollbar::default(),
             emoji_panel: emoji_panel::EmojiPanel::new(accounts.read(cx).emoji_settings_path()),
+            emoji_set_box: None,
+            emoji_set_removing: None,
             columns: Columns::default(),
             columns_path: None,
             column_drag: None,
@@ -1929,6 +1936,17 @@ impl MainView {
                 cx.notify();
             }
             Update::CustomEmojiFailed(id) => crate::custom_emoji::failed(id),
+            Update::EmojiSets {
+                installed,
+                featured,
+            } => {
+                self.emoji_panel.set_sets(installed, featured);
+                cx.notify();
+            }
+            Update::EmojiSetLoaded { set, found } => {
+                self.emoji_set_loaded(set, found);
+                cx.notify();
+            }
             Update::Archive(info) => {
                 // An emptied archive closes (`Widget::refreshFolderTopBar`).
                 if info.is_none() && self.archive_open {

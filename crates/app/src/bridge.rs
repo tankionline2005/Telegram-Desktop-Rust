@@ -74,6 +74,15 @@ pub enum Command {
     },
     /// Custom emoji are needed (their documents and files; once per id).
     LoadCustomEmoji(Vec<i64>),
+    /// The installed and featured emoji sets (the emoji panel).
+    LoadEmojiSets,
+    /// One set by id or link name (the set box).
+    LoadEmojiSet(tdr_data::emoji_sets::SetRef),
+    /// Adds or removes an emoji set.
+    ToggleEmojiSet {
+        set: tdr_data::emoji_sets::SetRef,
+        install: bool,
+    },
     /// Not in the file cache (the file thread looked): fetch and download.
     FetchCustomEmoji(Vec<i64>),
     /// A userpic is needed (once per photo).
@@ -150,6 +159,16 @@ pub enum Update {
     },
     /// A custom emoji that could not be loaded.
     CustomEmojiFailed(i64),
+    /// The installed emoji sets (the user's order) and the featured ones.
+    EmojiSets {
+        installed: Vec<EmojiSet>,
+        featured: Vec<EmojiSet>,
+    },
+    /// One set for the set box (`None`: not found).
+    EmojiSetLoaded {
+        set: tdr_data::emoji_sets::SetRef,
+        found: Option<EmojiSet>,
+    },
     /// The archive's row, `None` while the archive is empty.
     Archive(Option<ArchiveInfo>),
     /// The chat list of a folder (0: all chats); the window shows the open one's.
@@ -1449,6 +1468,64 @@ fn members_text(store: &Storage, peer: PeerKey, count: i32) -> String {
 }
 
 /// Starts the data thread.
+/// An emoji set with its emoji.
+#[derive(Clone, Debug)]
+pub struct EmojiSet {
+    pub info: tdr_data::emoji_sets::SetInfo,
+    pub emoji: Vec<tdr_data::emoji_sets::EmojiDocument>,
+}
+
+fn emoji_set_of(full: &tdr_data::emoji_sets::FullSet) -> EmojiSet {
+    EmojiSet {
+        info: full.info.clone(),
+        emoji: full
+            .documents
+            .iter()
+            .filter_map(tdr_data::emoji_sets::emoji_document)
+            .collect(),
+    }
+}
+
+/// The installed sets with their emoji (fetched together) and the featured ones.
+async fn load_emoji_sets(
+    client: &tdr_api::Client,
+) -> anyhow::Result<(Vec<EmojiSet>, Vec<EmojiSet>)> {
+    use tdr_data::emoji_sets::{self, SetRef};
+    let infos = emoji_sets::installed_emoji_sets(client).await?;
+    let mut tasks = Vec::new();
+    for info in infos {
+        let client = client.clone();
+        tasks.push(tokio::spawn(async move {
+            let raw =
+                emoji_sets::sticker_set(&client, &SetRef::Id(info.id, info.access_hash)).await;
+            raw.ok()
+                .and_then(|r| emoji_sets::full_set(&r))
+                .map(|f| emoji_set_of(&f))
+        }));
+    }
+    let mut installed = Vec::new();
+    for t in tasks {
+        if let Ok(Some(set)) = t.await {
+            installed.push(set);
+        }
+    }
+    let featured = emoji_sets::featured_emoji_sets(client)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|f| !installed.iter().any(|i| i.info.id == f.info.id))
+        .map(|f| EmojiSet {
+            info: f.info,
+            emoji: f
+                .documents
+                .iter()
+                .filter_map(emoji_sets::emoji_document)
+                .collect(),
+        })
+        .collect();
+    Ok((installed, featured))
+}
+
 /// Work for the userpic thread.
 enum PicJob {
     /// The UI wants this userpic.
@@ -2520,6 +2597,47 @@ async fn run(
                         Err(e) => error!("read: {e}"),
                     },
                     Command::LoadCustomEmoji(_) => {}
+                    Command::LoadEmojiSets => {
+                        let client = client.clone();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            match load_emoji_sets(&client).await {
+                                Ok((installed, featured)) => {
+                                    let _ = tx.send(Update::EmojiSets { installed, featured });
+                                }
+                                Err(e) => tracing::debug!("emoji sets: {e}"),
+                            }
+                        });
+                    }
+                    Command::LoadEmojiSet(set) => {
+                        let client = client.clone();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let found = tdr_data::emoji_sets::sticker_set(&client, &set)
+                                .await
+                                .ok()
+                                .and_then(|r| tdr_data::emoji_sets::full_set(&r))
+                                .map(|f| emoji_set_of(&f));
+                            let _ = tx.send(Update::EmojiSetLoaded { set, found });
+                        });
+                    }
+                    Command::ToggleEmojiSet { set, install } => {
+                        let client = client.clone();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let done = if install {
+                                tdr_data::emoji_sets::install_set(&client, &set).await
+                            } else {
+                                tdr_data::emoji_sets::uninstall_set(&client, &set).await
+                            };
+                            if let Err(e) = done {
+                                tracing::debug!("emoji set: {e}");
+                            }
+                            if let Ok((installed, featured)) = load_emoji_sets(&client).await {
+                                let _ = tx.send(Update::EmojiSets { installed, featured });
+                            }
+                        });
+                    }
                     // Not in the file cache (the file thread looked): fetch the
                     // documents (`getCustomEmojiDocuments`) and download the files.
                     Command::FetchCustomEmoji(ids) => {
@@ -2908,6 +3026,42 @@ const DEMO_CUSTOM_EMOJI: [(i64, &str, &[u8]); 4] = [
         include_bytes!("../../../assets/tdesktop-animations/demo__robot.tgs"),
     ),
 ];
+
+/// The demo's installed set: its custom emoji.
+fn demo_emoji_sets() -> Update {
+    let emoji = DEMO_CUSTOM_EMOJI
+        .iter()
+        .filter_map(|(id, _, _)| match demo_custom_emoji(*id) {
+            Some(Update::CustomEmoji { doc, .. }) => Some(doc),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let info = |id: i64, title: &str, installed: bool| tdr_data::emoji_sets::SetInfo {
+        id,
+        access_hash: 0,
+        title: title.into(),
+        short_name: title.replace(' ', ""),
+        count: emoji.len() as i32,
+        hash: 0,
+        emojis: true,
+        archived: false,
+        official: false,
+        installed,
+        text_color: false,
+        creator: false,
+        thumb_document_id: None,
+    };
+    Update::EmojiSets {
+        installed: vec![EmojiSet {
+            info: info(1, "tdesktop animations @tdesktop", true),
+            emoji: emoji.clone(),
+        }],
+        featured: vec![EmojiSet {
+            info: info(2, "Featured demo", false),
+            emoji,
+        }],
+    }
+}
 
 fn demo_custom_emoji(id: i64) -> Option<Update> {
     let (_, alt, bytes) = DEMO_CUSTOM_EMOJI.iter().find(|e| e.0 == id)?;
@@ -3712,7 +3866,26 @@ pub fn start_demo(
                 | Command::SaveDraft { .. }
                 | Command::Read { .. }
                 | Command::LoadUserpic { .. }
-                | Command::FetchCustomEmoji(_) => {}
+                | Command::FetchCustomEmoji(_)
+                | Command::ToggleEmojiSet { .. } => {}
+                Command::LoadEmojiSet(set) => {
+                    let found = match demo_emoji_sets() {
+                        Update::EmojiSets {
+                            installed,
+                            featured,
+                        } => installed.into_iter().chain(featured).find(|s| match &set {
+                            tdr_data::emoji_sets::SetRef::Id(id, _) => s.info.id == *id,
+                            tdr_data::emoji_sets::SetRef::ShortName(n) => {
+                                s.info.short_name.eq_ignore_ascii_case(n)
+                            }
+                        }),
+                        _ => None,
+                    };
+                    let _ = up_tx.send(Update::EmojiSetLoaded { set, found });
+                }
+                Command::LoadEmojiSets => {
+                    let _ = up_tx.send(demo_emoji_sets());
+                }
                 Command::LoadCustomEmoji(ids) => {
                     for id in ids {
                         let _ = up_tx

@@ -18,8 +18,9 @@ use gpui::{
 };
 use tdr_emoji::Section;
 
-use super::{MainView, c};
+use super::{MainView, c, text_width};
 use crate::anim::ease_out_circ;
+use crate::bridge::Command;
 use crate::icons::{Icon, icon};
 use crate::popup_menu::{Entry, MenuAction, PopupMenu};
 use crate::scale::{self, lg, px};
@@ -103,6 +104,53 @@ enum Over {
         index: usize,
     },
     ColorAll,
+    /// A set's title: opens the set.
+    Title(usize),
+    /// A set's button: remove, add or unlock.
+    Button(usize),
+}
+
+/// Recent emoji and the seven sections come first (`_staticCount`).
+const STATIC_SECTIONS: usize = 8;
+/// `kCollapsedRows`.
+const COLLAPSED_ROWS: usize = 3;
+// emojiPanButton, stickerPanRemoveSet, emojiPanExpand.
+const BUTTON_RIGHT: f32 = 7.;
+const BUTTON_TOP: f32 = 8.;
+const BUTTON_HEIGHT: f32 = 23.;
+const BUTTON_PADDING: f32 = 12.;
+const REMOVE_SIZE: f32 = 20.;
+const REMOVE_SKIP: f32 = 10.;
+const REMOVE_TOP: f32 = 10.;
+const HEADER_LOCK_LEFT: f32 = 7.;
+const HEADER_LOCKED_LEFT: f32 = 26.;
+const EXPAND_HEIGHT: f32 = 19.;
+const ICON_WIDTH: f32 = 30.;
+
+/// An emoji of a section: one of Telegram's or a custom one.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Slot {
+    Emoji(u16),
+    Custom(i64),
+}
+
+/// An emoji set in the panel (`CustomSet`).
+#[derive(Clone, Debug)]
+pub(super) struct SetSection {
+    info: tdr_data::emoji_sets::SetInfo,
+    emoji: Vec<i64>,
+    /// In the user's sets (can be removed).
+    installed: bool,
+    /// Has emoji that need Premium (`isPremiumEmoji`).
+    premium: bool,
+}
+
+/// The button at the right of a set's title.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SetButton {
+    Remove,
+    Add,
+    Unlock,
 }
 
 struct Picker {
@@ -145,6 +193,18 @@ pub(super) struct EmojiPanel {
     list_width: f32,
     /// A popup menu is open over the panel.
     menu_open: bool,
+    /// The installed sets, then the featured ones.
+    sets: Vec<SetSection>,
+    sets_asked: bool,
+    /// Collapsed sets opened by their "+N" badge.
+    expanded: std::collections::HashSet<i64>,
+    /// Premium emoji are locked here (`premiumMayBeBought`): no Premium and not
+    /// Saved Messages.
+    locked: bool,
+    /// The footer's horizontal scroll (when the sets' icons do not fit).
+    footer_scroll: f32,
+    /// The sets' header buttons at the last frame (list coordinates).
+    button_rects: std::collections::HashMap<usize, Bounds<Pixels>>,
 }
 
 impl EmojiPanel {
@@ -175,6 +235,12 @@ impl EmojiPanel {
             layout: None,
             list_width: 0.,
             menu_open: false,
+            sets: Vec::new(),
+            sets_asked: false,
+            expanded: std::collections::HashSet::new(),
+            locked: true,
+            footer_scroll: 0.,
+            button_rects: std::collections::HashMap::new(),
         }
     }
 
@@ -196,6 +262,70 @@ impl EmojiPanel {
             );
         }
         self.lists = lists;
+    }
+
+    /// The sets came (`refreshCustom`): the installed ones in the user's order,
+    /// then the featured ones not installed.
+    pub(super) fn set_sets(
+        &mut self,
+        installed: Vec<crate::bridge::EmojiSet>,
+        featured: Vec<crate::bridge::EmojiSet>,
+    ) {
+        let section = |set: crate::bridge::EmojiSet, installed: bool| {
+            for doc in &set.emoji {
+                crate::custom_emoji::remember(doc);
+            }
+            SetSection {
+                premium: set.emoji.iter().any(|d| !d.free),
+                emoji: set.emoji.iter().map(|d| d.id).collect(),
+                info: set.info,
+                installed,
+            }
+        };
+        let mut sets: Vec<SetSection> = installed
+            .into_iter()
+            .filter(|s| !s.emoji.is_empty())
+            .map(|s| section(s, true))
+            .collect();
+        sets.extend(
+            featured
+                .into_iter()
+                .filter(|s| !s.emoji.is_empty())
+                .map(|s| section(s, false)),
+        );
+        self.sets = sets;
+    }
+
+    /// The set is among the user's.
+    pub(super) fn has_installed(&self, id: i64) -> bool {
+        self.sets.iter().any(|s| s.installed && s.info.id == id)
+    }
+
+    fn set(&self, section: usize) -> Option<&SetSection> {
+        section
+            .checked_sub(STATIC_SECTIONS)
+            .and_then(|k| self.sets.get(k))
+    }
+
+    /// `premiumRequired` of a set here.
+    fn premium_required(&self, set: &SetSection) -> bool {
+        set.premium && self.locked
+    }
+
+    /// `hasRemoveButton` / `hasAddButton` / unlock.
+    fn set_button(&self, set: &SetSection) -> SetButton {
+        if self.premium_required(set) {
+            SetButton::Unlock
+        } else if set.installed {
+            SetButton::Remove
+        } else {
+            SetButton::Add
+        }
+    }
+
+    /// Shown in three rows with a "+N" badge (`collapsed`).
+    fn collapsible(&self, set: &SetSection) -> bool {
+        !self.expanded.contains(&set.info.id) && (!set.installed || self.premium_required(set))
     }
 
     /// The panel takes the mouse (not while it fades out).
@@ -308,6 +438,9 @@ impl EmojiPanel {
 struct SectionInfo {
     section: usize,
     count: usize,
+    /// Cells shown: all, or three rows of a collapsed set.
+    shown: usize,
+    collapsed: bool,
     top: f32,
     rows_top: f32,
     rows_bottom: f32,
@@ -324,7 +457,8 @@ struct ListLayout {
 }
 
 impl ListLayout {
-    fn new(width: f32, counts: &[usize], min_height: f32) -> Self {
+    /// `counts`: cells of each section and whether it may be collapsed.
+    fn new(width: f32, counts: &[(usize, bool)], min_height: f32) -> Self {
         let full = lg(MARGIN_LEFT) + width + lg(MARGIN_RIGHT);
         let inner = full - lg(PADDING_LEFT) - lg(PADDING_RIGHT);
         let columns = ((inner / lg(DESIRED_SIZE)).floor() as usize).max(1);
@@ -335,13 +469,21 @@ impl ListLayout {
         let search = lg(SEARCH_MARGIN[1]) + lg(SEARCH_HEIGHT) + lg(SEARCH_MARGIN[3]);
         let mut sections = Vec::new();
         let mut top = 0.;
-        for (i, count) in counts.iter().enumerate() {
-            let rows = count.div_ceil(columns);
+        for (i, (count, collapsible)) in counts.iter().enumerate() {
+            let collapsed = *collapsible && *count > columns * COLLAPSED_ROWS;
+            let shown = if collapsed {
+                columns * COLLAPSED_ROWS
+            } else {
+                *count
+            };
+            let rows = shown.div_ceil(columns);
             let rows_top = top + if i == 0 { search } else { lg(HEADER) };
             let rows_bottom = rows_top + rows as f32 * single.1;
             sections.push(SectionInfo {
                 section: i,
                 count: *count,
+                shown,
+                collapsed,
                 top,
                 rows_top,
                 rows_bottom,
@@ -377,7 +519,7 @@ impl ListLayout {
                 }
                 let row = ((y - info.rows_top) / self.single.1).floor() as usize;
                 let index = row * self.columns + column as usize;
-                return if index < info.count {
+                return if index < info.shown {
                     Over::Emoji {
                         section: info.section,
                         index,
@@ -396,6 +538,18 @@ impl ListLayout {
             .iter()
             .find(|s| y < s.rows_bottom)
             .map_or(self.sections.len().saturating_sub(1), |s| s.section)
+    }
+
+    fn emoji_right(&self) -> f32 {
+        self.rows_left + self.columns as f32 * self.single.0
+    }
+
+    /// The header of a section at `y` (above its rows).
+    fn header_at(&self, y: f32) -> Option<usize> {
+        self.sections
+            .iter()
+            .find(|s| s.section > 0 && y >= s.top && y < s.rows_top)
+            .map(|s| s.section)
     }
 
     /// The "color all" button of the people section's header.
@@ -421,17 +575,140 @@ fn contains(b: &Bounds<Pixels>, x: f32, y: f32) -> bool {
 }
 
 impl MainView {
-    fn emoji_counts(&self) -> Vec<usize> {
+    fn emoji_counts(&self) -> Vec<(usize, bool)> {
         match &self.emoji_panel.results {
-            Some(results) => vec![results.len()],
-            None => self.emoji_panel.lists.iter().map(Vec::len).collect(),
+            Some(results) => vec![(results.len(), false)],
+            None => self
+                .emoji_panel
+                .lists
+                .iter()
+                .map(|l| (l.len(), false))
+                .chain(
+                    self.emoji_panel
+                        .sets
+                        .iter()
+                        .map(|s| (s.emoji.len(), self.emoji_panel.collapsible(s))),
+                )
+                .collect(),
         }
     }
 
     fn emoji_at(&self, section: usize, index: usize) -> Option<u16> {
+        match self.cell_at(section, index)? {
+            Slot::Emoji(e) => Some(e),
+            Slot::Custom(_) => None,
+        }
+    }
+
+    fn cell_at(&self, section: usize, index: usize) -> Option<Slot> {
         match &self.emoji_panel.results {
-            Some(results) => results.get(index).copied(),
-            None => self.emoji_panel.lists.get(section)?.get(index).copied(),
+            Some(results) => results.get(index).copied().map(Slot::Emoji),
+            None => match self.emoji_panel.set(section) {
+                Some(set) => set.emoji.get(index).copied().map(Slot::Custom),
+                None => self
+                    .emoji_panel
+                    .lists
+                    .get(section)?
+                    .get(index)
+                    .copied()
+                    .map(Slot::Emoji),
+            },
+        }
+    }
+
+    /// The emoji sets are asked for once (`refreshCustom` follows the data).
+    fn ensure_emoji_sets(&mut self) {
+        if !self.emoji_panel.sets_asked {
+            self.emoji_panel.sets_asked = true;
+            let _ = self.commands.send(Command::LoadEmojiSets);
+        }
+    }
+
+    /// The width of a set's text button ("Add", "Unlock").
+    fn set_button_rect(
+        &self,
+        layout: &ListLayout,
+        section: usize,
+        window: &Window,
+    ) -> Option<Bounds<Pixels>> {
+        let set = self.emoji_panel.set(section)?;
+        let info = layout.sections.get(section)?;
+        let right = layout.emoji_right();
+        Some(match self.emoji_panel.set_button(set) {
+            SetButton::Remove => {
+                let size = lg(REMOVE_SIZE);
+                Bounds::new(
+                    point(
+                        gpx(right - lg(REMOVE_SKIP) - size),
+                        gpx(info.top + lg(REMOVE_TOP)),
+                    ),
+                    gpui::size(gpx(size), gpx(size)),
+                )
+            }
+            kind => {
+                let text = if kind == SetButton::Add {
+                    "Add"
+                } else {
+                    "Unlock"
+                };
+                let w =
+                    text_width(window, text, 13., FontWeight::SEMIBOLD) + 2. * lg(BUTTON_PADDING);
+                Bounds::new(
+                    point(
+                        gpx(right - w - lg(BUTTON_RIGHT)),
+                        gpx(info.top + lg(BUTTON_TOP)),
+                    ),
+                    gpui::size(gpx(w), px(BUTTON_HEIGHT)),
+                )
+            }
+        })
+    }
+
+    /// A custom emoji chosen (`selectCustom`): into the field, unless it needs
+    /// Premium here (then the toast about it).
+    fn choose_custom(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let info = crate::custom_emoji::info(id);
+        let free = info.as_ref().is_some_and(|i| i.free);
+        if self.emoji_panel.locked && !free {
+            self.show_toast("Subscribe to Telegram Premium to unlock this emoji.", None);
+            return;
+        }
+        let alt = info
+            .map(|i| i.alt)
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(|| "🙂".into());
+        let input = self.input.clone();
+        input.update(cx, |i, cx| i.insert_custom_emoji(&alt, id, cx));
+        window.focus(&input.focus_handle(cx));
+    }
+
+    fn open_emoji_set(&mut self, section: usize) {
+        if let Some(set) = self.emoji_panel.set(section) {
+            let r = tdr_data::emoji_sets::SetRef::Id(set.info.id, set.info.access_hash);
+            self.open_emoji_set_box(r);
+        }
+    }
+
+    fn emoji_set_button(&mut self, section: usize) {
+        let Some(set) = self.emoji_panel.set(section).cloned() else {
+            return;
+        };
+        let r = tdr_data::emoji_sets::SetRef::Id(set.info.id, set.info.access_hash);
+        match self.emoji_panel.set_button(&set) {
+            SetButton::Remove => {
+                self.emoji_set_removing = Some((r, set.info.title.clone()));
+                self.layers
+                    .show_layer(super::layers::LayerBox::RemoveEmojiSet);
+            }
+            SetButton::Add => {
+                let _ = self.commands.send(Command::ToggleEmojiSet {
+                    set: r,
+                    install: true,
+                });
+            }
+            SetButton::Unlock => {
+                self.show_toast("Subscribe to Telegram Premium to unlock this emoji.", None);
+            }
         }
     }
 
@@ -578,6 +855,16 @@ impl MainView {
             && layout.color_all_rect().is_some_and(|r| contains(&r, x, y))
         {
             Over::ColorAll
+        } else if let Some(section) = layout
+            .header_at(y)
+            .filter(|s| *s >= STATIC_SECTIONS && self.emoji_panel.results.is_none())
+        {
+            let button = self.emoji_panel.button_rects.get(&section).copied();
+            if button.is_some_and(|r| contains(&r, x, y)) {
+                Over::Button(section)
+            } else {
+                Over::Title(section)
+            }
         } else {
             layout.hit(x, y)
         };
@@ -642,8 +929,23 @@ impl MainView {
         }
         match over {
             Over::Emoji { section, index } => {
-                if let Some(emoji) = self.emoji_at(section, index) {
-                    self.choose_emoji(emoji, window, cx);
+                let collapsed_badge = self
+                    .emoji_panel
+                    .layout
+                    .as_ref()
+                    .and_then(|l| l.sections.get(section))
+                    .is_some_and(|info| info.collapsed && index + 1 == info.shown);
+                if collapsed_badge {
+                    if let Some(set) = self.emoji_panel.set(section) {
+                        let id = set.info.id;
+                        self.emoji_panel.expanded.insert(id);
+                    }
+                } else {
+                    match self.cell_at(section, index) {
+                        Some(Slot::Emoji(emoji)) => self.choose_emoji(emoji, window, cx),
+                        Some(Slot::Custom(id)) => self.choose_custom(id, window, cx),
+                        None => {}
+                    }
                 }
             }
             Over::ColorAll => {
@@ -652,6 +954,8 @@ impl MainView {
                     self.show_emoji_picker(Over::ColorAll, &layout);
                 }
             }
+            Over::Title(section) => self.open_emoji_set(section),
+            Over::Button(section) => self.emoji_set_button(section),
             Over::None => {}
         }
         cx.notify();
@@ -689,7 +993,7 @@ impl MainView {
                     f32::from(r.size.height) - 2. * lg(PAN_RADIUS),
                 )
             }
-            Over::None => return,
+            Over::None | Over::Title(_) | Over::Button(_) => return,
         };
         let (pw, ph) = picker_size(layout.single, all);
         let visible_top = -f32::from(self.emoji_panel.scroll.offset().y);
@@ -740,7 +1044,7 @@ impl MainView {
                 }
                 self.choose_emoji(emoji, window, cx);
             }
-            Over::None => {}
+            Over::None | Over::Title(_) | Over::Button(_) => {}
         }
         cx.notify();
     }
@@ -933,16 +1237,29 @@ impl MainView {
         } else {
             layout.section_at(visible_top)
         };
-        let single_w = ((w - 2. * lg(ICON_SKIP)) / 8.).floor();
+        self.ensure_emoji_sets();
+        // `premiumMayBeBought` and `_allowWithoutPremium` (Saved Messages).
+        let premium = self
+            .accounts
+            .read(cx)
+            .active()
+            .and_then(|s| s.me.as_ref())
+            .is_some_and(|m| m.premium);
+        let saved = self
+            .selected
+            .and_then(|peer| self.chat_item(peer))
+            .is_some_and(|c| c.is_saved);
+        self.emoji_panel.locked = !premium && !saved;
         if current != self.emoji_panel.footer && current != usize::MAX {
-            let from = self.footer_selection_x(single_w);
+            let items = self.footer_items(w);
+            let from = self.footer_selection_x(&items);
             self.emoji_panel.footer = current;
             self.emoji_panel.footer_from = (from, Instant::now());
         }
 
         let tabs = self.render_selector_tabs(w, window);
         let list = self.render_emoji_list(&layout, list_w, window, cx);
-        let footer = self.render_emoji_footer(w, single_w, rounded, window, cx);
+        let footer = self.render_emoji_footer(w, rounded, window, cx);
         let picker = self.render_emoji_picker(&layout, cx);
         let bar = self.render_scrollbar(super::Area::Emoji, cx);
 
@@ -994,9 +1311,72 @@ impl MainView {
             .into_any_element()
     }
 
-    fn footer_selection_x(&self, single_w: f32) -> f32 {
+    /// The footer's icons (`StickersListFooter`): without sets the recent emoji
+    /// and the seven sections share the width; with sets the sections are one
+    /// icon that opens into seven while one of them is shown, then a set's icon
+    /// each (`iconWidth`), scrolled when they do not fit.
+    fn footer_items(&self, w: f32) -> Vec<FooterItem> {
+        let left = lg(ICON_SKIP);
+        let sets = &self.emoji_panel.sets;
+        if sets.is_empty() {
+            let single = ((w - 2. * left) / 8.).floor();
+            return (0..8)
+                .map(|k| FooterItem {
+                    x: left + k as f32 * single,
+                    w: single,
+                    section: k,
+                })
+                .collect();
+        }
+        let single = lg(ICON_WIDTH);
+        let expanded = (1..STATIC_SECTIONS).contains(&self.emoji_panel.footer);
+        let mut items = vec![FooterItem {
+            x: left,
+            w: single,
+            section: 0,
+        }];
+        let mut x = left + single;
+        if expanded {
+            for k in 1..STATIC_SECTIONS {
+                items.push(FooterItem {
+                    x,
+                    w: single,
+                    section: k,
+                });
+                x += single;
+            }
+        } else {
+            items.push(FooterItem {
+                x,
+                w: single,
+                section: 1,
+            });
+            x += single;
+        }
+        for k in 0..sets.len() {
+            items.push(FooterItem {
+                x,
+                w: single,
+                section: STATIC_SECTIONS + k,
+            });
+            x += single;
+        }
+        items
+    }
+
+    /// Where the footer's selection is now (it slides to the shown section).
+    fn footer_selection_x(&self, items: &[FooterItem]) -> f32 {
         let (from, start) = self.emoji_panel.footer_from;
-        let to = self.emoji_panel.footer as f32 * single_w;
+        let footer = self.emoji_panel.footer;
+        let to = items
+            .iter()
+            .find(|i| i.section == footer)
+            .or_else(|| {
+                items
+                    .iter()
+                    .find(|i| i.section == 1 && footer < STATIC_SECTIONS)
+            })
+            .map_or(0., |i| i.x);
         let t = (start.elapsed().as_secs_f32() * 1000. / SELECTION_MS).min(1.);
         from + (to - from) * ease_out_circ(t)
     }
@@ -1085,11 +1465,69 @@ impl MainView {
             .as_ref()
             .filter(|p| p.hiding.is_none())
             .map(|p| p.target);
-        let lists: Vec<Vec<u16>> = match &self.emoji_panel.results {
-            Some(r) => vec![r.clone()],
-            None => self.emoji_panel.lists.clone(),
+        let lists: Vec<Vec<Slot>> = match &self.emoji_panel.results {
+            Some(r) => vec![r.iter().map(|e| Slot::Emoji(*e)).collect()],
+            None => self
+                .emoji_panel
+                .lists
+                .iter()
+                .map(|l| l.iter().map(|e| Slot::Emoji(*e)).collect())
+                .chain(
+                    self.emoji_panel
+                        .sets
+                        .iter()
+                        .map(|s| s.emoji.iter().map(|id| Slot::Custom(*id)).collect()),
+                )
+                .collect(),
         };
         let searching = self.emoji_panel.results.is_some();
+        // The sets' headers: title, lock, button (and its rectangle for clicks).
+        struct SetHead {
+            title: String,
+            locked: bool,
+            button: SetButton,
+            rect: Bounds<Pixels>,
+        }
+        let mut heads: std::collections::HashMap<usize, SetHead> = std::collections::HashMap::new();
+        self.emoji_panel.button_rects.clear();
+        if !searching {
+            for k in 0..self.emoji_panel.sets.len() {
+                let section = STATIC_SECTIONS + k;
+                let Some(rect) = self.set_button_rect(layout, section, window) else {
+                    continue;
+                };
+                let set = &self.emoji_panel.sets[k];
+                self.emoji_panel.button_rects.insert(section, rect);
+                heads.insert(
+                    section,
+                    SetHead {
+                        title: set.info.title.clone(),
+                        locked: self.emoji_panel.premium_required(set),
+                        button: self.emoji_panel.set_button(set),
+                        rect,
+                    },
+                );
+            }
+        }
+        let custom_side = crate::custom_emoji::size_large();
+        let text_fg = p.window_fg;
+        let button_bg = p.active_button_bg;
+        let button_bg_over = p.active_button_bg_over;
+        let button_fg = p.active_button_fg;
+        let premium_fg = p.premium_button_fg;
+        let premium_bg = (p.premium_button_bg1, p.premium_button_bg3);
+        let close_fg = p.small_close_icon_fg;
+        let close_fg_over = p.small_close_icon_fg_over;
+        let pan_bg = p.emoji_pan_bg;
+        let lock_image = crate::icons::tinted_image(
+            Icon::PremiumLock,
+            p.emoji_pan_header_fg,
+            window.scale_factor(),
+        );
+        let close_image =
+            crate::icons::tinted_image(Icon::SmallClose, close_fg, window.scale_factor());
+        let close_over_image =
+            crate::icons::tinted_image(Icon::SmallClose, close_fg_over, window.scale_factor());
         let origin = self.emoji_panel.origin.clone();
         let painted = layout.clone();
         let header_color = p.emoji_pan_header_fg;
@@ -1112,8 +1550,117 @@ impl MainView {
                     if top > clip.bottom() || bounds.origin.y + gpx(info.rows_bottom) < clip.top() {
                         continue;
                     }
+                    let head = heads.get(&info.section);
                     if info.section > 0 && !searching {
-                        let title = SECTION_TITLES[info.section - 1];
+                        let title: &str = match head {
+                            Some(h) => &h.title,
+                            None => SECTION_TITLES.get(info.section - 1).copied().unwrap_or(""),
+                        };
+                        let title_left = if head.is_some_and(|h| h.locked) {
+                            lg(HEADER_LOCKED_LEFT)
+                        } else {
+                            lg(HEADER_LEFT)
+                        } - lg(MARGIN_LEFT);
+                        if let Some(h) = head {
+                            if h.locked
+                                && let Some((image, w, hh, pad)) = &lock_image
+                            {
+                                let at = point(
+                                    bounds.origin.x
+                                        + gpx(lg(HEADER_LOCK_LEFT) - lg(MARGIN_LEFT) - pad),
+                                    top + px(HEADER_TOP) - gpx(*pad),
+                                );
+                                let _ = window.paint_image(
+                                    Bounds::new(
+                                        at,
+                                        gpui::size(gpx(w + 2. * pad), gpx(hh + 2. * pad)),
+                                    ),
+                                    Corners::default(),
+                                    image.clone(),
+                                    0,
+                                    false,
+                                );
+                            }
+                            let r = Bounds::new(bounds.origin + h.rect.origin, h.rect.size);
+                            let hovered = over == Over::Button(info.section);
+                            match h.button {
+                                SetButton::Remove => {
+                                    let image = if hovered {
+                                        &close_over_image
+                                    } else {
+                                        &close_image
+                                    };
+                                    if let Some((image, w, hh, pad)) = image {
+                                        let at = point(
+                                            r.origin.x + (r.size.width - gpx(*w)) / 2. - gpx(*pad),
+                                            r.origin.y + (r.size.height - gpx(*hh)) / 2.
+                                                - gpx(*pad),
+                                        );
+                                        let _ = window.paint_image(
+                                            Bounds::new(
+                                                at,
+                                                gpui::size(gpx(w + 2. * pad), gpx(hh + 2. * pad)),
+                                            ),
+                                            Corners::default(),
+                                            image.clone(),
+                                            0,
+                                            false,
+                                        );
+                                    }
+                                }
+                                kind => {
+                                    let radius = Corners::all(r.size.height / 2.);
+                                    let (label, fg) = if kind == SetButton::Add {
+                                        let bg = if hovered { button_bg_over } else { button_bg };
+                                        window
+                                            .paint_quad(gpui::fill(r, c(bg)).corner_radii(radius));
+                                        ("Add", button_fg)
+                                    } else {
+                                        window.paint_quad(
+                                            gpui::fill(
+                                                r,
+                                                gpui::linear_gradient(
+                                                    90.,
+                                                    gpui::linear_color_stop(c(premium_bg.0), 0.),
+                                                    gpui::linear_color_stop(c(premium_bg.1), 1.),
+                                                ),
+                                            )
+                                            .corner_radii(radius),
+                                        );
+                                        ("Unlock", premium_fg)
+                                    };
+                                    let run = TextRun {
+                                        len: label.len(),
+                                        font: gpui::Font {
+                                            weight: FontWeight::SEMIBOLD,
+                                            ..font("Open Sans")
+                                        },
+                                        color: c(fg).into(),
+                                        background_color: None,
+                                        underline: None,
+                                        strikethrough: None,
+                                    };
+                                    let shaped = window.text_system().shape_line(
+                                        SharedString::from(label),
+                                        f.size,
+                                        &[run],
+                                        None,
+                                    );
+                                    let _ = shaped.paint(
+                                        point(
+                                            r.origin.x + (r.size.width - shaped.width) / 2.,
+                                            r.origin.y + px(2.),
+                                        ),
+                                        f.line_height(),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            }
+                        }
+                        let title_right = head
+                            .map(|h| f32::from(h.rect.origin.x))
+                            .unwrap_or(f32::from(bounds.size.width));
                         let run = TextRun {
                             len: title.len(),
                             font: gpui::Font {
@@ -1126,25 +1673,35 @@ impl MainView {
                             strikethrough: None,
                         };
                         let shaped = window.text_system().shape_line(
-                            SharedString::from(title),
+                            SharedString::from(title.to_string()),
                             f.size,
                             &[run],
                             None,
                         );
-                        let _ = shaped.paint(
+                        // Cut at the button (the title is elided there in tdesktop).
+                        let title_clip = Bounds::from_corners(
+                            point(bounds.origin.x, top),
                             point(
-                                bounds.origin.x + gpx(lg(HEADER_LEFT) - lg(MARGIN_LEFT)),
-                                top + px(HEADER_TOP),
+                                bounds.origin.x + gpx(title_right - lg(4.)),
+                                top + px(HEADER),
                             ),
-                            f.line_height(),
-                            window,
-                            cx,
+                        );
+                        window.with_content_mask(
+                            Some(gpui::ContentMask { bounds: title_clip }),
+                            |window| {
+                                let _ = shaped.paint(
+                                    point(bounds.origin.x + gpx(title_left), top + px(HEADER_TOP)),
+                                    f.line_height(),
+                                    window,
+                                    cx,
+                                );
+                            },
                         );
                     }
                     let Some(list) = lists.get(info.section) else {
                         continue;
                     };
-                    for (index, emoji) in list.iter().enumerate() {
+                    for (index, cell) in list.iter().enumerate().take(info.shown) {
                         let r = painted.emoji_rect(info.section, index);
                         let y = bounds.origin.y + r.origin.y;
                         if y > clip.bottom() || y + r.size.height < clip.top() {
@@ -1169,11 +1726,69 @@ impl MainView {
                                 .corner_radii(Corners::all(px(PAN_RADIUS))),
                             );
                         }
-                        let at = point(
-                            ax + gpx(((area.0 - esize) / 2.).floor()),
-                            ay + gpx(((area.1 - esize) / 2.).floor()),
-                        );
-                        crate::emoji::paint(*emoji, at, size_large, window);
+                        // `drawCollapsedBadge`: the last cell of a collapsed set.
+                        if info.collapsed && index + 1 == info.shown {
+                            let text = format!("+{}", info.count - info.shown + 1);
+                            let small = scale::font(12.);
+                            let run = TextRun {
+                                len: text.len(),
+                                font: gpui::Font {
+                                    weight: FontWeight::BOLD,
+                                    ..font("Open Sans")
+                                },
+                                color: c(pan_bg).into(),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            let shaped = window.text_system().shape_line(
+                                text.into(),
+                                small.size,
+                                &[run],
+                                None,
+                            );
+                            let h = lg(EXPAND_HEIGHT);
+                            let w = (f32::from(shaped.width) + lg(8.)).max(h);
+                            let bx = x + gpx(((f32::from(r.size.width) - w) / 2.).floor());
+                            let by = y + gpx(((f32::from(r.size.height) - h) / 2.).floor());
+                            window.paint_quad(
+                                gpui::fill(
+                                    Bounds::new(point(bx, by), gpui::size(gpx(w), gpx(h))),
+                                    c(header_color),
+                                )
+                                .corner_radii(Corners::all(gpx(h / 2.))),
+                            );
+                            let _ = shaped.paint(
+                                point(bx + (gpx(w) - shaped.width) / 2., by + px(1.)),
+                                gpx(h - lg(1.)),
+                                window,
+                                cx,
+                            );
+                            continue;
+                        }
+                        match cell {
+                            Slot::Emoji(emoji) => {
+                                let at = point(
+                                    ax + gpx(((area.0 - esize) / 2.).floor()),
+                                    ay + gpx(((area.1 - esize) / 2.).floor()),
+                                );
+                                crate::emoji::paint(*emoji, at, size_large, window);
+                            }
+                            Slot::Custom(id) => {
+                                let side = custom_side as f32 / scale::get();
+                                let at = point(
+                                    ax + gpx(((area.0 - side) / 2.).floor()),
+                                    ay + gpx(((area.1 - side) / 2.).floor()),
+                                );
+                                crate::custom_emoji::paint(
+                                    *id,
+                                    at,
+                                    custom_side,
+                                    c(text_fg).into(),
+                                    window,
+                                );
+                            }
+                        }
                     }
                 }
                 let _ = skin_color;
@@ -1253,9 +1868,13 @@ impl MainView {
                     cx.notify();
                 }),
             )
-            .when(matches!(over, Over::Emoji { .. } | Over::ColorAll), |d| {
-                d.cursor_pointer()
-            })
+            .when(
+                matches!(
+                    over,
+                    Over::Emoji { .. } | Over::ColorAll | Over::Title(_) | Over::Button(_)
+                ),
+                |d| d.cursor_pointer(),
+            )
             .child(list)
             .children(color_all)
             .children(search)
@@ -1406,12 +2025,26 @@ impl MainView {
     fn render_emoji_footer(
         &mut self,
         w: f32,
-        single_w: f32,
         rounded: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.palette();
+        let items = self.footer_items(w);
+        let single_w = items.first().map_or(lg(ICON_WIDTH), |i| i.w);
+        // Keep the selected icon in view.
+        let total = items.last().map_or(0., |i| i.x + i.w) + lg(ICON_SKIP);
+        let max_scroll = (total - w).max(0.);
+        if let Some(sel) = items.iter().find(|i| i.section == self.emoji_panel.footer) {
+            let scroll = &mut self.emoji_panel.footer_scroll;
+            if sel.x - *scroll < 0. {
+                *scroll = sel.x - lg(ICON_SKIP);
+            } else if sel.x + sel.w - *scroll > w {
+                *scroll = sel.x + sel.w - w + lg(ICON_SKIP);
+            }
+        }
+        self.emoji_panel.footer_scroll = self.emoji_panel.footer_scroll.clamp(0., max_scroll);
+        let scroll = self.emoji_panel.footer_scroll;
         let icons = [
             Icon::EmojiRecent,
             Icon::EmojiSmile,
@@ -1423,11 +2056,10 @@ impl MainView {
             Icon::EmojiLove,
         ];
         let footer_h = lg(FOOTER);
-        let left = lg(ICON_SKIP);
         let area_x = ((single_w - lg(ICON_AREA)) / 2.).floor();
         let area_y = ((footer_h - lg(ICON_AREA)) / 2.).floor();
         let searching = self.emoji_panel.results.is_some();
-        let sel_x = self.footer_selection_x(single_w);
+        let sel_x = self.footer_selection_x(&items) - scroll;
         let mut row = div()
             .absolute()
             .left_0()
@@ -1442,7 +2074,7 @@ impl MainView {
             row = row.child(
                 div()
                     .absolute()
-                    .left(gpx(left + sel_x + area_x))
+                    .left(gpx(sel_x + area_x))
                     .top(gpx(area_y))
                     .w(gpx(single_w - 2. * area_x))
                     .h(px(ICON_AREA))
@@ -1450,29 +2082,62 @@ impl MainView {
                     .bg(c(p.window_bg_ripple)),
             );
         }
-        for (i, glyph) in icons.into_iter().enumerate() {
-            let active = !searching && i == self.emoji_panel.footer;
+        let custom_side = crate::emoji::size_large();
+        let text_fg = p.window_fg;
+        for item in &items {
+            let i = item.section;
+            let active = !searching
+                && (i == self.emoji_panel.footer
+                    || (i == 1
+                        && !self.emoji_panel.sets.is_empty()
+                        && items.len() < STATIC_SECTIONS + self.emoji_panel.sets.len()
+                        && (1..STATIC_SECTIONS).contains(&self.emoji_panel.footer)));
+            let glyph: AnyElement = if i < STATIC_SECTIONS {
+                icon(
+                    icons[i],
+                    if active {
+                        p.emoji_sub_icon_fg_active
+                    } else {
+                        p.emoji_icon_fg
+                    },
+                    window,
+                )
+                .into_any_element()
+            } else {
+                // The set's icon: its thumbnail emoji, else the first one.
+                let set = &self.emoji_panel.sets[i - STATIC_SECTIONS];
+                let id = set
+                    .info
+                    .thumb_document_id
+                    .or(set.emoji.first().copied())
+                    .unwrap_or(0);
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        let s = custom_side as f32 / scale::get();
+                        let at = point(
+                            bounds.origin.x + (bounds.size.width - gpx(s)) / 2.,
+                            bounds.origin.y + (bounds.size.height - gpx(s)) / 2.,
+                        );
+                        crate::custom_emoji::paint(id, at, custom_side, c(text_fg).into(), window);
+                    },
+                )
+                .size_full()
+                .into_any_element()
+            };
             row = row.child(
                 div()
                     .id(("emoji-footer", i))
                     .absolute()
-                    .left(gpx(left + i as f32 * single_w))
+                    .left(gpx(item.x - scroll))
                     .top_0()
-                    .w(gpx(single_w))
+                    .w(gpx(item.w))
                     .h_full()
                     .flex()
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .child(icon(
-                        glyph,
-                        if active {
-                            p.emoji_sub_icon_fg_active
-                        } else {
-                            p.emoji_icon_fg
-                        },
-                        window,
-                    ))
+                    .child(glyph)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(field) = this.emoji_panel.search.clone()
                             && this.emoji_panel.results.is_some()
@@ -1484,8 +2149,25 @@ impl MainView {
                     })),
             );
         }
-        row.into_any_element()
+        row.overflow_hidden()
+            .on_scroll_wheel(
+                cx.listener(move |this, e: &gpui::ScrollWheelEvent, window, cx| {
+                    let d = e.delta.pixel_delta(window.line_height());
+                    let delta = if d.x.abs() > d.y.abs() { d.x } else { d.y };
+                    this.emoji_panel.footer_scroll =
+                        (this.emoji_panel.footer_scroll - f32::from(delta)).clamp(0., max_scroll);
+                    cx.notify();
+                }),
+            )
+            .into_any_element()
     }
+}
+
+/// An icon of the footer: its place and the section it shows.
+struct FooterItem {
+    x: f32,
+    w: f32,
+    section: usize,
 }
 
 /// The picker's size with its shadow margins (`updateSize`).

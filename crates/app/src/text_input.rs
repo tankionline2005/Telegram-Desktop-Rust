@@ -94,6 +94,8 @@ pub enum Tag {
     Pre,
     Blockquote,
     Spoiler,
+    /// A custom emoji over its fallback emoji (one per emoji, never merged).
+    CustomEmoji(i64),
 }
 
 impl Tag {
@@ -330,7 +332,11 @@ fn normalize(text: &str, tags: &mut Vec<TagSpan>) {
     let mut merged: Vec<TagSpan> = Vec::with_capacity(tags.len());
     for t in tags.drain(..) {
         match merged.last_mut() {
-            Some(last) if last.tag == t.tag && t.range.start <= last.range.end => {
+            Some(last)
+                if last.tag == t.tag
+                    && t.range.start <= last.range.end
+                    && !matches!(t.tag, Tag::CustomEmoji(_)) =>
+            {
                 last.range.end = last.range.end.max(t.range.end);
             }
             _ => merged.push(t),
@@ -355,6 +361,22 @@ fn shift_tags(tags: &mut [TagSpan], range: Range<usize>, inserted: usize) {
     let s = range.start;
     for t in tags.iter_mut() {
         let (mut a, mut b) = (map(t.range.start), map(t.range.end));
+        if let Tag::CustomEmoji(_) = t.tag {
+            // One object: text typed after it is not part of it, an edit inside or
+            // of a part of it removes it.
+            let whole = t.range.len();
+            if inserted > 0 && a >= s {
+                a += inserted;
+                b += inserted;
+            } else if inserted > 0 && a < s && s < b {
+                b = a;
+            }
+            if b - a != whole {
+                b = a;
+            }
+            t.range = a..b;
+            continue;
+        }
         if inserted > 0 {
             if a < s && s <= b {
                 b += inserted;
@@ -1006,6 +1028,22 @@ impl TextInput {
         }
     }
 
+    /// `InsertCustomEmojiAtCursor`: the custom emoji `id` over its fallback emoji
+    /// `alt` in place of the selection, the caret after it.
+    pub fn insert_custom_emoji(&mut self, alt: &str, id: i64, cx: &mut Context<Self>) {
+        let r = self.selected_range.clone();
+        self.edit(r.clone(), alt, EditKind::Other);
+        let end = r.start + alt.len();
+        self.tags.push(TagSpan {
+            range: r.start..end,
+            tag: Tag::CustomEmoji(id),
+        });
+        normalize(&self.content, &mut self.tags);
+        self.selected_range = end..end;
+        self.last_edit = None;
+        cx.notify();
+    }
+
     /// `InsertEmojiAtCursor`: `text` in place of the selection, the caret after it.
     pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
         let r = self.selected_range.clone();
@@ -1237,6 +1275,7 @@ impl TextInput {
                     Tag::Pre => Kind::Pre(String::new()),
                     Tag::Blockquote => Kind::Blockquote,
                     Tag::Spoiler => Kind::Spoiler,
+                    Tag::CustomEmoji(id) => Kind::CustomEmoji(id),
                 },
             })
             .collect();
@@ -1797,6 +1836,7 @@ pub fn out_entities(text: &str, tags: &[TagSpan]) -> Vec<tdr_data::OutEntity> {
                     Tag::Pre => OutKind::Pre(String::new()),
                     Tag::Blockquote => OutKind::Blockquote,
                     Tag::Spoiler => OutKind::Spoiler,
+                    Tag::CustomEmoji(id) => OutKind::CustomEmoji(id),
                 },
             }
         })
