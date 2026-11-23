@@ -5736,6 +5736,15 @@ name = "tdr-emoji"
 version = "0.1.0"
 
 [[package]]
+name = "tdr-lottie"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "serde_json",
+ "tiny-skia",
+]
+
+[[package]]
 name = "tdr-mtproto"
 version = "0.1.0"
 dependencies = [
