@@ -3157,6 +3157,7 @@ fn demo_custom_emoji(id: i64) -> Option<Update> {
             text_color: false,
             free: false,
             sticker: false,
+            path: None,
         },
         bytes: bytes.to_vec(),
     })

@@ -44,6 +44,9 @@ pub struct EmojiDocument {
     pub free: bool,
     /// A sticker (not an emoji): the stickers stage uses it.
     pub sticker: bool,
+    /// The vector thumbnail (`photoPathSize`, Telegram's compressed SVG path in
+    /// a 512 square), drawn while the file loads.
+    pub path: Option<Vec<u8>>,
 }
 
 /// The document of a TL object, if it is a custom emoji or a sticker.
@@ -69,6 +72,10 @@ pub fn emoji_document(doc: &enums::Document) -> Option<EmojiDocument> {
         text_color: false,
         free: false,
         sticker: false,
+        path: d.thumbs.iter().flatten().find_map(|t| match t {
+            enums::PhotoSize::PhotoPathSize(p) => Some(p.bytes.to_vec()),
+            _ => None,
+        }),
     };
     let set_of = |s: &enums::InputStickerSet| match s {
         enums::InputStickerSet::ID(id) => Some((id.id, id.access_hash)),

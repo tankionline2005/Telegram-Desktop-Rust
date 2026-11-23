@@ -35,12 +35,40 @@ pub(super) struct SetBox {
     pub set: SetRef,
     /// `None` while loading, `Some(None)` when not found.
     pub loaded: Option<Option<EmojiSet>>,
+    /// The title's link under the mouse (its word's index).
+    pub link_over: Option<usize>,
+    /// The emoji under the mouse.
+    pub over: Option<usize>,
+}
+
+/// A link in a set's title: a mention (`TextParseMentions`) or an address, with
+/// the punctuation after it left out. The word's link part and where it goes.
+fn title_link(word: &str) -> Option<(usize, String)> {
+    if let Some(name) = word.strip_prefix('@') {
+        let len = name
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(name.len());
+        return (len >= 4).then(|| (len + 1, format!("https://t.me/{}", &name[..len])));
+    }
+    let lower = word.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("t.me/") {
+        let len = word
+            .trim_end_matches(['.', ',', ')', '!', '?', ';', ':'])
+            .len();
+        return Some((len, word[..len].to_string()));
+    }
+    None
 }
 
 impl MainView {
     pub(super) fn open_emoji_set_box(&mut self, set: SetRef) {
         let _ = self.commands.send(Command::LoadEmojiSet(set.clone()));
-        self.emoji_set_box = Some(SetBox { set, loaded: None });
+        self.emoji_set_box = Some(SetBox {
+            set,
+            loaded: None,
+            link_over: None,
+            over: None,
+        });
         self.layers.show_layer(LayerBox::EmojiSet);
     }
 
@@ -144,20 +172,52 @@ impl MainView {
             ),
             Some(Some(set)) => (set.info.title.clone(), Some(set.clone())),
         };
-        // The title's mentions are links (`TextParseMentions`).
+        // The title's mentions and links open (`TextParseMentions`), underlined
+        // under the mouse.
+        let link_over = self.emoji_set_box.as_ref().and_then(|b| b.link_over);
         let mut title_row = div().flex().flex_wrap().min_w(px(0.));
         for (k, word) in title.split(' ').enumerate() {
-            let mention = word.starts_with('@') && word.len() > 1;
-            title_row = title_row.child(
-                div()
-                    .when(k > 0, |d| d.ml(gpui::px(lg(4.))))
-                    .text_color(c(if mention {
-                        p.window_active_text_fg
-                    } else {
-                        p.box_title_fg
-                    }))
-                    .child(word.to_string()),
-            );
+            let mut cell = div().flex().when(k > 0, |d| d.ml(gpui::px(lg(4.))));
+            match title_link(word) {
+                Some((len, url)) => {
+                    let over = link_over == Some(k);
+                    cell = cell
+                        .child(
+                            div()
+                                .id(("emoji-set-title-link", k))
+                                .cursor_pointer()
+                                .text_color(c(p.window_active_text_fg))
+                                .when(over, |d| d.underline())
+                                .child(word[..len].to_string())
+                                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                    if let Some(b) = &mut this.emoji_set_box {
+                                        b.link_over = if *hovered {
+                                            Some(k)
+                                        } else {
+                                            b.link_over.filter(|o| *o != k)
+                                        };
+                                    }
+                                    cx.notify();
+                                }))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.layers.hide_layer();
+                                    this.open_url(&url, window, cx);
+                                    cx.notify();
+                                })),
+                        )
+                        .when(len < word.len(), |d| {
+                            d.child(
+                                div()
+                                    .text_color(c(p.box_title_fg))
+                                    .child(word[len..].to_string()),
+                            )
+                        });
+                }
+                None => {
+                    cell = cell.text_color(c(p.box_title_fg)).child(word.to_string());
+                }
+            }
+            title_row = title_row.child(cell);
         }
         let header = div()
             .flex_none()
@@ -222,6 +282,9 @@ impl MainView {
         let rows = ids.len().div_ceil(PER_ROW);
         let grid_h = rows as f32 * lg(CELL.1);
         let text_fg = p.window_fg;
+        // `PathShiftGradient(windowBgRipple, windowBgOver)` over loading emoji.
+        let (shimmer_bg, shimmer_fg): (gpui::Rgba, gpui::Rgba) =
+            (c(p.window_bg_ripple), c(p.window_bg_over));
         let side = crate::custom_emoji::size_large();
         let grid = canvas(
             |_, _, _| {},
@@ -238,18 +301,66 @@ impl MainView {
                     if at.y > clip.bottom() || at.y + gpui::px(s) < clip.top() {
                         continue;
                     }
-                    crate::custom_emoji::paint(*id, at, side, c(text_fg).into(), window);
+                    crate::custom_emoji::paint_ex(
+                        *id,
+                        at,
+                        side,
+                        c(text_fg).into(),
+                        crate::custom_emoji::Loading::Shimmer {
+                            left: f32::from(bounds.origin.x),
+                            width: f32::from(bounds.size.width),
+                            bg: shimmer_bg,
+                            fg: shimmer_fg,
+                        },
+                        window,
+                    );
                 }
             },
         )
         .w_full()
         .h(gpui::px(grid_h));
+        // Each emoji is chosen into the field (`processChosenSticker`), on the
+        // rounded `emojiPanHover` under the mouse; the box stays.
+        let over = self.emoji_set_box.as_ref().and_then(|b| b.over);
+        let count = set.as_ref().map_or(0, |s| s.emoji.len());
+        let mut cells = div().relative().w_full().h(gpui::px(grid_h));
+        for k in 0..count {
+            let id = set.as_ref().map_or(0, |s| s.emoji[k].id);
+            let x = lg(PADDING) + (k % PER_ROW) as f32 * lg(CELL.0);
+            let y = (k / PER_ROW) as f32 * lg(CELL.1);
+            cells = cells.child(
+                div()
+                    .id(("emoji-set-cell", k))
+                    .absolute()
+                    .left(gpui::px(x))
+                    .top(gpui::px(y))
+                    .w(gpui::px(lg(CELL.0)))
+                    .h(gpui::px(lg(CELL.1)))
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .when(over == Some(k), |d| d.bg(c(p.window_bg_over)))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if let Some(b) = &mut this.emoji_set_box {
+                            b.over = if *hovered {
+                                Some(k)
+                            } else {
+                                b.over.filter(|o| *o != k)
+                            };
+                        }
+                        cx.notify();
+                    }))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.choose_custom(id, window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
         let list = div()
             .id("emoji-set-list")
             .flex_none()
             .h(gpui::px(grid_h.clamp(lg(CELL.1), lg(MAX_HEIGHT))))
             .overflow_y_scroll()
-            .child(grid);
+            .child(cells.child(div().absolute().left_0().top_0().size_full().child(grid)));
 
         // The bottom button.
         let button = set.as_ref().map(|set| {

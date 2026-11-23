@@ -164,6 +164,8 @@ pub enum Icon {
     MenuCancel,
     MenuRestore,
     PremiumLock,
+    /// `emojiEmpty`: the panel's search found nothing.
+    EmojiEmpty,
     SmallClose,
     MenuDiscussion,
     MenuNetwork,
@@ -318,6 +320,7 @@ impl Icon {
             Icon::MenuCancel => Source::Png(icon_bytes!("menu__cancel")),
             Icon::MenuRestore => Source::Png(icon_bytes!("menu__restore")),
             Icon::PremiumLock => Source::Png(icon_bytes!("emoji__premium_lock")),
+            Icon::EmojiEmpty => Source::Png(icon_bytes!("emoji_empty")),
             Icon::SmallClose => Source::Png(icon_bytes!("simple_close")),
             Icon::MenuDiscussion => Source::Png(icon_bytes!("menu__discussion")),
             Icon::InfoClose => Source::Png(icon_bytes!("info__info_close")),

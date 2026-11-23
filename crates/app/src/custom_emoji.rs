@@ -31,6 +31,41 @@ pub struct Info {
     pub set: Option<(i64, i64)>,
     pub text_color: bool,
     pub free: bool,
+    /// The vector thumbnail (`photoPathSize`), drawn while loading.
+    pub path: Option<Arc<resvg::tiny_skia::Path>>,
+}
+
+impl Info {
+    fn of(doc: &EmojiDocument) -> Self {
+        Self {
+            alt: doc.alt.clone(),
+            set: doc.set,
+            text_color: doc.text_color,
+            free: doc.free,
+            path: doc
+                .path
+                .as_deref()
+                .and_then(crate::vector_thumb::parse)
+                .map(Arc::new),
+        }
+    }
+}
+
+/// What is drawn while an emoji loads (`Ui::CustomEmoji::Loading`).
+#[derive(Clone, Copy)]
+pub enum Loading {
+    /// The thumbnail's silhouette in the text color at an eighth of its alpha
+    /// (`PreviewColorFromTextColor`).
+    Silhouette,
+    /// `PathShiftGradient` (the set box): the silhouette in `bg` with a band of
+    /// `fg` sliding over `left..left + width` (logical, window) for a second,
+    /// then a second of rest.
+    Shimmer {
+        left: f32,
+        width: f32,
+        bg: gpui::Rgba,
+        fg: gpui::Rgba,
+    },
 }
 
 enum Doc {
@@ -213,6 +248,8 @@ struct State {
     wanted: Vec<i64>,
     instances: HashMap<Key, Instance>,
     shown: HashMap<(i64, u32, u32), Shown>,
+    /// Loading silhouettes on screen (`Loading`), by emoji and size.
+    loading: HashMap<(i64, u32), Shown>,
     /// Images replaced or dropped, removed from the atlas at the next frame.
     retired: Vec<Arc<RenderImage>>,
     /// Window paints so far (`begin_frame`).
@@ -541,6 +578,18 @@ pub fn begin_frame(window: &mut Window) {
                 s.retired.push(v.image);
             }
         }
+        // Silhouettes of emoji that loaded or went away.
+        let stale: Vec<_> = s
+            .loading
+            .iter()
+            .filter(|(_, v)| now.duration_since(v.painted) > Duration::from_millis(100))
+            .map(|(k, _)| *k)
+            .collect();
+        for key in stale {
+            if let Some(v) = s.loading.remove(&key) {
+                s.retired.push(v.image);
+            }
+        }
         if s.counter.is_multiple_of(60) {
             trim(s, now);
         }
@@ -609,15 +658,7 @@ fn want_in(s: &mut State, id: i64) {
 /// The document and file came.
 pub fn loaded(doc: &EmojiDocument, bytes: Vec<u8>) {
     with(|s| {
-        s.info.insert(
-            doc.id,
-            Info {
-                alt: doc.alt.clone(),
-                set: doc.set,
-                text_color: doc.text_color,
-                free: doc.free,
-            },
-        );
+        s.info.insert(doc.id, Info::of(doc));
         s.docs.insert(
             doc.id,
             Doc::File {
@@ -644,12 +685,7 @@ pub fn info(id: i64) -> Option<Info> {
 /// Remembers a document's details without its file (from a set's list).
 pub fn remember(doc: &EmojiDocument) {
     with(|s| {
-        s.info.entry(doc.id).or_insert_with(|| Info {
-            alt: doc.alt.clone(),
-            set: doc.set,
-            text_color: doc.text_color,
-            free: doc.free,
-        });
+        s.info.entry(doc.id).or_insert_with(|| Info::of(doc));
     });
 }
 
@@ -660,6 +696,18 @@ pub fn paint(
     origin: Point<Pixels>,
     side: u32,
     color: gpui::Hsla,
+    window: &mut Window,
+) -> bool {
+    paint_ex(id, origin, side, color, Loading::Silhouette, window)
+}
+
+/// `paint` with what to draw while it loads.
+pub fn paint_ex(
+    id: i64,
+    origin: Point<Pixels>,
+    side: u32,
+    color: gpui::Hsla,
+    loading: Loading,
     window: &mut Window,
 ) -> bool {
     let _timer = crate::profile::Timer::new("custom_emoji::paint");
@@ -681,7 +729,7 @@ pub fn paint(
             if has_file && job == Job::Idle {
                 queue(s, key, true);
             }
-            return None;
+            return Err(s.info.get(&id).and_then(|i| i.path.clone()));
         }
         if !paused {
             i.advance(now, counter);
@@ -705,9 +753,13 @@ pub fn paint(
                 v.image.clone()
             }
             _ => {
-                let i = s.instances.get_mut(&key)?;
+                let Some(i) = s.instances.get_mut(&key) else {
+                    return Err(None);
+                };
                 let alpha_only = i.alpha_only;
-                let pixels = i.unpack(frame)?;
+                let Some(pixels) = i.unpack(frame) else {
+                    return Err(None);
+                };
                 let bgra: Vec<u8> = if alpha_only {
                     let (r, g, b) = (
                         (color_key >> 24) as u8,
@@ -739,18 +791,135 @@ pub fn paint(
         if more {
             queue(s, key, false);
         }
-        Some(image)
+        Ok(image)
     });
-    let Some(image) = image else {
-        return false;
-    };
     let scale = window.scale_factor();
     let x = (f32::from(origin.x) * scale).round() / scale;
     let y = (f32::from(origin.y) * scale).round() / scale;
     let side_l = side as f32 / scale;
     let bounds = Bounds::new(point(px(x), px(y)), size(px(side_l), px(side_l)));
-    let _ = window.paint_image(bounds, Corners::default(), image, 0, false);
-    true
+    match image {
+        Ok(image) => {
+            let _ = window.paint_image(bounds, Corners::default(), image, 0, false);
+            true
+        }
+        Err(Some(path)) => {
+            if let Some(image) = loading_image(id, side, &path, color, loading, x, scale) {
+                let _ = window.paint_image(bounds, Corners::default(), image, 0, false);
+            }
+            false
+        }
+        Err(None) => false,
+    }
+}
+
+/// `PathShiftGradient`'s slide and rest.
+const SHIMMER_SLIDE_MS: u128 = 1000;
+const SHIMMER_FULL_MS: u128 = 2000;
+
+static SHIMMER_START: OnceLock<Instant> = OnceLock::new();
+
+/// The loading silhouette of `id` (cached while it looks the same).
+fn loading_image(
+    id: i64,
+    side: u32,
+    path: &resvg::tiny_skia::Path,
+    color: gpui::Hsla,
+    loading: Loading,
+    x: f32,
+    scale: f32,
+) -> Option<Arc<RenderImage>> {
+    use resvg::tiny_skia::{
+        Color, FillRule, GradientStop, LinearGradient, Paint, Pixmap, Shader, SpreadMode, Transform,
+    };
+    let to_color = |c: gpui::Rgba, a: f32| {
+        Color::from_rgba(c.r, c.g, c.b, a.clamp(0., 1.)).unwrap_or(Color::TRANSPARENT)
+    };
+    let byte = |v: f32| (v.clamp(0., 1.) * 255.).round() as u64;
+    let now = SHIMMER_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis();
+    // What the image depends on: the colors and the band's place.
+    let (look, shader): (u64, Shader) = match loading {
+        Loading::Silhouette => {
+            let c = gpui::Rgba::from(color);
+            // `PreviewColorFromTextColor`: an eighth of the alpha.
+            let a = ((c.a * 255. + 1.) / 8.).floor() / 255.;
+            let look = byte(c.r) << 24 | byte(c.g) << 16 | byte(c.b) << 8 | byte(a);
+            (look, Shader::SolidColor(to_color(c, a)))
+        }
+        Loading::Shimmer {
+            left,
+            width,
+            bg,
+            fg,
+        } => {
+            let period = now % SHIMMER_FULL_MS;
+            let colors = byte(bg.r) << 40 | byte(bg.g) << 32 | byte(fg.r) << 24;
+            if period >= SHIMMER_SLIDE_MS {
+                crate::repaint::after_ms((SHIMMER_FULL_MS - period) as u64);
+                (colors, Shader::SolidColor(to_color(bg, bg.a)))
+            } else {
+                crate::repaint::after_ms(16);
+                let progress = period as f32 / SHIMMER_SLIDE_MS as f32;
+                let gw = width / 2.;
+                let start = (left - gw) + (width + gw) * progress;
+                let sx = ((start - x) * scale).round();
+                let shader = LinearGradient::new(
+                    resvg::tiny_skia::Point::from_xy(sx, 0.),
+                    resvg::tiny_skia::Point::from_xy(sx + gw * scale, 0.),
+                    vec![
+                        GradientStop::new(0., to_color(bg, bg.a)),
+                        GradientStop::new(0.5, to_color(fg, fg.a)),
+                        GradientStop::new(1., to_color(bg, bg.a)),
+                    ],
+                    SpreadMode::Pad,
+                    Transform::identity(),
+                )
+                .unwrap_or(Shader::SolidColor(to_color(bg, bg.a)));
+                (colors | 1 << 63 | ((sx as i64 as u64) & 0xFFFF), shader)
+            }
+        }
+    };
+    let look = look as usize;
+    let now_i = Instant::now();
+    let cached = with(|s| {
+        let v = s.loading.get_mut(&(id, side))?;
+        v.painted = now_i;
+        (v.frame == look).then(|| v.image.clone())
+    });
+    if cached.is_some() {
+        return cached;
+    }
+    let mut pixmap = Pixmap::new(side.max(1), side.max(1))?;
+    let paint = Paint {
+        shader,
+        anti_alias: true,
+        ..Paint::default()
+    };
+    let k = side as f32 / 512.;
+    pixmap.fill_path(
+        path,
+        &paint,
+        FillRule::EvenOdd,
+        Transform::from_scale(k, k),
+        None,
+    );
+    let image = crate::vector::to_image(&pixmap);
+    with(|s| {
+        if let Some(old) = s.loading.insert(
+            (id, side),
+            Shown {
+                frame: look,
+                image: image.clone(),
+                painted: now_i,
+            },
+        ) {
+            s.retired.push(old.image);
+        }
+    });
+    Some(image)
 }
 
 /// `Ui::Emoji::GetCustomSizeNormal`: device pixels of a custom emoji in text.

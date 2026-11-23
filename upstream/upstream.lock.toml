@@ -2683,3 +2683,18 @@ path = "assets/tdesktop-icons/simple_close@3x.png"
 upstream = "icons/simple_close@3x.png"
 submodule = "Telegram/lib_ui"
 sha256 = "59f0e5be3cac0542ed6e627533ccb3fc76e780597637eb6958acb3eae968014a"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji_empty.png"
+upstream = "Telegram/Resources/icons/emoji_empty.png"
+sha256 = "b1a1ec2736f36b5874f1852d714f1286c9ad5091eb8a6c8df02faca22c7a9700"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji_empty@2x.png"
+upstream = "Telegram/Resources/icons/emoji_empty@2x.png"
+sha256 = "e270e03082d777b693f62db845774203322b1316e5ab69315cd5072e65d7c983"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji_empty@3x.png"
+upstream = "Telegram/Resources/icons/emoji_empty@3x.png"
+sha256 = "8bb91e800b75fde060cc09bb750f6085f926ff02699d341db2d16524ec5f36e5"

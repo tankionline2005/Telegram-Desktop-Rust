@@ -37,6 +37,7 @@ mod tray;
 mod tray_menu;
 mod ui;
 mod vector;
+mod vector_thumb;
 mod wallpaper;
 
 use std::borrow::Cow;

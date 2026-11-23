@@ -716,10 +716,10 @@ impl MainView {
 
     /// A custom emoji chosen (`selectCustom`): into the field, unless it needs
     /// Premium here (then the toast about it).
-    fn choose_custom(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn choose_custom(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let info = crate::custom_emoji::info(id);
         let free = info.as_ref().is_some_and(|i| i.free);
-        if self.emoji_panel.locked && !free {
+        if self.custom_emoji_locked(cx) && !free {
             self.show_toast("Subscribe to Telegram Premium to unlock this emoji.", None);
             return;
         }
@@ -1987,6 +1987,47 @@ impl MainView {
                     .child(icon(Icon::EmojiSkin, skin_color, window))
             });
         let has_query = !self.emoji_panel.query.is_empty();
+        // `paintEmptySearchResults`: the icon at a third of the height, the
+        // text near its bottom.
+        let empty = self
+            .emoji_panel
+            .results
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+            .then(|| {
+                let f = scale::font(13.);
+                let line = f32::from(f.line_height());
+                let (icon_w, icon_h) = (lg(140.), lg(140.));
+                let h = layout.height;
+                let icon_top = ((h / 3.) - icon_h / 2.).max(line).floor();
+                let text_top = (icon_top + icon_h - line).min(h - 2. * line);
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .w(gpx(width))
+                    .h(gpx(h))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(gpx(((width - icon_w) / 2.).floor()))
+                            .top(gpx(icon_top))
+                            .child(icon(Icon::EmojiEmpty, p.window_sub_text_fg, window)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top(gpx(text_top))
+                            .w(gpx(width))
+                            .flex()
+                            .justify_center()
+                            .text_size(f.size)
+                            .line_height(f.line_height())
+                            .text_color(c(p.window_sub_text_fg))
+                            .child("No emoji found"),
+                    )
+            });
         let cancel_color = if self.emoji_panel.cancel_over {
             p.emoji_sub_icon_fg_active
         } else {
@@ -2087,6 +2128,7 @@ impl MainView {
             .child(list)
             .children(color_all)
             .children(search)
+            .children(empty)
             .into_any_element()
     }
 

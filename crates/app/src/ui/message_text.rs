@@ -667,7 +667,7 @@ impl MainView {
     }
 
     /// A link: t.me links open here (`TryConvertUrlToLocal`), the rest in the browser.
-    fn open_url(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_url(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         match local_link(url) {
             Some(LocalLink::Username { name, post }) => {
                 let _ = self.commands.send(Command::OpenUsername {
