@@ -993,9 +993,20 @@ impl Animation {
         }
     }
 
-    /// The layer's own time for its properties.
-    fn local(layer: &Layer, frame: f64) -> f64 {
-        (frame - layer.st) / layer.sr
+    /// The layer's own time for its properties: rlottie evaluates a layer's
+    /// transform, shapes and masks at its composition's frame (`mFrameNo`); the
+    /// start time and the stretch only move a precomp's children (`timeRemap`).
+    fn local(_layer: &Layer, frame: f64) -> f64 {
+        frame
+    }
+
+    /// `model::Layer::timeRemap`: the frame of a precomp's children.
+    fn child_frame(&self, layer: &Layer, frame: f64) -> f64 {
+        let f = match &layer.tm {
+            Some(tm) => tm.f(frame) * self.frame_rate,
+            None => frame - layer.st,
+        };
+        (f / layer.sr).trunc()
     }
 
     fn layer_matrix(&self, layers: &[Layer], layer: &Layer, frame: f64, depth: usize) -> Transform {
@@ -1100,10 +1111,7 @@ impl Animation {
                 else {
                     return;
                 };
-                let child_frame = match &layer.tm {
-                    Some(tm) => tm.f(local) * self.frame_rate,
-                    None => local,
-                };
+                let child_frame = self.child_frame(layer, frame);
                 self.draw_layers(children, child_frame, m, alpha, pixmap, depth + 1);
             }
             1 => {

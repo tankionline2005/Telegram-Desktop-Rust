@@ -12,6 +12,8 @@ name = "tdr"
 path = "src/main.rs"
 
 [dependencies]
+flate2 = "1.1"
+serde_json = "1"
 tdr-tl.workspace = true
 tdr-crypto.workspace = true
 tdr-mtproto.workspace = true

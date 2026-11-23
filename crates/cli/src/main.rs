@@ -122,6 +122,7 @@ async fn main() -> Result<()> {
         ["probe", "folders"] => probe_folders().await,
         ["probe", "emoji"] => probe_emoji().await,
         ["probe", "emoji-speed"] => probe_emoji_speed().await,
+        ["probe", "saved-emoji", dir] => probe_saved_emoji(dir).await,
         ["probe", "login"] => probe_login().await,
         ["logout"] => logout().await,
         ["selftest", "reconnect"] => selftest_reconnect().await,
@@ -976,6 +977,151 @@ fn packed_size(cur: &[u8], prev: Option<&[u8]>) -> usize {
         size += var(lit - start) + var(i - lit) + (i - lit);
     }
     size
+}
+
+/// The custom emoji of the last message in Saved Messages (ids and the Lottie
+/// features they use, no text): their files go to `dir` for contact sheets.
+async fn probe_saved_emoji(dir: &str) -> Result<()> {
+    use std::io::Read;
+    let client = logged_in()?;
+    let r = client
+        .invoke(&functions::messages::GetHistory {
+            peer: enums::InputPeer::InputPeerSelf,
+            offset_id: 0,
+            offset_date: 0,
+            add_offset: 0,
+            limit: 1,
+            max_id: 0,
+            min_id: 0,
+            hash: 0,
+        })
+        .await?;
+    let messages = match r {
+        enums::messages::Messages::Messages(m) => m.messages,
+        enums::messages::Messages::Slice(m) => m.messages,
+        enums::messages::Messages::ChannelMessages(m) => m.messages,
+        enums::messages::Messages::NotModified(_) => vec![],
+    };
+    let mut ids: Vec<i64> = Vec::new();
+    for m in &messages {
+        if let enums::Message::Message(m) = m {
+            for e in m.entities.iter().flatten() {
+                if let enums::MessageEntity::CustomEmoji(e) = e
+                    && !ids.contains(&e.document_id)
+                {
+                    ids.push(e.document_id);
+                }
+            }
+        }
+    }
+    println!("custom emoji in the last saved message: {}", ids.len());
+    let docs = tdr_data::emoji_sets::custom_emoji_documents(&client, &ids).await?;
+    std::fs::create_dir_all(dir)?;
+    for raw in docs {
+        let Some(doc) = tdr_data::emoji_sets::emoji_document(&raw) else {
+            continue;
+        };
+        let bytes = tdr_data::emoji_sets::download_document(&client, &doc).await?;
+        let ext = match doc.format {
+            tdr_data::emoji_sets::EmojiFormat::Tgs => "tgs",
+            tdr_data::emoji_sets::EmojiFormat::Webm => "webm",
+            tdr_data::emoji_sets::EmojiFormat::Webp => "webp",
+        };
+        std::fs::write(format!("{dir}/{}.{ext}", doc.id), &bytes)?;
+        if ext != "tgs" {
+            println!("{} {ext}", doc.id);
+            continue;
+        }
+        let mut json = String::new();
+        flate2::read::GzDecoder::new(&bytes[..]).read_to_string(&mut json)?;
+        let v: serde_json::Value = serde_json::from_str(&json)?;
+        let mut features = std::collections::BTreeMap::<String, usize>::new();
+        fn walk(
+            v: &serde_json::Value,
+            f: &mut std::collections::BTreeMap<String, usize>,
+            in_layer: bool,
+        ) {
+            match v {
+                serde_json::Value::Object(o) => {
+                    if in_layer && o.contains_key("ty") && o.contains_key("ip") {
+                        *f.entry(format!("layer ty {}", o["ty"])).or_default() += 1;
+                        for k in [
+                            "tt", "tp", "td", "hasMask", "ef", "sy", "ao", "ct", "hd", "sr", "tm",
+                            "parent",
+                        ] {
+                            if o.contains_key(k) {
+                                *f.entry(format!("layer.{k}={}", o[k])).or_default() += 1;
+                            }
+                        }
+                        if let Some(b) = o.get("bm")
+                            && b != 0
+                        {
+                            *f.entry(format!("layer.bm={b}")).or_default() += 1;
+                        }
+                        if let Some(st) = o.get("st")
+                            && st != 0
+                        {
+                            *f.entry("layer.st!=0".into()).or_default() += 1;
+                        }
+                        if let Some(m) = o.get("masksProperties").and_then(|m| m.as_array()) {
+                            for m in m {
+                                *f.entry(format!(
+                                    "mask mode {} inv {}",
+                                    m["mode"],
+                                    m.get("inv").unwrap_or(&serde_json::Value::Null)
+                                ))
+                                .or_default() += 1;
+                            }
+                        }
+                    }
+                    if let Some(ty) = o.get("ty").and_then(|t| t.as_str()) {
+                        *f.entry(format!("shape {ty}")).or_default() += 1;
+                        if o.get("hd") == Some(&serde_json::Value::Bool(true)) {
+                            *f.entry(format!("shape {ty} hidden")).or_default() += 1;
+                        }
+                        if ty == "tm" && o.contains_key("m") {
+                            *f.entry(format!("tm.m={}", o["m"])).or_default() += 1;
+                        }
+                        if (ty == "fl" || ty == "gf") && o.contains_key("r") {
+                            *f.entry(format!("{ty}.r={}", o["r"])).or_default() += 1;
+                        }
+                        if let Some(b) = o.get("bm")
+                            && b != 0
+                        {
+                            *f.entry(format!("{ty}.bm={b}")).or_default() += 1;
+                        }
+                        if ty == "gr" && o.contains_key("np") {
+                            // fine
+                        }
+                    }
+                    for (k, x) in o {
+                        walk(x, f, in_layer || k == "layers");
+                    }
+                }
+                serde_json::Value::Array(a) => {
+                    for x in a {
+                        walk(x, f, in_layer);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(&v, &mut features, false);
+        println!(
+            "{} tgs fr {} ip {} op {} w {} h {} assets {}",
+            doc.id,
+            v["fr"],
+            v["ip"],
+            v["op"],
+            v["w"],
+            v["h"],
+            v["assets"].as_array().map_or(0, |a| a.len())
+        );
+        for (k, n) in features {
+            println!("    {k}: {n}");
+        }
+    }
+    Ok(())
 }
 
 async fn probe_folders() -> Result<()> {
