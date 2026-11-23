@@ -76,6 +76,8 @@ pub enum Command {
     LoadCustomEmoji(Vec<i64>),
     /// The installed and featured emoji sets (the emoji panel).
     LoadEmojiSets,
+    /// The emoji search's groups (`messages.getEmojiGroups`).
+    LoadEmojiGroups,
     /// Emoji keywords: which of `languages` the server has, then each one's
     /// keywords since the version kept (`versions`).
     RefreshEmojiKeywords {
@@ -173,6 +175,8 @@ pub enum Update {
         version: i32,
         changes: Vec<tdr_data::emoji_keywords::KeywordChange>,
     },
+    /// The emoji search's groups.
+    EmojiGroups(Vec<tdr_data::emoji_sets::EmojiGroup>),
     /// The installed emoji sets (the user's order) and the featured ones.
     EmojiSets {
         installed: Vec<EmojiSet>,
@@ -2672,6 +2676,18 @@ async fn run(
                         Err(e) => error!("read: {e}"),
                     },
                     Command::LoadCustomEmoji(_) => {}
+                    Command::LoadEmojiGroups => {
+                        let client = client.clone();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            match tdr_data::emoji_sets::emoji_groups(&client).await {
+                                Ok(groups) => {
+                                    let _ = tx.send(Update::EmojiGroups(groups));
+                                }
+                                Err(e) => tracing::debug!("emoji groups: {e}"),
+                            }
+                        });
+                    }
                     Command::RefreshEmojiKeywords { languages, versions } => {
                         let client = client.clone();
                         let tx = tx.clone();
@@ -3999,6 +4015,22 @@ pub fn start_demo(
                 }
                 Command::LoadEmojiSets => {
                     let _ = up_tx.send(demo_emoji_sets());
+                }
+                Command::LoadEmojiGroups => {
+                    let group = |title: &str, icon: usize, emoticons: &[&str]| {
+                        tdr_data::emoji_sets::EmojiGroup {
+                            title: title.into(),
+                            icon: DEMO_CUSTOM_EMOJI[icon].0,
+                            emoticons: emoticons.iter().map(|e| (*e).to_string()).collect(),
+                            premium: false,
+                        }
+                    };
+                    let _ = up_tx.send(Update::EmojiGroups(vec![
+                        group("Greetings", 0, &["👋", "🤝", "🙂"]),
+                        group("Celebrate", 1, &["🎉", "🥳", "🎂"]),
+                        group("Wow", 2, &["😮", "🤩", "💎"]),
+                        group("Robots", 3, &["🤖", "👾"]),
+                    ]));
                 }
                 Command::LoadCustomEmoji(ids) => {
                     for id in ids {

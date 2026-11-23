@@ -393,3 +393,47 @@ pub async fn set_emoji_status(
 pub fn decode_document(blob: &[u8]) -> Option<EmojiDocument> {
     decode::<enums::Document>(blob).and_then(|d| emoji_document(&d))
 }
+
+/// A group of the emoji search (`messages.getEmojiGroups`): its icon (a custom
+/// emoji) and the emoji it stands for; the Premium group stands for premium
+/// custom emoji.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EmojiGroup {
+    pub title: String,
+    pub icon: i64,
+    pub emoticons: Vec<String>,
+    pub premium: bool,
+}
+
+/// `messages.getEmojiGroups`.
+pub async fn emoji_groups(client: &Client) -> Result<Vec<EmojiGroup>> {
+    let answer = client
+        .invoke(&functions::messages::GetEmojiGroups { hash: 0 })
+        .await?;
+    let enums::messages::EmojiGroups::EmojiGroups(g) = answer else {
+        return Ok(Vec::new());
+    };
+    Ok(g.groups
+        .into_iter()
+        .map(|g| match g {
+            enums::EmojiGroup::EmojiGroup(g) => EmojiGroup {
+                title: g.title,
+                icon: g.icon_emoji_id,
+                emoticons: g.emoticons,
+                premium: false,
+            },
+            enums::EmojiGroup::Greeting(g) => EmojiGroup {
+                title: g.title,
+                icon: g.icon_emoji_id,
+                emoticons: g.emoticons,
+                premium: false,
+            },
+            enums::EmojiGroup::Premium(g) => EmojiGroup {
+                title: g.title,
+                icon: g.icon_emoji_id,
+                emoticons: Vec::new(),
+                premium: true,
+            },
+        })
+        .collect())
+}

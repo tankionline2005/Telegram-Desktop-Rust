@@ -2698,3 +2698,18 @@ sha256 = "e270e03082d777b693f62db845774203322b1316e5ab69315cd5072e65d7c983"
 path = "assets/tdesktop-icons/emoji_empty@3x.png"
 upstream = "Telegram/Resources/icons/emoji_empty@3x.png"
 sha256 = "8bb91e800b75fde060cc09bb750f6085f926ff02699d341db2d16524ec5f36e5"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_back.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_back.png"
+sha256 = "ee64c24ac1815406a6a4b18ef0644b494ffbe3d5ba04b21153e6edafc7299070"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_back@2x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_back@2x.png"
+sha256 = "f1ae558e2e2325ea36d8456bd209e4ef61a13e490219018ae5b749dd7ed04bab"
+
+[[vendored]]
+path = "assets/tdesktop-icons/emoji__emoji_back@3x.png"
+upstream = "Telegram/Resources/icons/emoji/emoji_back@3x.png"
+sha256 = "50a5c4405b6f36d1c4706a11c52120e0969e7f089cec588ca3699c712714d87b"

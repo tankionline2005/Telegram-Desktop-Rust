@@ -1978,6 +1978,10 @@ impl MainView {
                 crate::emoji_suggest::apply_difference(remote, &lang, version, changes);
                 self.emoji_keywords_came(cx);
             }
+            Update::EmojiGroups(groups) => {
+                self.emoji_panel.groups = groups;
+                cx.notify();
+            }
             Update::EmojiSets {
                 installed,
                 featured,
