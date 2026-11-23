@@ -5670,7 +5670,6 @@ dependencies = [
  "flate2",
  "gpui",
  "image",
- "lyon",
  "qrcode",
  "raw-window-handle",
  "resvg",

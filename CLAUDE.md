@@ -184,3 +184,9 @@
   on screen as a GPU image (`custom_emoji`: frames in memory, old images dropped from
   the atlas each frame). Performance switches: `TDR_PROFILE=1` prints timings to stderr,
   `TDR_OFF=tails,spoilers,emoji,shadows,text,view` turns parts off (`profile.rs`).
+- Never call `window.paint_path`: GPUI 0.2.2 draws every batch of paths through a
+  window-sized 4x MSAA texture (cleared and resolved per batch), and paths between
+  other primitives are a batch each, so a tail per message made every frame cost
+  tens of milliseconds on the Vega 3. Strokes go through `vector::paint_strokes`
+  (tiny-skia, cached images dropped from the atlas when unused), filled shapes are
+  cached images (`icons::bubble_tail_image`).

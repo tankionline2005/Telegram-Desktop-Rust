@@ -5,8 +5,8 @@
 
 use gpui::{
     AnyElement, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, PathBuilder, SharedString, StatefulInteractiveElement, Styled, Window, canvas,
-    div, point, prelude::FluentBuilder,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, canvas, div,
+    prelude::FluentBuilder,
 };
 
 use super::{MainView, c, empty_userpic};
@@ -408,7 +408,7 @@ impl MainView {
                 // `Ui::ToggleUpDownArrowPath`: a chevron pointing up, turned by
                 // `(progress - 1) * pi` around its center (down while the list is
                 // hidden).
-                use gpui::{PathStyle, StrokeOptions};
+                use crate::vector::{Cap, Join, Stroke, paint_strokes};
                 let (x, y) = (
                     f32::from(bounds.right()) - scale::lg(TOGGLE_POSITION),
                     f32::from(bounds.bottom()) - scale::lg(TOGGLE_POSITION),
@@ -416,25 +416,11 @@ impl MainView {
                 let s = scale::lg(TOGGLE_SIZE);
                 let alpha = (toggled - 1.) * std::f32::consts::PI;
                 let (sin, cos) = alpha.sin_cos();
-                let turn = |px: f32, py: f32| {
-                    point(
-                        gpui::px(x + px * cos - py * sin),
-                        gpui::px(y + py * cos + px * sin),
-                    )
-                };
+                let turn = |px: f32, py: f32| (x + px * cos - py * sin, y + py * cos + px * sin);
                 let width = scale::lg(1.5);
-                let mut path = PathBuilder::stroke(gpui::px(width)).with_style(PathStyle::Stroke(
-                    StrokeOptions::default()
-                        .with_line_width(width)
-                        .with_line_cap(lyon::tessellation::LineCap::Round)
-                        .with_line_join(lyon::tessellation::LineJoin::Round),
-                ));
-                path.move_to(turn(-s, s / 2.));
-                path.line_to(turn(0., -s / 2.));
-                path.line_to(turn(s, s / 2.));
-                if let Ok(path) = path.build() {
-                    window.paint_path(path, c(arrow_color));
-                }
+                let arrow = [turn(-s, s / 2.), turn(0., -s / 2.), turn(s, s / 2.)];
+                let stroke = Stroke::new(width).cap(Cap::Round).join(Join::Round);
+                paint_strokes(&[&arrow], stroke, c(arrow_color), window);
             },
         )
         .absolute()

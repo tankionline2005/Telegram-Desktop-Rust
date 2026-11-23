@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight, ListAlignment, ListOffset,
-    ListState, MouseButton, PathBuilder, Pixels, RenderImage, Rgba, SharedString, TextRun,
+    ListState, MouseButton, Pixels, RenderImage, Rgba, SharedString, TextRun,
     UniformListScrollHandle, WeakEntity, Window, WindowControlArea, canvas, div, font, img,
     linear_color_stop, linear_gradient, list, point, prelude::*, rgba, uniform_list,
 };
@@ -242,8 +242,7 @@ fn empty_userpic(p: &Palette, size: f32, initials: &str, color: u8, saved: bool)
 /// pixels of the userpic's size: a round-joined top half and a miter-joined bottom half
 /// with the notch, flat caps.
 fn paint_bookmark(bounds: gpui::Bounds<Pixels>, size: f32, fg: Color, window: &mut Window) {
-    use gpui::{PathStyle, StrokeOptions};
-    use lyon::tessellation::{LineCap, LineJoin};
+    use crate::vector::{Join, Stroke, paint_strokes};
     let scale = window.scale_factor();
     let s = scale::device(size);
     let thickness = (s * 0.055).round();
@@ -258,70 +257,50 @@ fn paint_bookmark(bounds: gpui::Bounds<Pixels>, size: f32, fg: Color, window: &m
     let half = ((top + bottom) / 2.).floor();
     // Qt draws this pen so that each line covers whole pixels (a 3 px side is 3 solid
     // pixels in tdesktop): the outline sits half a pixel off the integer grid.
-    let at = |x: f32, y: f32| {
-        point(
-            bounds.left() + gpui::px((x + 0.5) / scale),
-            bounds.top() + gpui::px((y + 0.5) / scale),
-        )
-    };
-    let stroke = |join: LineJoin| {
-        PathStyle::Stroke(
-            StrokeOptions::default()
-                .with_line_width(thickness / scale)
-                .with_line_cap(LineCap::Butt)
-                .with_line_join(join),
-        )
-    };
-    let mut upper =
-        PathBuilder::stroke(gpui::px(thickness / scale)).with_style(stroke(LineJoin::Round));
-    upper.move_to(at(left, half));
-    upper.line_to(at(left, top));
-    upper.line_to(at(right, top));
-    upper.line_to(at(right, half));
-    let mut lower =
-        PathBuilder::stroke(gpui::px(thickness / scale)).with_style(stroke(LineJoin::Miter));
-    lower.move_to(at(left, half));
-    lower.line_to(at(left, bottom));
-    lower.line_to(at(middle, bottom - add));
-    lower.line_to(at(right, bottom));
-    lower.line_to(at(right, half));
-    for path in [upper, lower] {
-        if let Ok(path) = path.build() {
-            window.paint_path(path, c(fg));
-        }
-    }
+    let (bx, by) = (f32::from(bounds.left()), f32::from(bounds.top()));
+    let at = |x: f32, y: f32| (bx + (x + 0.5) / scale, by + (y + 0.5) / scale);
+    let upper = [
+        at(left, half),
+        at(left, top),
+        at(right, top),
+        at(right, half),
+    ];
+    let lower = [
+        at(left, half),
+        at(left, bottom),
+        at(middle, bottom - add),
+        at(right, bottom),
+        at(right, half),
+    ];
+    let stroke = Stroke::new(thickness / scale);
+    paint_strokes(&[&upper], stroke.join(Join::Round), c(fg), window);
+    paint_strokes(&[&lower], stroke, c(fg), window);
 }
 
 /// `bubble_tail` in style pixels.
 const TAIL_SIZE: (f32, f32) = (6., 10.);
 
-/// The bubble tail filled in `bounds` (mirrored for the right side).
+/// The bubble tail filled in `bounds` (mirrored for the right side): an image of
+/// the tail at its device size (`icons::bubble_tail_image`).
 fn paint_tail(bounds: gpui::Bounds<Pixels>, right_side: bool, fill: Rgba, window: &mut Window) {
     if crate::profile::off("tails") {
         return;
     }
-    let outline = crate::icons::bubble_tail_outline();
-    let sx = f32::from(bounds.size.width) / TAIL_SIZE.0;
-    let sy = f32::from(bounds.size.height) / TAIL_SIZE.1;
-    let at = |&(x, y): &(f32, f32)| {
-        let x = if right_side { TAIL_SIZE.0 - x } else { x };
-        point(
-            bounds.left() + gpui::px(x * sx),
-            bounds.top() + gpui::px(y * sy),
-        )
-    };
-    let mut path = PathBuilder::fill();
-    let mut points = outline.iter();
-    if let Some(first) = points.next() {
-        path.move_to(at(first));
-        for p in points {
-            path.line_to(at(p));
-        }
-        path.close();
-    }
-    if let Ok(path) = path.build() {
-        window.paint_path(path, fill);
-    }
+    let scale = window.scale_factor();
+    let w = (f32::from(bounds.size.width) * scale).round().max(1.) as u32;
+    let h = (f32::from(bounds.size.height) * scale).round().max(1.) as u32;
+    let to = |v: f32| (v.clamp(0., 1.) * 255.).round() as u32;
+    let rgba = (to(fill.r) << 24) | (to(fill.g) << 16) | (to(fill.b) << 8) | to(fill.a);
+    let image = crate::icons::bubble_tail_image(right_side, rgba, w, h);
+    let pad = crate::icons::TAIL_PAD as f32 / scale;
+    let at = gpui::Bounds::new(
+        point(bounds.left() - gpui::px(pad), bounds.top() - gpui::px(pad)),
+        gpui::size(
+            gpui::px((w + 2 * crate::icons::TAIL_PAD) as f32 / scale),
+            gpui::px((h + 2 * crate::icons::TAIL_PAD) as f32 / scale),
+        ),
+    );
+    let _ = window.paint_image(at, gpui::Corners::default(), image, 0, false);
 }
 
 /// A grey rounded "service" pill (dates, service messages, `msgServiceBg`).
@@ -4651,7 +4630,10 @@ impl Render for MainView {
         if crate::profile::off("view") {
             // Performance experiment: an empty frame, every vsync.
             window.request_animation_frame();
-            return div().size_full().bg(c(self.palette().window_bg)).into_any_element();
+            return div()
+                .size_full()
+                .bg(c(self.palette().window_bg))
+                .into_any_element();
         }
         crate::profile::time("MainView::render", || self.render_view(window, cx))
     }
@@ -4668,6 +4650,7 @@ impl MainView {
         crate::repaint::begin();
         crate::repaint::set_paused(!window.is_window_active());
         crate::custom_emoji::begin_frame(window);
+        crate::vector::begin_frame(window);
         // Custom emoji painted in the last frame and not known yet.
         let wanted = crate::custom_emoji::take_wanted();
         if !wanted.is_empty() {

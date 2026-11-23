@@ -36,6 +36,7 @@ mod tray;
 #[cfg(windows)]
 mod tray_menu;
 mod ui;
+mod vector;
 mod wallpaper;
 
 use std::borrow::Cow;

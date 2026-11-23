@@ -817,3 +817,66 @@ pub fn telegram_logo() -> Arc<RenderImage> {
     });
     LOGO.clone()
 }
+
+/// The bubble tail filled with `rgba` (0xRRGGBBAA) at `w` x `h` device pixels,
+/// mirrored for the right side, with a transparent border of one pixel. An image,
+/// not a path: GPUI draws every batch of paths through a window-sized 4x MSAA
+/// texture (cleared and resolved each time), which on a weak GPU made every frame
+/// cost tens of milliseconds with a tail per message.
+pub fn bubble_tail_image(right: bool, rgba: u32, w: u32, h: u32) -> Arc<RenderImage> {
+    use resvg::tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
+    type Tails = HashMap<(bool, u32, u32, u32), Arc<RenderImage>>;
+    static TAILS: LazyLock<Mutex<Tails>> = LazyLock::new(Default::default);
+    let key = (right, rgba, w, h);
+    if let Some(image) = TAILS.lock().unwrap().get(&key) {
+        return image.clone();
+    }
+    let (w, h) = (w.max(1), h.max(1));
+    let mut pixmap = Pixmap::new(w + 2 * PAD, h + 2 * PAD).expect("tail pixmap");
+    let (sx, sy) = (w as f32 / 6., h as f32 / 10.);
+    let mut pb = PathBuilder::new();
+    for (k, &(x, y)) in bubble_tail_outline().iter().enumerate() {
+        let x = if right { 6. - x } else { x };
+        let (px, py) = (PAD as f32 + x * sx, PAD as f32 + y * sy);
+        if k == 0 {
+            pb.move_to(px, py);
+        } else {
+            pb.line_to(px, py);
+        }
+    }
+    pb.close();
+    if let Some(path) = pb.finish() {
+        let mut paint = Paint {
+            anti_alias: true,
+            ..Paint::default()
+        };
+        paint.set_color_rgba8(
+            (rgba >> 24) as u8,
+            (rgba >> 16) as u8,
+            (rgba >> 8) as u8,
+            rgba as u8,
+        );
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+    let mut out = image::RgbaImage::new(pixmap.width(), pixmap.height());
+    for (i, p) in pixmap.pixels().iter().enumerate() {
+        let c = p.demultiply();
+        let (x, y) = (i as u32 % pixmap.width(), i as u32 / pixmap.width());
+        // GPUI expects BGRA.
+        out.put_pixel(x, y, image::Rgba([c.blue(), c.green(), c.red(), c.alpha()]));
+    }
+    let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+        out
+    )]));
+    TAILS.lock().unwrap().insert(key, image.clone());
+    image
+}
+
+/// The transparent border of [`bubble_tail_image`], device pixels.
+pub const TAIL_PAD: u32 = PAD;

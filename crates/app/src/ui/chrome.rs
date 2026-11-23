@@ -9,9 +9,9 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, Context, Div, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    PathBuilder, Pixels, SharedString, StatefulInteractiveElement, Styled, Window, canvas, div,
-    point, prelude::FluentBuilder,
+    AnyElement, Context, Div, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
+    SharedString, StatefulInteractiveElement, Styled, Window, canvas, div, point,
+    prelude::FluentBuilder,
 };
 use tdr_theme::Color;
 
@@ -221,31 +221,19 @@ fn paint_arc(
     color: Color,
     window: &mut Window,
 ) {
-    use gpui::{PathStyle, StrokeOptions};
-    use lyon::tessellation::LineCap;
+    use crate::vector::{Cap, Join, Stroke, paint_strokes};
     let r = size / 2.;
     let (cx, cy) = (f32::from(bounds.left()) + r, f32::from(bounds.top()) + r);
     let steps = ((length.abs() / 5760.) * 64.).ceil().max(2.) as usize;
-    let mut path = PathBuilder::stroke(gpui::px(thickness)).with_style(PathStyle::Stroke(
-        StrokeOptions::default()
-            .with_line_width(thickness)
-            .with_line_cap(LineCap::Round),
-    ));
-    for i in 0..=steps {
-        let angle = (from + length * i as f32 / steps as f32) / 16. * std::f32::consts::PI / 180.;
-        let at = point(
-            gpui::px(cx + r * angle.cos()),
-            gpui::px(cy - r * angle.sin()),
-        );
-        if i == 0 {
-            path.move_to(at);
-        } else {
-            path.line_to(at);
-        }
-    }
-    if let Ok(path) = path.build() {
-        window.paint_path(path, c(color));
-    }
+    let points: Vec<(f32, f32)> = (0..=steps)
+        .map(|i| {
+            let angle =
+                (from + length * i as f32 / steps as f32) / 16. * std::f32::consts::PI / 180.;
+            (cx + r * angle.cos(), cy - r * angle.sin())
+        })
+        .collect();
+    let stroke = Stroke::new(thickness).cap(Cap::Round).join(Join::Round);
+    paint_strokes(&[&points], stroke, c(color), window);
 }
 
 impl MainView {
@@ -1969,24 +1957,18 @@ impl MainView {
 
 /// `CrossAnimation` at rest: an X in a `CANCEL_SIZE` square, 1.5 px strokes.
 fn paint_cross(bounds: gpui::Bounds<Pixels>, color: Color, window: &mut Window) {
-    use gpui::{PathStyle, StrokeOptions};
     let size = f32::from(bounds.size.width);
     let skip = scale::lg(CANCEL_SKIP) * size / scale::lg(CANCEL_SIZE);
     let (l, t) = (f32::from(bounds.left()), f32::from(bounds.top()));
     let width = scale::lg(1.5);
-    for (a, b) in [
-        ((skip, skip), (size - skip, size - skip)),
-        ((size - skip, skip), (skip, size - skip)),
-    ] {
-        let mut path = PathBuilder::stroke(gpui::px(width)).with_style(PathStyle::Stroke(
-            StrokeOptions::default().with_line_width(width),
-        ));
-        path.move_to(point(gpui::px(l + a.0), gpui::px(t + a.1)));
-        path.line_to(point(gpui::px(l + b.0), gpui::px(t + b.1)));
-        if let Ok(path) = path.build() {
-            window.paint_path(path, c(color));
-        }
-    }
+    let first = [(l + skip, t + skip), (l + size - skip, t + size - skip)];
+    let second = [(l + size - skip, t + skip), (l + skip, t + size - skip)];
+    crate::vector::paint_strokes(
+        &[&first, &second],
+        crate::vector::Stroke::new(width),
+        c(color),
+        window,
+    );
 }
 
 /// A folder title wrapped like `Ui::Text::String` into lines of `width`: words go
