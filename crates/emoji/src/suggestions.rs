@@ -261,6 +261,17 @@ fn data() -> &'static Data {
     })
 }
 
+/// The emoji panel's tooltip (`EmojiListWidget::tooltipText`): the first short
+/// code of the emoji's original.
+pub fn code_of(emoji: u16) -> Option<&'static str> {
+    let original = crate::get(emoji).map_or(emoji, |e| e.original());
+    data()
+        .list
+        .iter()
+        .find(|r| r.emoji == original)
+        .map(|r| r.replacement.as_str())
+}
+
 /// `GetSuggestionMaxLength`.
 pub fn max_length() -> usize {
     data().max_length

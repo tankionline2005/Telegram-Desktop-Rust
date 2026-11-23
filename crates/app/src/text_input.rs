@@ -79,7 +79,6 @@ actions!(
         FormatLink,
         FormatDate,
         Tab,
-        FieldEscape,
     ]
 );
 
@@ -152,7 +151,6 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, Some(CONTEXT)),
         KeyBinding::new("tab", Tab, Some(CONTEXT)),
-        KeyBinding::new("escape", FieldEscape, Some(CONTEXT)),
         KeyBinding::new("delete", Delete, Some(CONTEXT)),
         KeyBinding::new("left", Left, Some(CONTEXT)),
         KeyBinding::new("right", Right, Some(CONTEXT)),
@@ -739,17 +737,6 @@ impl TextInput {
         if !self.suggest_key(crate::emoji_suggest::Key::Tab, cx) {
             cx.propagate();
         }
-    }
-
-    fn field_escape(&mut self, _: &FieldEscape, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(suggest) = self.suggest.clone()
-            && suggest.borrow().visible()
-        {
-            suggest.borrow_mut().hide();
-            cx.notify();
-            return;
-        }
-        window.dispatch_action(Box::new(crate::ui::Escape), cx);
     }
 
     /// The lines the text takes, wrapped (1 when empty).
@@ -2074,7 +2061,6 @@ impl Render for TextInput {
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::tab))
-            .on_action(cx.listener(Self::field_escape))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))

@@ -2461,6 +2461,12 @@ impl MainView {
     /// Esc: closes the main menu, or else the open chat (back to "Select a chat"), as
     /// in tdesktop.
     fn escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        // The field's emoji suggestions first (`SuggestionsController`'s Escape).
+        if self.emoji_suggest.borrow().visible() {
+            self.emoji_suggest.borrow_mut().hide();
+            cx.notify();
+            return;
+        }
         if self.hide_menu() || self.clear_text_selection() {
         } else if self.layers.any() {
             self.layers.hide_current();
@@ -5360,7 +5366,15 @@ impl MainView {
             .child(self.render_title_bar(window, cx))
             .child(body)
             .children(layers)
-            .children(self.render_emoji_suggestions(window, cx))
+            // Over everything painted before (images included).
+            .children(
+                self.render_emoji_suggestions(window, cx)
+                    .map(|e| gpui::deferred(e).with_priority(1)),
+            )
+            .children(
+                self.render_emoji_tooltip(window)
+                    .map(|e| gpui::deferred(e).with_priority(2)),
+            )
             .children(self.render_drag_capture(cx))
             .children(self.render_menu(window, cx))
             .children(self.text_ui.toast.as_ref().and_then(|t| {

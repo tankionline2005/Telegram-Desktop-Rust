@@ -112,6 +112,8 @@ enum Over {
 
 /// Recent emoji and the seven sections come first (`_staticCount`).
 const STATIC_SECTIONS: usize = 8;
+/// `Ui::Tooltip::Show(1000, ...)`.
+const TOOLTIP_DELAY: Duration = Duration::from_millis(1000);
 /// `stickerIconMove`: the footer scrolls to a newly selected icon in this time.
 const ICON_MOVE_MS: f32 = 400.;
 /// `kCollapsedRows`.
@@ -190,6 +192,9 @@ pub(super) struct EmojiPanel {
     recent_slots: Vec<Slot>,
     /// The mouse is over the search's cancel cross.
     cancel_over: bool,
+    /// The emoji under the mouse, where the mouse is (window) and since when:
+    /// its short code shows after a second (`Ui::Tooltip::Show(1000, ...)`).
+    tip: Option<(u16, Point<Pixels>, Instant)>,
     /// The list's top left in the window at the last paint.
     origin: Rc<Cell<Point<Pixels>>>,
     pub(super) recent: tdr_emoji::recent::Recent,
@@ -241,6 +246,7 @@ impl EmojiPanel {
             results: None,
             recent_slots: Vec::new(),
             cancel_over: false,
+            tip: None,
             origin: Rc::new(Cell::new(Point::default())),
             recent,
             recent_path,
@@ -943,11 +949,76 @@ impl MainView {
         };
         if over != self.emoji_panel.over {
             self.emoji_panel.over = over;
+            let emoji = match over {
+                Over::Emoji { section, index } => match self.cell_at(section, index) {
+                    Some(Slot::Emoji(e)) => Some(e),
+                    _ => None,
+                },
+                _ => None,
+            };
+            self.emoji_panel.tip = emoji.map(|e| (e, position, Instant::now()));
+            if emoji.is_some() {
+                Self::wake_after(TOOLTIP_DELAY, cx);
+            }
             cx.notify();
+        } else if let Some(tip) = &mut self.emoji_panel.tip
+            && tip.2.elapsed() < TOOLTIP_DELAY
+        {
+            tip.1 = position;
         }
     }
 
+    /// `Ui::Tooltip` with the short code of the emoji under the mouse.
+    pub(super) fn render_emoji_tooltip(&self, window: &Window) -> Option<AnyElement> {
+        let (emoji, at, since) = self.emoji_panel.tip?;
+        if since.elapsed() < TOOLTIP_DELAY || self.emoji_panel.show == Show::Hidden {
+            return None;
+        }
+        let code = tdr_emoji::suggestions::code_of(emoji)?;
+        let p = self.palette();
+        let f = scale::font(13.);
+        let text_w = super::text_width(window, code, 13., FontWeight::NORMAL);
+        let w = text_w.ceil() + lg(10.) + 2.;
+        let h = f32::from(f.line_height()) + lg(4.) + 2.;
+        // `defaultTooltip`: shift (-20, 20), centered when narrower than 40.
+        let (mx, my) = (f32::from(at.x), f32::from(at.y));
+        let mut x = if w < lg(40.) {
+            mx - w / 2.
+        } else {
+            mx - lg(20.)
+        };
+        let mut y = my + lg(20.);
+        let size = window.viewport_size();
+        let skip = lg(10.);
+        if x + w > f32::from(size.width) - skip {
+            x = (f32::from(size.width) - skip - w).max(mx - w);
+        }
+        if y + h > f32::from(size.height) - skip {
+            y = my - h - skip;
+        }
+        Some(
+            div()
+                .absolute()
+                .left(gpx(x.max(0.)))
+                .top(gpx(y))
+                .w(gpx(w))
+                .h(gpx(h))
+                .rounded(px(3.))
+                .border_1()
+                .border_color(c(p.tooltip_border_fg))
+                .bg(c(p.tooltip_bg))
+                .text_color(c(p.tooltip_fg))
+                .text_size(f.size)
+                .line_height(f.line_height())
+                .pl(gpx(lg(5.)))
+                .pt(gpx(lg(2.)))
+                .child(code.to_string())
+                .into_any_element(),
+        )
+    }
+
     fn emoji_mouse_down(&mut self, layout: &ListLayout, cx: &mut Context<Self>) {
+        self.emoji_panel.tip = None;
         if self
             .emoji_panel
             .picker
@@ -1371,6 +1442,9 @@ impl MainView {
                     .h(gpx(scroll_h))
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                         this.area_hovered(super::Area::Emoji, *hovered, cx);
+                        if !*hovered {
+                            this.emoji_panel.tip = None;
+                        }
                         if !*hovered && this.emoji_panel.over != Over::None {
                             this.emoji_panel.over = Over::None;
                             cx.notify();
