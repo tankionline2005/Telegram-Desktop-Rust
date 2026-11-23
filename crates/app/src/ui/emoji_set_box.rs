@@ -347,12 +347,27 @@ impl MainView {
                                 b.over.filter(|o| *o != k)
                             };
                         }
+                        if *hovered {
+                            this.preview_hover(id, cx);
+                        }
                         cx.notify();
                     }))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.choose_custom(id, window, cx);
-                        cx.notify();
-                    })),
+                    // Held: the large preview (`showPreview`); a click chooses.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.preview_press(id, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            if !this.preview_release(cx) {
+                                this.choose_custom(id, window, cx);
+                            }
+                            cx.notify();
+                        }),
+                    ),
             );
         }
         let list = div()

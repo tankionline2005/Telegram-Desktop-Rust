@@ -1111,6 +1111,11 @@ impl MainView {
         };
         if over != self.emoji_panel.over {
             self.emoji_panel.over = over;
+            if let Over::Emoji { section, index } = over
+                && let Some(Slot::Custom(id)) = self.cell_at(section, index)
+            {
+                self.preview_hover(id, cx);
+            }
             let emoji = match over {
                 Over::Emoji { section, index } => match self.cell_at(section, index) {
                     Some(Slot::Emoji(e)) => Some(e),
@@ -1197,6 +1202,11 @@ impl MainView {
         let over = self.emoji_panel.over;
         self.emoji_panel.pressed = over;
         if let Over::Emoji { section, index } = over
+            && let Some(Slot::Custom(id)) = self.cell_at(section, index)
+        {
+            self.preview_press(id, cx);
+        }
+        if let Over::Emoji { section, index } = over
             && let Some(emoji) = self.emoji_at(section, index)
             && tdr_emoji::get(emoji).is_some_and(|e| e.has_variants())
             && self.emoji_panel.results.is_none()
@@ -1226,6 +1236,9 @@ impl MainView {
     fn emoji_mouse_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pressed = std::mem::take(&mut self.emoji_panel.pressed);
         self.emoji_panel.press_at = None;
+        if self.preview_release(cx) {
+            return;
+        }
         if self.emoji_panel.picker.is_some() {
             return;
         }

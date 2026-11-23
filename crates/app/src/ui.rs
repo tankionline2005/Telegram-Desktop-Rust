@@ -35,6 +35,7 @@ mod archive;
 mod chrome;
 mod country_box;
 mod emoji_panel;
+mod emoji_preview;
 mod emoji_set_box;
 mod emoji_suggest_box;
 mod layers;
@@ -744,6 +745,8 @@ pub struct MainView {
     emoji_panel: emoji_panel::EmojiPanel,
     /// The open emoji set box.
     emoji_set_box: Option<emoji_set_box::SetBox>,
+    /// The held custom emoji's large preview.
+    emoji_preview: emoji_preview::EmojiPreview,
     /// Emoji suggestions over the message field (shared with it).
     emoji_suggest: std::rc::Rc<std::cell::RefCell<crate::emoji_suggest::Suggest>>,
     /// The set the "Remove" box asks about.
@@ -1032,6 +1035,7 @@ impl MainView {
             emoji_panel: emoji_panel::EmojiPanel::new(accounts.read(cx).emoji_settings_path()),
             emoji_set_box: None,
             emoji_suggest,
+            emoji_preview: Default::default(),
             emoji_set_removing: None,
             columns: Columns::default(),
             columns_path: None,
@@ -4743,6 +4747,7 @@ impl MainView {
         crate::custom_emoji::begin_frame(window);
         crate::vector::begin_frame(window);
         self.update_emoji_suggest(window, cx);
+        self.update_emoji_preview(window);
         // Custom emoji painted in the last frame and not known yet.
         let wanted = crate::custom_emoji::take_wanted();
         if !wanted.is_empty() {
@@ -5378,6 +5383,10 @@ impl MainView {
             .children(
                 self.render_emoji_tooltip(window)
                     .map(|e| gpui::deferred(e).with_priority(2)),
+            )
+            .children(
+                self.render_emoji_preview(window, cx)
+                    .map(|e| gpui::deferred(e).with_priority(3)),
             )
             .children(self.render_drag_capture(cx))
             .children(self.render_menu(window, cx))
