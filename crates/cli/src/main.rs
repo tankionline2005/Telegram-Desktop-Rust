@@ -748,6 +748,18 @@ async fn probe_emoji() -> Result<()> {
     println!("installed emoji sets: {}", sets.len());
     let featured = emoji_sets::featured_emoji_sets(&client).await?;
     println!("featured emoji sets: {}", featured.len());
+    let mut by_docs = std::collections::BTreeMap::<usize, usize>::new();
+    for f in &featured {
+        *by_docs.entry(f.documents.len()).or_default() += 1;
+    }
+    println!("featured sets by documents given: {by_docs:?}");
+    println!(
+        "featured already installed: {}",
+        featured
+            .iter()
+            .filter(|f| sets.iter().any(|s| s.id == f.info.id))
+            .count()
+    );
     let Some(first) = sets.first().or(featured.first().map(|f| &f.info)) else {
         return Ok(());
     };

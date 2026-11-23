@@ -1551,20 +1551,47 @@ async fn load_emoji_sets(
             installed.push(set);
         }
     }
-    let featured = emoji_sets::featured_emoji_sets(client)
+    let listed: Vec<_> = emoji_sets::featured_emoji_sets(client)
         .await
         .unwrap_or_default()
         .into_iter()
         .filter(|f| !installed.iter().any(|i| i.info.id == f.info.id))
-        .map(|f| EmojiSet {
-            info: f.info,
-            emoji: f
+        .collect();
+    // Most trending sets come without their emoji (`stickerSetNoCovered`):
+    // they are asked for, as tdesktop's `scheduleStickerSetRequest`, a few at
+    // a time.
+    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+    let mut tasks = Vec::new();
+    for f in listed {
+        let client = client.clone();
+        let limit = limit.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut emoji: Vec<_> = f
                 .documents
                 .iter()
                 .filter_map(emoji_sets::emoji_document)
-                .collect(),
-        })
-        .collect();
+                .collect();
+            if emoji.len() < f.info.count.max(1) as usize {
+                let _permit = limit.acquire().await;
+                let raw =
+                    emoji_sets::sticker_set(&client, &SetRef::Id(f.info.id, f.info.access_hash))
+                        .await;
+                if let Some(full) = raw.ok().and_then(|r| emoji_sets::full_set(&r)) {
+                    emoji = emoji_set_of(&full).emoji;
+                }
+            }
+            EmojiSet {
+                info: f.info,
+                emoji,
+            }
+        }));
+    }
+    let mut featured = Vec::new();
+    for t in tasks {
+        if let Ok(set) = t.await {
+            featured.push(set);
+        }
+    }
     Ok((installed, featured))
 }
 

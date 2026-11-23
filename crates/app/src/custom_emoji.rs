@@ -31,8 +31,23 @@ pub struct Info {
     pub set: Option<(i64, i64)>,
     pub text_color: bool,
     pub free: bool,
-    /// The vector thumbnail (`photoPathSize`), drawn while loading.
-    pub path: Option<Arc<resvg::tiny_skia::Path>>,
+    /// The vector thumbnail (`photoPathSize`), drawn while loading (parsed
+    /// when first drawn: sets bring thousands of documents).
+    pub path: Option<Arc<LazyPath>>,
+}
+
+/// A vector thumbnail's bytes and, once drawn, its path.
+pub struct LazyPath {
+    bytes: Vec<u8>,
+    parsed: OnceLock<Option<resvg::tiny_skia::Path>>,
+}
+
+impl LazyPath {
+    fn get(&self) -> Option<&resvg::tiny_skia::Path> {
+        self.parsed
+            .get_or_init(|| crate::vector_thumb::parse(&self.bytes))
+            .as_ref()
+    }
 }
 
 impl Info {
@@ -42,11 +57,12 @@ impl Info {
             set: doc.set,
             text_color: doc.text_color,
             free: doc.free,
-            path: doc
-                .path
-                .as_deref()
-                .and_then(crate::vector_thumb::parse)
-                .map(Arc::new),
+            path: doc.path.clone().map(|bytes| {
+                Arc::new(LazyPath {
+                    bytes,
+                    parsed: OnceLock::new(),
+                })
+            }),
         }
     }
 }
@@ -804,7 +820,9 @@ pub fn paint_ex(
             true
         }
         Err(Some(path)) => {
-            if let Some(image) = loading_image(id, side, &path, color, loading, x, scale) {
+            if let Some(path) = path.get()
+                && let Some(image) = loading_image(id, side, path, color, loading, x, scale)
+            {
                 let _ = window.paint_image(bounds, Corners::default(), image, 0, false);
             }
             false
