@@ -13,6 +13,11 @@ pub fn ease_out_circ(t: f32) -> f32 {
     (1. - t * t).max(0.).sqrt()
 }
 
+/// `anim::sineInOut`.
+pub fn sine_in_out(t: f32) -> f32 {
+    -((std::f32::consts::PI * t).cos() - 1.) / 2.
+}
+
 pub fn ease_in_circ(t: f32) -> f32 {
     1. - (1. - t * t).max(0.).sqrt()
 }

@@ -36,6 +36,7 @@ mod chrome;
 mod country_box;
 mod emoji_panel;
 mod emoji_set_box;
+mod emoji_suggest_box;
 mod layers;
 mod main_menu;
 mod menus;
@@ -743,6 +744,8 @@ pub struct MainView {
     emoji_panel: emoji_panel::EmojiPanel,
     /// The open emoji set box.
     emoji_set_box: Option<emoji_set_box::SetBox>,
+    /// Emoji suggestions over the message field (shared with it).
+    emoji_suggest: std::rc::Rc<std::cell::RefCell<crate::emoji_suggest::Suggest>>,
     /// The set the "Remove" box asks about.
     emoji_set_removing: Option<(tdr_data::emoji_sets::SetRef, String)>,
     /// The chat list's share of the window (tdesktop's dialogs width ratios).
@@ -896,6 +899,17 @@ impl MainView {
         cx.observe(&accounts, |_, _, cx| cx.notify()).detach();
         let palette = tdr_theme::palette(dark);
         let input = cx.new(|cx| TextInput::new("Write a message…", palette, cx));
+        let emoji_suggest = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::emoji_suggest::Suggest::default(),
+        ));
+        input.update(cx, |i, _| i.enable_emoji_helpers(emoji_suggest.clone()));
+        if let Some(dir) = accounts
+            .read(cx)
+            .emoji_settings_path()
+            .and_then(|p| p.parent().map(|d| d.join("emoji-keywords")))
+        {
+            crate::emoji_suggest::load_keywords(dir);
+        }
         let search = cx.new(|cx| {
             let mut field = TextInput::new("Search", palette, cx);
             field.set_single_line(true);
@@ -1017,6 +1031,7 @@ impl MainView {
             emoji_bar: Scrollbar::default(),
             emoji_panel: emoji_panel::EmojiPanel::new(accounts.read(cx).emoji_settings_path()),
             emoji_set_box: None,
+            emoji_suggest,
             emoji_set_removing: None,
             columns: Columns::default(),
             columns_path: None,
@@ -1937,6 +1952,31 @@ impl MainView {
                 cx.notify();
             }
             Update::CustomEmojiFailed(id) => crate::custom_emoji::failed(id),
+            Update::EmojiKeywords {
+                remote,
+                lang,
+                version,
+                changes,
+            } => {
+                let changes = changes
+                    .into_iter()
+                    .map(|c| {
+                        if c.added {
+                            tdr_emoji::keywords::Change::Add {
+                                keyword: c.keyword,
+                                emoticons: c.emoticons,
+                            }
+                        } else {
+                            tdr_emoji::keywords::Change::Delete {
+                                keyword: c.keyword,
+                                emoticons: c.emoticons,
+                            }
+                        }
+                    })
+                    .collect();
+                crate::emoji_suggest::apply_difference(remote, &lang, version, changes);
+                self.emoji_keywords_came(cx);
+            }
             Update::EmojiSets {
                 installed,
                 featured,
@@ -2379,6 +2419,9 @@ impl MainView {
         const SAVE_CLOUD_DRAFT_IDLE: Duration = Duration::from_secs(14); // kSaveCloudDraftIdleTimeout
         let text = self.input.read(cx).text();
         self.update_send_state(!text.is_empty());
+        if !text.is_empty() {
+            self.refresh_emoji_keywords();
+        }
         if text == self.input_text {
             return;
         }
@@ -4651,6 +4694,7 @@ impl MainView {
         crate::repaint::set_paused(!window.is_window_active());
         crate::custom_emoji::begin_frame(window);
         crate::vector::begin_frame(window);
+        self.update_emoji_suggest(window, cx);
         // Custom emoji painted in the last frame and not known yet.
         let wanted = crate::custom_emoji::take_wanted();
         if !wanted.is_empty() {
@@ -5278,6 +5322,7 @@ impl MainView {
             .child(self.render_title_bar(window, cx))
             .child(body)
             .children(layers)
+            .children(self.render_emoji_suggestions(window, cx))
             .children(self.render_drag_capture(cx))
             .children(self.render_menu(window, cx))
             .children(self.text_ui.toast.as_ref().and_then(|t| {

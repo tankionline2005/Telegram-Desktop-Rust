@@ -5737,6 +5737,9 @@ dependencies = [
 [[package]]
 name = "tdr-emoji"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "tdr-lottie"

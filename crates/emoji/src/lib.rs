@@ -648,4 +648,6 @@ mod tests {
     }
 }
 
+pub mod keywords;
 pub mod recent;
+pub mod suggestions;

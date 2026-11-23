@@ -76,6 +76,12 @@ pub enum Command {
     LoadCustomEmoji(Vec<i64>),
     /// The installed and featured emoji sets (the emoji panel).
     LoadEmojiSets,
+    /// Emoji keywords: which of `languages` the server has, then each one's
+    /// keywords since the version kept (`versions`).
+    RefreshEmojiKeywords {
+        languages: Vec<String>,
+        versions: Vec<(String, i32)>,
+    },
     /// One set by id or link name (the set box).
     LoadEmojiSet(tdr_data::emoji_sets::SetRef),
     /// Adds or removes an emoji set.
@@ -159,6 +165,14 @@ pub enum Update {
     },
     /// A custom emoji that could not be loaded.
     CustomEmojiFailed(i64),
+    /// A language's emoji keywords since its kept version; `remote`: the
+    /// languages the server has keywords for.
+    EmojiKeywords {
+        remote: Vec<String>,
+        lang: String,
+        version: i32,
+        changes: Vec<tdr_data::emoji_keywords::KeywordChange>,
+    },
     /// The installed emoji sets (the user's order) and the featured ones.
     EmojiSets {
         installed: Vec<EmojiSet>,
@@ -2600,6 +2614,37 @@ async fn run(
                         Err(e) => error!("read: {e}"),
                     },
                     Command::LoadCustomEmoji(_) => {}
+                    Command::RefreshEmojiKeywords { languages, versions } => {
+                        let client = client.clone();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let remote = match tdr_data::emoji_keywords::languages(&client, languages).await {
+                                Ok(remote) => remote,
+                                Err(e) => {
+                                    tracing::debug!("emoji keywords languages: {e}");
+                                    return;
+                                }
+                            };
+                            for lang in &remote {
+                                let version = versions
+                                    .iter()
+                                    .find(|(l, _)| l == lang)
+                                    .map_or(0, |(_, v)| *v);
+                                match tdr_data::emoji_keywords::difference(&client, lang, version).await {
+                                    Ok(d) if d.lang_code == *lang => {
+                                        let _ = tx.send(Update::EmojiKeywords {
+                                            remote: remote.clone(),
+                                            lang: lang.clone(),
+                                            version: d.version,
+                                            changes: d.changes,
+                                        });
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => tracing::debug!("emoji keywords: {e}"),
+                                }
+                            }
+                        });
+                    }
                     Command::LoadEmojiSets => {
                         let client = client.clone();
                         let tx = tx.clone();
@@ -3870,6 +3915,7 @@ pub fn start_demo(
                 | Command::Read { .. }
                 | Command::LoadUserpic { .. }
                 | Command::FetchCustomEmoji(_)
+                | Command::RefreshEmojiKeywords { .. }
                 | Command::ToggleEmojiSet { .. } => {}
                 Command::LoadEmojiSet(set) => {
                     let found = match demo_emoji_sets() {

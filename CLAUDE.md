@@ -192,3 +192,9 @@
   tens of milliseconds on the Vega 3. Strokes go through `vector::paint_strokes`
   (tiny-skia, cached images dropped from the atlas when unused), filled shapes are
   cached images (`icons::bubble_tail_image`).
+- Emoji while typing: instant replaces and short codes are `tdr_emoji::suggestions`
+  (lib_ui's `emoji_suggestions` + codegen's replaces), language keywords
+  `tdr_emoji::keywords` (fetched by `tdr_data::emoji_keywords`, kept in
+  `data/emoji-keywords/`). The field (`text_input`) finds the query and forwards
+  Enter/Tab/arrows/Esc to the shared `emoji_suggest::Suggest`; `MainView` fills its
+  rows and draws them (`ui/emoji_suggest_box.rs`).

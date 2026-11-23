@@ -11,6 +11,7 @@ pub mod countries;
 mod countries_fallback;
 pub mod describe;
 pub mod drafts;
+pub mod emoji_keywords;
 pub mod emoji_sets;
 pub mod filters;
 pub mod login;

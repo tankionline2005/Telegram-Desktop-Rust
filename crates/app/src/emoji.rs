@@ -375,6 +375,36 @@ pub fn origin_in_line(x: Pixels, line_top: Pixels, line_height: Pixels) -> gpui:
     point(x + px(pad), line_top + px(y))
 }
 
+/// The recent emoji and chosen skin tones as the panel keeps them, for the
+/// field's replaces and suggestions (`defaultEmojiVariant`, `recentEmoji`).
+static RECENT: std::sync::Mutex<Option<tdr_emoji::recent::Recent>> = std::sync::Mutex::new(None);
+
+/// Keeps a copy of the panel's recent emoji (when they changed).
+pub fn sync_recent(recent: &tdr_emoji::recent::Recent) {
+    let mut guard = RECENT.lock().unwrap();
+    if guard.as_ref() != Some(recent) {
+        *guard = Some(recent.clone());
+    }
+}
+
+/// The emoji in the variant chosen for it (`lookupEmojiVariant`).
+pub fn variant_of(emoji: u16) -> u16 {
+    RECENT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or(emoji, |r| r.variant_of(emoji))
+}
+
+/// The recent emoji, the most used first.
+pub fn recent_list() -> Vec<u16> {
+    RECENT
+        .lock()
+        .unwrap()
+        .as_mut()
+        .map_or_else(Vec::new, |r| r.list())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

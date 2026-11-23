@@ -78,6 +78,8 @@ actions!(
         FormatClear,
         FormatLink,
         FormatDate,
+        Tab,
+        FieldEscape,
     ]
 );
 
@@ -149,6 +151,8 @@ const UNDO_LIMIT: usize = 200;
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, Some(CONTEXT)),
+        KeyBinding::new("tab", Tab, Some(CONTEXT)),
+        KeyBinding::new("escape", FieldEscape, Some(CONTEXT)),
         KeyBinding::new("delete", Delete, Some(CONTEXT)),
         KeyBinding::new("left", Left, Some(CONTEXT)),
         KeyBinding::new("right", Right, Some(CONTEXT)),
@@ -251,6 +255,37 @@ pub struct TextInput {
     last_edit: Option<EditKind>,
     /// One line only (the chat search): no line feeds, typed or pasted.
     single_line: bool,
+    /// `InstantReplaces::Default` while typing (the message field).
+    instant_replaces: bool,
+    /// Text replaced while typing (or by a suggestion): Backspace at its end
+    /// brings the original back (`revertFormatReplace`).
+    replaced: Vec<Replaced>,
+    /// Emoji suggestions over the field (the message field).
+    suggest: Option<Rc<RefCell<crate::emoji_suggest::Suggest>>>,
+}
+
+/// One replacement made while typing.
+#[derive(Clone)]
+struct Replaced {
+    range: Range<usize>,
+    original: String,
+}
+
+/// An object over `range` after `edit` replaced `inserted` bytes: moved, or gone
+/// when the edit touches it (text typed right after it is not part of it).
+fn shift_object(
+    range: &Range<usize>,
+    edit: &Range<usize>,
+    inserted: usize,
+) -> Option<Range<usize>> {
+    if edit.end <= range.start {
+        let start = range.start - edit.len() + inserted;
+        Some(start..start + range.len())
+    } else if edit.start >= range.end {
+        Some(range.clone())
+    } else {
+        None
+    }
 }
 
 impl EventEmitter<Submit> for TextInput {}
@@ -435,7 +470,286 @@ impl TextInput {
             redo: Vec::new(),
             last_edit: None,
             single_line: false,
+            instant_replaces: false,
+            replaced: Vec::new(),
+            suggest: None,
         }
+    }
+
+    /// The message field: instant replaces and emoji suggestions.
+    pub fn enable_emoji_helpers(&mut self, suggest: Rc<RefCell<crate::emoji_suggest::Suggest>>) {
+        self.instant_replaces = true;
+        self.suggest = Some(suggest);
+    }
+
+    /// The caret's place in the window for a byte offset (the suggestions point
+    /// at it), with the line height.
+    pub fn caret_bounds(&self, offset: usize) -> Option<Bounds<Pixels>> {
+        let bounds = self.bounds?;
+        let at = self.point_for_index(offset.min(self.content.len()))?;
+        Some(Bounds::new(
+            point(
+                bounds.left() + px(at.x),
+                bounds.top() + px(at.y) - self.scroll_y,
+            ),
+            size(px(1.), line_height()),
+        ))
+    }
+
+    /// Inside a code tag at `pos` (no replaces there).
+    fn in_code(&self, pos: usize) -> bool {
+        self.tags.iter().any(|t| {
+            matches!(t.tag, Tag::Code | Tag::Pre) && t.range.start < pos && t.range.end >= pos
+        })
+    }
+
+    /// `processInstantReplaces` after one typed character.
+    fn instant_replace(&mut self) {
+        let pos = self.selected_range.end;
+        if !self.instant_replaces || !self.selected_range.is_empty() || self.in_code(pos) {
+            return;
+        }
+        let Some((len, with)) = tdr_emoji::suggestions::instant_replace(&self.content[..pos])
+        else {
+            return;
+        };
+        // An emoji in the variant (skin tone) chosen for it.
+        let with = match tdr_emoji::by_text(with) {
+            Some(e) => {
+                tdr_emoji::get(crate::emoji::variant_of(e)).map_or(with.to_string(), |o| o.text())
+            }
+            None => with.to_string(),
+        };
+        let from = pos - len;
+        let original = self.content[from..pos].to_string();
+        self.replace_tracked(from..pos, &with, original);
+    }
+
+    /// Replaces `range` by `with`, remembering `original` for Backspace.
+    fn replace_tracked(&mut self, range: Range<usize>, with: &str, original: String) {
+        self.edit(range.clone(), with, EditKind::Other);
+        let end = range.start + with.len();
+        self.selected_range = end..end;
+        self.last_edit = None;
+        self.replaced.push(Replaced {
+            range: range.start..end,
+            original,
+        });
+    }
+
+    /// `revertFormatReplace`: Backspace right after a replacement types back what
+    /// was replaced.
+    fn revert_replace(&mut self) -> bool {
+        let pos = self.selected_range.end;
+        if !self.selected_range.is_empty() {
+            return false;
+        }
+        let Some(k) = self.replaced.iter().position(|r| r.range.end == pos) else {
+            return false;
+        };
+        let r = self.replaced.remove(k);
+        self.edit(r.range.clone(), &r.original, EditKind::Other);
+        let end = r.range.start + r.original.len();
+        self.selected_range = end..end;
+        self.last_edit = None;
+        true
+    }
+
+    /// `getEmojiQuery`: what to suggest emoji for at the caret, where the query
+    /// starts and where the suggestions point.
+    fn emoji_query(&self) -> (crate::emoji_suggest::Query, usize, usize) {
+        use crate::emoji_suggest::Query;
+        let none = (Query::None, 0, 0);
+        if !self.selected_range.is_empty() || self.marked_range.is_some() {
+            return none;
+        }
+        let pos = self.selected_range.end.min(self.content.len());
+        let line_start = self.content[..pos].rfind('\n').map_or(0, |i| i + 1);
+        let line = &self.content[line_start..pos];
+        let custom = |a: usize, b: usize| {
+            self.tags.iter().any(|t| {
+                matches!(t.tag, Tag::CustomEmoji(_)) && t.range.start < b && t.range.end > a
+            })
+        };
+        // The emoji in the line, the text after the last one is the fragment.
+        let parts = tdr_emoji::split(line);
+        let mut fragment = 0;
+        if let Some((range, Some(emoji))) = parts.last()
+            && range.end == line.len()
+        {
+            if custom(line_start + range.start, line_start + range.end) {
+                return none;
+            }
+            // A run of the same emoji before the caret.
+            let mut start = range.start;
+            let mut count = 1;
+            for (r, e) in parts.iter().rev().skip(1) {
+                if *e == Some(*emoji)
+                    && r.end == start
+                    && !custom(line_start + r.start, line_start + r.end)
+                {
+                    start = r.start;
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+            let one = range.len();
+            return (
+                Query::Emoji {
+                    emoji: *emoji,
+                    count,
+                },
+                line_start + start,
+                pos - one,
+            );
+        }
+        for (range, emoji) in parts.iter().rev() {
+            if emoji.is_some() {
+                fragment = range.end;
+                break;
+            }
+        }
+        let text = &line[fragment..];
+        let legacy = tdr_emoji::suggestions::max_length();
+        let modern = crate::emoji_suggest::max_query_length();
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let mut units = 0;
+        for k in (0..chars.len()).rev() {
+            let (at, ch) = chars[k];
+            units += ch.len_utf16();
+            if ch == ':' {
+                let previous = (k > 0).then(|| chars[k - 1].1);
+                if previous.is_some_and(char::is_alphanumeric)
+                    || k + 1 == chars.len()
+                    || chars[k + 1].1.is_whitespace()
+                {
+                    return none;
+                }
+                let start = line_start + fragment + at;
+                let anchor = line_start + fragment + chars[k + 1].0 + chars[k + 1].1.len_utf8();
+                return (Query::Text(text[at..].to_string()), start, anchor);
+            }
+            if units > legacy && units > modern {
+                return none;
+            }
+        }
+        // `suggestExactFirstWord`: the whole field is one fragment.
+        let length = text.encode_utf16().count();
+        if length == 0
+            || text.starts_with(char::is_whitespace)
+            || length > modern
+            || line_start + fragment != 0
+            || pos != self.content.len()
+        {
+            return none;
+        }
+        (Query::Text(text.to_string()), 0, 0)
+    }
+
+    /// Tells the suggestions about a change of the text (`by_key`: typed).
+    fn text_changed_for_suggest(&mut self, by_key: bool) {
+        let Some(suggest) = self.suggest.clone() else {
+            return;
+        };
+        let (query, start, anchor) = self.emoji_query();
+        suggest
+            .borrow_mut()
+            .text_changed(query, start, anchor, by_key);
+    }
+
+    /// The caret moved without typing: the suggestions hide.
+    fn cursor_moved_for_suggest(&mut self) {
+        if let Some(suggest) = &self.suggest {
+            suggest.borrow_mut().cursor_moved();
+        }
+    }
+
+    /// A key for the suggestions first; true when they took it.
+    fn suggest_key(&mut self, key: crate::emoji_suggest::Key, cx: &mut Context<Self>) -> bool {
+        use crate::emoji_suggest::KeyResult;
+        let Some(suggest) = self.suggest.clone() else {
+            return false;
+        };
+        let result = suggest.borrow_mut().key(key);
+        match result {
+            KeyResult::Ignored => false,
+            KeyResult::Consumed => {
+                cx.notify();
+                true
+            }
+            KeyResult::Chosen(row) => {
+                self.choose_suggestion(&row, cx);
+                true
+            }
+        }
+    }
+
+    /// `replaceCurrent`: the query becomes the chosen emoji.
+    pub fn choose_suggestion(&mut self, row: &crate::emoji_suggest::Row, cx: &mut Context<Self>) {
+        use crate::emoji_suggest::Query;
+        let Some(suggest) = self.suggest.clone() else {
+            return;
+        };
+        let (query, start) = {
+            let s = suggest.borrow();
+            (s.query.clone(), s.query_start)
+        };
+        let Some(emoji) = tdr_emoji::get(row.emoji) else {
+            return;
+        };
+        let text = emoji.text();
+        let pos = self.selected_range.end.min(self.content.len());
+        match query {
+            Query::Text(_) if start <= pos => {
+                let original = self.content[start..pos].to_string();
+                self.replace_tracked(start..pos, &text, original);
+                if let Some(id) = row.custom {
+                    self.tags.push(TagSpan {
+                        range: start..start + text.len(),
+                        tag: Tag::CustomEmoji(id),
+                    });
+                }
+            }
+            Query::Emoji { count, .. } if start <= pos => {
+                let one = (pos - start) / count.max(1);
+                let mut at = start;
+                self.edit(start..pos, &text.repeat(count), EditKind::Other);
+                for _ in 0..count {
+                    if let Some(id) = row.custom {
+                        self.tags.push(TagSpan {
+                            range: at..at + text.len(),
+                            tag: Tag::CustomEmoji(id),
+                        });
+                    }
+                    at += text.len();
+                }
+                let _ = one;
+                self.selected_range = at..at;
+                self.last_edit = None;
+            }
+            _ => return,
+        }
+        normalize(&self.content, &mut self.tags);
+        self.text_changed_for_suggest(false);
+        cx.notify();
+    }
+
+    fn tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.suggest_key(crate::emoji_suggest::Key::Tab, cx) {
+            cx.propagate();
+        }
+    }
+
+    fn field_escape(&mut self, _: &FieldEscape, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(suggest) = self.suggest.clone()
+            && suggest.borrow().visible()
+        {
+            suggest.borrow_mut().hide();
+            cx.notify();
+            return;
+        }
+        window.dispatch_action(Box::new(crate::ui::Escape), cx);
     }
 
     /// The lines the text takes, wrapped (1 when empty).
@@ -501,6 +815,8 @@ impl TextInput {
         self.undo.clear();
         self.redo.clear();
         self.last_edit = None;
+        self.replaced.clear();
+        self.cursor_moved_for_suggest();
         cx.notify();
     }
 
@@ -546,6 +862,7 @@ impl TextInput {
         self.selected_range = self.valid(s.selected);
         self.selection_reversed = s.reversed;
         self.marked_range = None;
+        self.replaced.clear();
     }
 
     /// Remembers the state before an edit (one step for a run of typed letters).
@@ -587,6 +904,12 @@ impl TextInput {
         self.before_edit(kind);
         self.content =
             (self.content[0..range.start].to_owned() + text + &self.content[range.end..]).into();
+        self.replaced = std::mem::take(&mut self.replaced)
+            .into_iter()
+            .filter_map(|r| {
+                shift_object(&r.range, &range, text.len()).map(|range| Replaced { range, ..r })
+            })
+            .collect();
         shift_tags(&mut self.tags, range, text.len());
         normalize(&self.content, &mut self.tags);
     }
@@ -695,6 +1018,9 @@ impl TextInput {
         if self.single_line {
             return;
         }
+        if self.suggest_key(crate::emoji_suggest::Key::Enter, cx) {
+            return;
+        }
         let trimmed = self.content.trim();
         if trimmed.is_empty() {
             return;
@@ -747,6 +1073,9 @@ impl TextInput {
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
+        if self.suggest_key(crate::emoji_suggest::Key::Arrow(-1), cx) {
+            return;
+        }
         if self.selected_range.is_empty() {
             self.move_to(self.previous_boundary(self.cursor_offset()), cx);
         } else {
@@ -755,6 +1084,9 @@ impl TextInput {
     }
 
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
+        if self.suggest_key(crate::emoji_suggest::Key::Arrow(1), cx) {
+            return;
+        }
         if self.selected_range.is_empty() {
             self.move_to(self.next_boundary(self.selected_range.end), cx);
         } else {
@@ -763,11 +1095,17 @@ impl TextInput {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if self.suggest_key(crate::emoji_suggest::Key::Arrow(-1), cx) {
+            return;
+        }
         let target = self.vertical_target(self.cursor_offset(), -1.).unwrap_or(0);
         self.move_to(target, cx);
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.suggest_key(crate::emoji_suggest::Key::Arrow(1), cx) {
+            return;
+        }
         let target = self
             .vertical_target(self.cursor_offset(), 1.)
             .unwrap_or(self.content.len());
@@ -891,6 +1229,11 @@ impl TextInput {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.revert_replace() {
+            self.text_changed_for_suggest(true);
+            cx.notify();
+            return;
+        }
         if self.selected_range.is_empty() {
             self.select_to(self.previous_boundary(self.cursor_offset()), cx)
         }
@@ -1124,6 +1467,7 @@ impl TextInput {
         let offset = self.clamp(offset);
         self.selected_range = offset..offset;
         self.last_edit = None;
+        self.cursor_moved_for_suggest();
         cx.notify()
     }
 
@@ -1191,6 +1535,7 @@ impl TextInput {
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.cursor_moved_for_suggest();
         let offset = self.clamp(offset);
         self.selected_range = self.valid(self.selected_range.clone());
         if self.selection_reversed {
@@ -1421,6 +1766,10 @@ impl EntityInputHandler for TextInput {
         );
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
+        if new_text.encode_utf16().count() == 1 {
+            self.instant_replace();
+        }
+        self.text_changed_for_suggest(true);
         cx.notify();
     }
 
@@ -1724,6 +2073,8 @@ impl Render for TextInput {
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::tab))
+            .on_action(cx.listener(Self::field_escape))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))

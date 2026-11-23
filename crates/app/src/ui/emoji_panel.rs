@@ -140,9 +140,9 @@ enum Slot {
 #[derive(Clone, Debug)]
 pub(super) struct SetSection {
     info: tdr_data::emoji_sets::SetInfo,
-    emoji: Vec<i64>,
+    pub(super) emoji: Vec<i64>,
     /// In the user's sets (can be removed).
-    installed: bool,
+    pub(super) installed: bool,
     /// Has emoji that need Premium (`isPremiumEmoji`).
     premium: bool,
 }
@@ -188,7 +188,7 @@ pub(super) struct EmojiPanel {
     results: Option<Vec<u16>>,
     /// The list's top left in the window at the last paint.
     origin: Rc<Cell<Point<Pixels>>>,
-    recent: tdr_emoji::recent::Recent,
+    pub(super) recent: tdr_emoji::recent::Recent,
     recent_path: Option<std::path::PathBuf>,
     /// The list's layout and width at the last frame.
     layout: Option<ListLayout>,
@@ -196,7 +196,7 @@ pub(super) struct EmojiPanel {
     /// A popup menu is open over the panel.
     menu_open: bool,
     /// The installed sets, then the featured ones.
-    sets: Vec<SetSection>,
+    pub(super) sets: Vec<SetSection>,
     sets_asked: bool,
     /// Collapsed sets opened by their "+N" badge.
     expanded: std::collections::HashSet<i64>,
@@ -633,7 +633,7 @@ impl MainView {
     }
 
     /// The emoji sets are asked for once (`refreshCustom` follows the data).
-    fn ensure_emoji_sets(&mut self) {
+    pub(super) fn ensure_emoji_sets(&mut self) {
         if !self.emoji_panel.sets_asked {
             self.emoji_panel.sets_asked = true;
             let _ = self.commands.send(Command::LoadEmojiSets);
