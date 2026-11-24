@@ -140,6 +140,8 @@ impl MainView {
                                 bounds.origin.x + gpx(x.floor()),
                                 bounds.origin.y + gpx(y.floor()),
                             );
+                            // Rendered before every other emoji.
+                            crate::custom_emoji::focus(id, side);
                             crate::custom_emoji::paint(id, at, side, fg, window);
                             if let Some(emoji) = alt {
                                 // The emoji above (`_emojiList`, one here).

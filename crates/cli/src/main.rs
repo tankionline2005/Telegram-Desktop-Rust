@@ -944,7 +944,7 @@ async fn probe_emoji_speed() -> Result<()> {
                     anim.out_point,
                     anim.frame_rate,
                     anim.frame_count(),
-                    anim.frame_count() as f64 * 1000. / anim.frame_rate,
+                    anim.frame_count() as f64 * 1000. / f64::from(anim.frame_rate),
                     t1.elapsed()
                 );
             }

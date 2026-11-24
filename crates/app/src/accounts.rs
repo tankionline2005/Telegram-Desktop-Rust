@@ -242,6 +242,7 @@ impl Accounts {
                     peer,
                     photo_id,
                     image,
+                    ..
                 } if slot.me.as_ref().is_some_and(|m| m.peer == *peer) => {
                     slot.userpic = Some((*photo_id, image.clone()));
                     cx.notify();

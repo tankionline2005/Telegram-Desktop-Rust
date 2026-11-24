@@ -20,6 +20,10 @@ pub(super) type TextKey = (PeerKey, i32);
 
 /// Keep at most this many measured texts.
 const CACHE_LIMIT: usize = 3000;
+/// Above this many, texts not used for `CACHE_KEEP` are dropped (measured again
+/// when scrolled back to: shaped glyphs take ~40 bytes a character).
+const CACHE_SOFT_LIMIT: usize = 300;
+const CACHE_KEEP: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(super) struct RichEntry {
     text: String,
@@ -28,6 +32,7 @@ pub(super) struct RichEntry {
     measured: Rc<Measured>,
     /// The last layout: width, skip block and the lines.
     layout: Option<((u32, u32, u32), Rc<Layout>)>,
+    used: Instant,
 }
 
 /// Selected text in one message.
@@ -206,11 +211,12 @@ impl MainView {
     ) -> Rc<Measured> {
         let scale = window.scale_factor().to_bits();
         let mut cache = self.text_ui.cache.borrow_mut();
-        if let Some(e) = cache.get(&key)
+        if let Some(e) = cache.get_mut(&key)
             && e.scale == scale
             && e.text == text
             && e.entities == entities
         {
+            e.used = Instant::now();
             return e.measured.clone();
         }
         if cache.len() > CACHE_LIMIT {
@@ -226,6 +232,7 @@ impl MainView {
                 scale,
                 measured: measured.clone(),
                 layout: None,
+                used: Instant::now(),
             },
         );
         measured
@@ -253,6 +260,14 @@ impl MainView {
             return layout;
         }
         Rc::new(measured.layout(width, skip))
+    }
+
+    /// Drops the measured texts not used lately once there are many.
+    pub(super) fn trim_text_cache(&self) {
+        let mut cache = self.text_ui.cache.borrow_mut();
+        if cache.len() > CACHE_SOFT_LIMIT {
+            cache.retain(|_, e| e.used.elapsed() < CACHE_KEEP);
+        }
     }
 
     /// `TextPalette` of a message (`inTextPalette` / `outTextPalette`) and its quote

@@ -213,4 +213,9 @@
   Demo paste checks overwrite the user's clipboard: save and restore it, skip if it holds
   anything but text.
 - PowerShell paths with `[` `]` (this folder) need `-LiteralPath`; copy files with bash.
+- Custom emoji show only once every frame is rendered (silhouette until then; asked by
+  the user), workers render one emoji to its end in on-screen reading order, and the
+  long press preview (`custom_emoji::focus`) goes first, on all cores. `tdr-lottie`
+  keeps numbers in `f32` (as rlottie); check renderer changes against reference frames
+  with the ignored test `memory::tests::lottie_reference` (`LOTTIE_REF`, `LOTTIE_MODE`).
 

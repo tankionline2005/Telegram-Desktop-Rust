@@ -74,6 +74,20 @@ fn added(size: usize) {
     }
 }
 
+/// The window's part of the report, set by the window now and then.
+static UI_STATS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// The report is on (`TDR_MEMORY`).
+pub fn on() -> bool {
+    REPORT.load(Ordering::Relaxed)
+}
+
+static REPORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_ui_stats(stats: String) {
+    *UI_STATS.lock().unwrap() = stats;
+}
+
 /// Live heap bytes.
 pub fn live() -> usize {
     LIVE.load(Ordering::Relaxed)
@@ -89,17 +103,20 @@ pub fn init() {
         return;
     };
     BIG.store(mode == "big", Ordering::Relaxed);
+    REPORT.store(true, Ordering::Relaxed);
     std::thread::Builder::new()
         .name("memory-report".into())
         .spawn(|| {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 eprintln!(
-                    "memory: heap {} (peak {}); {}; {}",
+                    "memory: heap {} (peak {}); {}; {}; {}; {}",
                     mb(live()),
                     mb(PEAK.load(Ordering::Relaxed)),
                     crate::custom_emoji::stats(),
                     crate::emoji::stats(),
+                    crate::spoiler::stats(),
+                    UI_STATS.lock().unwrap(),
                 );
             }
         })
@@ -124,7 +141,99 @@ mod tests {
                 bytes.len() / 1024,
                 path.file_name().unwrap().to_string_lossy()
             );
+            for side in [35u32, 320] {
+                let mut pixmap = tdr_lottie::tiny_skia::Pixmap::new(side, side).unwrap();
+                let t = std::time::Instant::now();
+                let n = anim.frame_count().min(180);
+                for k in 0..n {
+                    pixmap.fill(tdr_lottie::tiny_skia::Color::TRANSPARENT);
+                    anim.render_into(k, &mut pixmap);
+                }
+                eprintln!("    {side} px: {n} frames in {:?}", t.elapsed());
+            }
             drop(anim);
         }
+    }
+
+    /// `LOTTIE_REF=<dir>` with `LOTTIE_MODE=dump|compare`: renders the custom
+    /// emoji in the file cache (read only) and the files of `TGS_DIR` at four
+    /// frames, and keeps them or compares them with the kept ones (a renderer
+    /// change must not change the pictures).
+    #[test]
+    #[ignore]
+    fn lottie_reference() {
+        let out = std::path::PathBuf::from(std::env::var("LOTTIE_REF").unwrap());
+        let dump = std::env::var("LOTTIE_MODE").as_deref() == Ok("dump");
+        std::fs::create_dir_all(&out).unwrap();
+        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+        if let Ok(dir) = std::env::var("TGS_DIR") {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let path = e.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                files.push((name, std::fs::read(&path).unwrap()));
+            }
+        }
+        if let Ok(mut cache) =
+            tdr_data::tdr_storage::FileCache::open_read_only(crate::data_dir().join("files"))
+        {
+            for key in cache.keys("emoji-file:", 400).unwrap_or_default() {
+                if let Ok(Some(bytes)) = cache.get(&key)
+                    && bytes.starts_with(&[0x1f, 0x8b])
+                {
+                    files.push((key.replace(':', "_"), bytes));
+                }
+            }
+        }
+        let (mut same, mut changed, mut worst) = (0, 0, 0u8);
+        let mut rendering = std::time::Duration::ZERO;
+        let mut parsed = 0usize;
+        for (name, bytes) in &files {
+            let before = super::live();
+            let Ok(anim) = tdr_lottie::Animation::from_tgs(bytes) else {
+                continue;
+            };
+            parsed += super::live() - before;
+            let n = anim.frame_count();
+            let mut pixels = Vec::new();
+            let t = std::time::Instant::now();
+            for k in [0, n / 3, 2 * n / 3, n.saturating_sub(1)] {
+                pixels.extend_from_slice(anim.render(k, 100, 100).unwrap().data());
+            }
+            let mut small = tdr_lottie::tiny_skia::Pixmap::new(35, 35).unwrap();
+            for k in 0..n.min(180) {
+                small.fill(tdr_lottie::tiny_skia::Color::TRANSPARENT);
+                anim.render_into(k, &mut small);
+            }
+            rendering += t.elapsed();
+            let path = out.join(format!("{name}.raw"));
+            if dump {
+                std::fs::write(&path, &pixels).unwrap();
+                continue;
+            }
+            let reference = std::fs::read(&path).unwrap();
+            let max = reference
+                .iter()
+                .zip(&pixels)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0);
+            let off = reference
+                .iter()
+                .zip(&pixels)
+                .filter(|(a, b)| a.abs_diff(**b) > 2)
+                .count();
+            if max <= 2 {
+                same += 1;
+            } else {
+                changed += 1;
+                eprintln!("{name}: max diff {max}, {off} channels over 2");
+            }
+            worst = worst.max(max);
+        }
+        eprintln!(
+            "{} animations, parsed {} KB, rendering {rendering:?}: {same} same,              {changed} changed, worst {worst}",
+            files.len(),
+            parsed / 1024,
+        );
     }
 }

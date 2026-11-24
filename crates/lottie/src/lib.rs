@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::io::Read;
 
 use serde_json::Value;
+use smallvec::{SmallVec, smallvec};
 pub use tiny_skia;
 use tiny_skia::{
     FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Mask, MaskType, Paint, PathBuilder,
@@ -42,14 +43,18 @@ impl std::error::Error for Error {}
 
 // ---------------------------------------------------------------- properties ----
 
+/// A property's numbers: up to four stay inline (no allocation), as most are
+/// (positions, scales, colors, opacities); gradients spill to the heap.
+type Vals = SmallVec<[f32; 4]>;
+
 /// The easing between two keys of one dimension: the out tangent of the first and
 /// the in tangent of the second (a CSS-like cubic bezier from (0,0) to (1,1)).
 #[derive(Clone, Copy, Debug)]
 struct Ease {
-    ox: f64,
-    oy: f64,
-    ix: f64,
-    iy: f64,
+    ox: f32,
+    oy: f32,
+    ix: f32,
+    iy: f32,
 }
 
 impl Ease {
@@ -60,7 +65,7 @@ impl Ease {
         iy: 1.,
     };
 
-    fn at(&self, t: f64) -> f64 {
+    fn at(&self, t: f32) -> f32 {
         if t <= 0. {
             return 0.;
         }
@@ -71,7 +76,7 @@ impl Ease {
         if (x1 - y1).abs() < 1e-9 && (x2 - y2).abs() < 1e-9 {
             return t;
         }
-        let bez = |a: f64, b: f64, u: f64| {
+        let bez = |a: f32, b: f32, u: f32| {
             let v = 1. - u;
             3. * v * v * u * a + 3. * v * u * u * b + u * u * u
         };
@@ -94,20 +99,20 @@ impl Ease {
     }
 }
 
+/// A path: per vertex its point and its in and out tangents (`v`, `i`, `o`),
+/// in one list (one allocation per path value).
 #[derive(Clone, Debug, Default)]
 struct Bezier {
     closed: bool,
-    v: Vec<[f64; 2]>,
-    i: Vec<[f64; 2]>,
-    o: Vec<[f64; 2]>,
+    pts: Vec<[[f32; 2]; 3]>,
 }
 
 trait Animatable: Clone {
-    fn mix(a: &Self, b: &Self, t: &dyn Fn(usize) -> f64) -> Self;
+    fn mix(a: &Self, b: &Self, t: &dyn Fn(usize) -> f32) -> Self;
 }
 
-impl Animatable for Vec<f64> {
-    fn mix(a: &Self, b: &Self, t: &dyn Fn(usize) -> f64) -> Self {
+impl Animatable for Vals {
+    fn mix(a: &Self, b: &Self, t: &dyn Fn(usize) -> f32) -> Self {
         a.iter()
             .enumerate()
             .map(|(k, x)| {
@@ -119,36 +124,35 @@ impl Animatable for Vec<f64> {
 }
 
 impl Animatable for Bezier {
-    fn mix(a: &Self, b: &Self, t: &dyn Fn(usize) -> f64) -> Self {
+    fn mix(a: &Self, b: &Self, t: &dyn Fn(usize) -> f32) -> Self {
         let t = t(0);
-        let lerp = |p: &[[f64; 2]], q: &[[f64; 2]]| -> Vec<[f64; 2]> {
-            p.iter()
-                .zip(q.iter().chain(std::iter::repeat(&[0., 0.])))
-                .map(|(p, q)| [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t])
-                .collect()
-        };
-        if a.v.len() != b.v.len() {
+        if a.pts.len() != b.pts.len() {
             return if t < 1. { a.clone() } else { b.clone() };
         }
+        let lerp = |p: [f32; 2], q: [f32; 2]| [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t];
         Bezier {
             closed: a.closed,
-            v: lerp(&a.v, &b.v),
-            i: lerp(&a.i, &b.i),
-            o: lerp(&a.o, &b.o),
+            pts: a
+                .pts
+                .iter()
+                .zip(&b.pts)
+                .map(|(p, q)| [lerp(p[0], q[0]), lerp(p[1], q[1]), lerp(p[2], q[2])])
+                .collect(),
         }
     }
 }
 
 #[derive(Clone, Debug)]
 struct Key<T> {
-    t: f64,
+    t: f32,
     s: T,
-    e: Option<T>,
+    /// The end value of old files (newer ones end at the next key's start).
+    e: Option<Box<T>>,
     hold: bool,
-    ease: Vec<Ease>,
+    ease: SmallVec<[Ease; 1]>,
     /// Spatial tangents of a position key (`to`, `ti`).
-    to: Option<[f64; 2]>,
-    ti: Option<[f64; 2]>,
+    to: Option<[f32; 2]>,
+    ti: Option<[f32; 2]>,
 }
 
 #[derive(Clone, Debug)]
@@ -158,7 +162,7 @@ enum Prop<T> {
 }
 
 impl<T: Animatable> Prop<T> {
-    fn at(&self, frame: f64) -> T {
+    fn at(&self, frame: f32) -> T {
         match self {
             Prop::Static(v) => v.clone(),
             Prop::Animated(keys) => {
@@ -179,7 +183,7 @@ impl<T: Animatable> Prop<T> {
                 }
                 let span = (b.t - a.t).max(1e-9);
                 let p = ((frame - a.t) / span).clamp(0., 1.);
-                let end = a.e.as_ref().unwrap_or(&b.s);
+                let end = a.e.as_deref().unwrap_or(&b.s);
                 let ease = &a.ease;
                 T::mix(&a.s, end, &|dim| {
                     let e = ease
@@ -194,9 +198,9 @@ impl<T: Animatable> Prop<T> {
     }
 }
 
-impl Prop<Vec<f64>> {
+impl Prop<Vals> {
     /// A position with spatial tangents moves along the curve between its keys.
-    fn at_spatial(&self, frame: f64) -> Vec<f64> {
+    fn at_spatial(&self, frame: f32) -> Vals {
         let Prop::Animated(keys) = self else {
             return self.at(frame);
         };
@@ -214,7 +218,7 @@ impl Prop<Vec<f64>> {
         if to == [0., 0.] && ti == [0., 0.] {
             return self.at(frame);
         }
-        let end = a.e.as_ref().unwrap_or(&b.s);
+        let end = a.e.as_deref().unwrap_or(&b.s);
         if a.s.len() < 2 || end.len() < 2 {
             return self.at(frame);
         }
@@ -231,7 +235,7 @@ impl Prop<Vec<f64>> {
             .at(((frame - a.t) / span).clamp(0., 1.));
         // Along the curve by its length.
         const N: usize = 40;
-        let point = |u: f64| -> [f64; 2] {
+        let point = |u: f32| -> [f32; 2] {
             let v = 1. - u;
             let w = [v * v * v, 3. * v * v * u, 3. * v * u * u, u * u * u];
             [
@@ -239,10 +243,10 @@ impl Prop<Vec<f64>> {
                 w[0] * p0[1] + w[1] * p1[1] + w[2] * p2[1] + w[3] * p3[1],
             ]
         };
-        let mut lengths = [0f64; N + 1];
+        let mut lengths = [0f32; N + 1];
         let mut prev = p0;
         for (i, l) in lengths.iter_mut().enumerate().skip(1) {
-            let q = point(i as f64 / N as f64);
+            let q = point(i as f32 / N as f32);
             *l = ((q[0] - prev[0]).powi(2) + (q[1] - prev[1]).powi(2)).sqrt();
             prev = q;
         }
@@ -252,9 +256,9 @@ impl Prop<Vec<f64>> {
         let target = lengths[N] * p;
         let i = lengths.partition_point(|l| *l < target).clamp(1, N);
         let seg = (lengths[i] - lengths[i - 1]).max(1e-9);
-        let u = ((i - 1) as f64 + (target - lengths[i - 1]) / seg) / N as f64;
+        let u = ((i - 1) as f32 + (target - lengths[i - 1]) / seg) / N as f32;
         let q = point(u);
-        let mut out = vec![q[0], q[1]];
+        let mut out: Vals = smallvec![q[0], q[1]];
         if a.s.len() > 2 {
             out.push(a.s[2]);
         }
@@ -262,21 +266,21 @@ impl Prop<Vec<f64>> {
     }
 }
 
-fn num(v: &Value) -> f64 {
+fn num(v: &Value) -> f32 {
     match v {
         Value::Array(a) => a.first().map_or(0., num),
-        v => v.as_f64().unwrap_or(0.),
+        v => v.as_f64().unwrap_or(0.) as f32,
     }
 }
 
-fn nums(v: &Value) -> Vec<f64> {
+fn nums(v: &Value) -> Vals {
     match v {
         Value::Array(a) => a.iter().map(num).collect(),
-        v => vec![num(v)],
+        v => smallvec![num(v)],
     }
 }
 
-fn point2(v: &Value) -> [f64; 2] {
+fn point2(v: &Value) -> [f32; 2] {
     let n = nums(v);
     [
         n.first().copied().unwrap_or(0.),
@@ -284,13 +288,13 @@ fn point2(v: &Value) -> [f64; 2] {
     ]
 }
 
-fn ease_list(o: &Value, i: &Value) -> Vec<Ease> {
+fn ease_list(o: &Value, i: &Value) -> SmallVec<[Ease; 1]> {
     let ox = nums(&o["x"]);
     let oy = nums(&o["y"]);
     let ix = nums(&i["x"]);
     let iy = nums(&i["y"]);
     let dims = ox.len().max(oy.len()).max(ix.len()).max(iy.len()).max(1);
-    let get = |v: &Vec<f64>, k: usize, d: f64| v.get(k).or(v.first()).copied().unwrap_or(d);
+    let get = |v: &Vals, k: usize, d: f32| v.get(k).or(v.first()).copied().unwrap_or(d);
     (0..dims)
         .map(|k| Ease {
             ox: get(&ox, k, 0.),
@@ -321,7 +325,7 @@ fn parse_prop<T: Clone>(v: &Value, value: &dyn Fn(&Value) -> Option<T>, default:
             Some(s) => s,
             // Old files: the last key has no value, the previous key's end.
             None => match keys.last() {
-                Some(prev) => prev.e.clone().unwrap_or_else(|| prev.s.clone()),
+                Some(prev) => prev.e.as_deref().unwrap_or(&prev.s).clone(),
                 None => default.clone(),
             },
         };
@@ -329,12 +333,12 @@ fn parse_prop<T: Clone>(v: &Value, value: &dyn Fn(&Value) -> Option<T>, default:
         keys.push(Key {
             t: num(&f["t"]),
             s,
-            e,
+            e: e.map(Box::new),
             hold: f["h"].as_i64() == Some(1) || f["h"].as_bool() == Some(true),
             ease: if f.get("o").is_some() {
                 ease_list(&f["o"], &f["i"])
             } else {
-                vec![Ease::LINEAR]
+                smallvec![Ease::LINEAR]
             },
             to: f.get("to").filter(|v| v.is_array()).map(point2),
             ti: f.get("ti").filter(|v| v.is_array()).map(point2),
@@ -346,15 +350,15 @@ fn parse_prop<T: Clone>(v: &Value, value: &dyn Fn(&Value) -> Option<T>, default:
     Prop::Animated(keys)
 }
 
-fn numbers(v: &Value, default: Vec<f64>) -> Prop<Vec<f64>> {
+fn numbers(v: &Value, default: Vals) -> Prop<Vals> {
     if v.is_null() {
         return Prop::Static(default);
     }
     parse_prop(v, &|k| Some(nums(k)), default)
 }
 
-fn scalar(v: &Value, default: f64) -> Prop<Vec<f64>> {
-    numbers(v, vec![default])
+fn scalar(v: &Value, default: f32) -> Prop<Vals> {
+    numbers(v, smallvec![default])
 }
 
 fn bezier_of(v: &Value) -> Option<Bezier> {
@@ -362,17 +366,14 @@ fn bezier_of(v: &Value) -> Option<Bezier> {
         Value::Array(a) => a.first()?,
         v => v,
     };
-    let pts = |key: &str| -> Vec<[f64; 2]> {
-        v[key]
-            .as_array()
-            .map(|a| a.iter().map(point2).collect())
-            .unwrap_or_default()
-    };
+    let list = |key: &str| v[key].as_array().map(Vec::as_slice).unwrap_or_default();
+    let (vs, is, os) = (list("v"), list("i"), list("o"));
+    let at = |l: &[Value], k: usize| l.get(k).map_or([0., 0.], point2);
     Some(Bezier {
         closed: v["c"].as_bool().unwrap_or(false),
-        v: pts("v"),
-        i: pts("i"),
-        o: pts("o"),
+        pts: (0..vs.len())
+            .map(|k| [at(vs, k), at(is, k), at(os, k)])
+            .collect(),
     })
 }
 
@@ -381,15 +382,15 @@ fn shape_prop(v: &Value) -> Prop<Bezier> {
 }
 
 trait PropExt {
-    fn f(&self, frame: f64) -> f64;
-    fn p(&self, frame: f64) -> [f64; 2];
+    fn f(&self, frame: f32) -> f32;
+    fn p(&self, frame: f32) -> [f32; 2];
 }
 
-impl PropExt for Prop<Vec<f64>> {
-    fn f(&self, frame: f64) -> f64 {
+impl PropExt for Prop<Vals> {
+    fn f(&self, frame: f32) -> f32 {
         self.at(frame).first().copied().unwrap_or(0.)
     }
-    fn p(&self, frame: f64) -> [f64; 2] {
+    fn p(&self, frame: f32) -> [f32; 2] {
         let v = self.at(frame);
         [
             v.first().copied().unwrap_or(0.),
@@ -402,19 +403,19 @@ impl PropExt for Prop<Vec<f64>> {
 
 #[derive(Clone, Debug)]
 enum Position {
-    Joined(Prop<Vec<f64>>),
-    Split(Prop<Vec<f64>>, Prop<Vec<f64>>),
+    Joined(Prop<Vals>),
+    Split(Prop<Vals>, Prop<Vals>),
 }
 
 #[derive(Clone, Debug)]
 struct Tr {
-    a: Prop<Vec<f64>>,
+    a: Prop<Vals>,
     p: Position,
-    s: Prop<Vec<f64>>,
-    r: Prop<Vec<f64>>,
-    o: Prop<Vec<f64>>,
-    sk: Prop<Vec<f64>>,
-    sa: Prop<Vec<f64>>,
+    s: Prop<Vals>,
+    r: Prop<Vals>,
+    o: Prop<Vals>,
+    sk: Prop<Vals>,
+    sa: Prop<Vals>,
 }
 
 impl Tr {
@@ -424,7 +425,7 @@ impl Tr {
             if p["s"].as_bool() == Some(true) || p.get("x").is_some() && p.get("k").is_none() {
                 Position::Split(scalar(&p["x"], 0.), scalar(&p["y"], 0.))
             } else {
-                Position::Joined(numbers(p, vec![0., 0.]))
+                Position::Joined(numbers(p, smallvec![0., 0.]))
             };
         let r = if v.get("r").is_some() {
             &v["r"]
@@ -432,9 +433,9 @@ impl Tr {
             &v["rz"]
         };
         Tr {
-            a: numbers(&v["a"], vec![0., 0.]),
+            a: numbers(&v["a"], smallvec![0., 0.]),
             p: position,
-            s: numbers(&v["s"], vec![100., 100.]),
+            s: numbers(&v["s"], smallvec![100., 100.]),
             r: scalar(r, 0.),
             o: scalar(&v["o"], 100.),
             sk: scalar(&v["sk"], 0.),
@@ -442,7 +443,7 @@ impl Tr {
         }
     }
 
-    fn matrix(&self, f: f64) -> Transform {
+    fn matrix(&self, f: f32) -> Transform {
         let a = self.a.p(f);
         let p = match &self.p {
             Position::Joined(p) => {
@@ -457,58 +458,56 @@ impl Tr {
         let s = self.s.p(f);
         let r = self.r.f(f);
         let sk = self.sk.f(f);
-        let mut m = Transform::from_translate(-a[0] as f32, -a[1] as f32)
-            .post_scale((s[0] / 100.) as f32, (s[1] / 100.) as f32);
+        let mut m = Transform::from_translate(-a[0], -a[1]).post_scale(s[0] / 100., s[1] / 100.);
         if sk != 0. {
-            let sa = self.sa.f(f) as f32;
-            let tan = (-sk.to_radians()).tan() as f32;
+            let sa = self.sa.f(f);
+            let tan = (-sk.to_radians()).tan();
             m = m
                 .post_rotate(sa)
                 .post_concat(Transform::from_row(1., 0., tan, 1., 0., 0.))
                 .post_rotate(-sa);
         }
-        m.post_rotate(r as f32)
-            .post_translate(p[0] as f32, p[1] as f32)
+        m.post_rotate(r).post_translate(p[0], p[1])
     }
 
-    fn opacity(&self, f: f64) -> f32 {
-        (self.o.f(f) / 100.).clamp(0., 1.) as f32
+    fn opacity(&self, f: f32) -> f32 {
+        (self.o.f(f) / 100.).clamp(0., 1.)
     }
 }
 
 #[derive(Clone, Debug)]
 struct Gradient {
     linear: bool,
-    s: Prop<Vec<f64>>,
-    e: Prop<Vec<f64>>,
-    h: Prop<Vec<f64>>,
-    a: Prop<Vec<f64>>,
+    s: Prop<Vals>,
+    e: Prop<Vals>,
+    h: Prop<Vals>,
+    a: Prop<Vals>,
     count: usize,
-    k: Prop<Vec<f64>>,
+    k: Prop<Vals>,
 }
 
 impl Gradient {
     fn parse(v: &Value) -> Gradient {
         Gradient {
             linear: v["t"].as_i64() != Some(2),
-            s: numbers(&v["s"], vec![0., 0.]),
-            e: numbers(&v["e"], vec![0., 0.]),
+            s: numbers(&v["s"], smallvec![0., 0.]),
+            e: numbers(&v["e"], smallvec![0., 0.]),
             h: scalar(&v["h"], 0.),
             a: scalar(&v["a"], 0.),
             count: v["g"]["p"].as_u64().unwrap_or(0) as usize,
-            k: numbers(&v["g"]["k"], Vec::new()),
+            k: numbers(&v["g"]["k"], Vals::new()),
         }
     }
 
-    fn stops(&self, f: f64, alpha: f32) -> Vec<GradientStop> {
+    fn stops(&self, f: f32, alpha: f32) -> Vec<GradientStop> {
         let k = self.k.at(f);
         let n = self.count.min(k.len() / 4);
-        let alphas: Vec<(f64, f64)> = k[n * 4..]
+        let alphas: Vec<(f32, f32)> = k[n * 4..]
             .chunks(2)
             .filter(|c| c.len() == 2)
             .map(|c| (c[0], c[1]))
             .collect();
-        let alpha_at = |pos: f64| -> f64 {
+        let alpha_at = |pos: f32| -> f32 {
             if alphas.is_empty() {
                 return 1.;
             }
@@ -526,13 +525,13 @@ impl Gradient {
         (0..n)
             .map(|i| {
                 let c = &k[i * 4..i * 4 + 4];
-                let a = (alpha_at(c[0]) as f32 * alpha).clamp(0., 1.);
+                let a = (alpha_at(c[0]) * alpha).clamp(0., 1.);
                 GradientStop::new(
-                    c[0] as f32,
+                    c[0],
                     tiny_skia::Color::from_rgba(
-                        c[1].clamp(0., 1.) as f32,
-                        c[2].clamp(0., 1.) as f32,
-                        c[3].clamp(0., 1.) as f32,
+                        c[1].clamp(0., 1.),
+                        c[2].clamp(0., 1.),
+                        c[3].clamp(0., 1.),
                         a,
                     )
                     .unwrap_or(tiny_skia::Color::TRANSPARENT),
@@ -541,7 +540,7 @@ impl Gradient {
             .collect()
     }
 
-    fn shader(&self, f: f64, alpha: f32, m: Transform) -> Option<Shader<'static>> {
+    fn shader(&self, f: f32, alpha: f32, m: Transform) -> Option<Shader<'static>> {
         let mut stops = self.stops(f, alpha);
         if stops.is_empty() {
             return None;
@@ -551,30 +550,27 @@ impl Gradient {
         }
         let s = self.s.p(f);
         let e = self.e.p(f);
-        let sp = Point::from_xy(s[0] as f32, s[1] as f32);
-        let ep = Point::from_xy(e[0] as f32, e[1] as f32);
+        let sp = Point::from_xy(s[0], s[1]);
+        let ep = Point::from_xy(e[0], e[1]);
         if self.linear {
             LinearGradient::new(sp, ep, stops, SpreadMode::Pad, m)
         } else {
             let r = ((e[0] - s[0]).powi(2) + (e[1] - s[1]).powi(2)).sqrt();
             let angle = (e[1] - s[1]).atan2(e[0] - s[0]) + self.a.f(f).to_radians();
             let h = (self.h.f(f) / 100.).clamp(-0.99, 0.99);
-            let focal = Point::from_xy(
-                (s[0] + angle.cos() * r * h) as f32,
-                (s[1] + angle.sin() * r * h) as f32,
-            );
-            RadialGradient::new(focal, sp, r.max(0.01) as f32, stops, SpreadMode::Pad, m)
+            let focal = Point::from_xy(s[0] + angle.cos() * r * h, s[1] + angle.sin() * r * h);
+            RadialGradient::new(focal, sp, r.max(0.01), stops, SpreadMode::Pad, m)
         }
     }
 }
 
 #[derive(Clone, Debug)]
 struct StrokeStyle {
-    w: Prop<Vec<f64>>,
+    w: Prop<Vals>,
     cap: LineCap,
     join: LineJoin,
     miter: f32,
-    dashes: Vec<(char, Prop<Vec<f64>>)>,
+    dashes: Vec<(char, Prop<Vals>)>,
 }
 
 impl StrokeStyle {
@@ -591,7 +587,7 @@ impl StrokeStyle {
                 Some(3) => LineJoin::Bevel,
                 _ => LineJoin::Miter,
             },
-            miter: v["ml"].as_f64().unwrap_or(4.) as f32,
+            miter: v["ml"].as_f64().map_or(4., |v| v as f32),
             dashes: v["d"]
                 .as_array()
                 .map(|a| {
@@ -611,8 +607,8 @@ impl StrokeStyle {
         }
     }
 
-    fn stroke(&self, f: f64) -> Option<Stroke> {
-        let width = self.w.f(f) as f32;
+    fn stroke(&self, f: f32) -> Option<Stroke> {
+        let width = self.w.f(f);
         if width <= 0. {
             return None;
         }
@@ -628,8 +624,8 @@ impl StrokeStyle {
             let mut offset = 0.;
             for (kind, v) in &self.dashes {
                 match kind {
-                    'o' => offset = v.f(f) as f32,
-                    _ => array.push(v.f(f).max(0.) as f32),
+                    'o' => offset = v.f(f),
+                    _ => array.push(v.f(f).max(0.)),
                 }
             }
             if array.len() % 2 == 1 {
@@ -647,56 +643,56 @@ impl StrokeStyle {
 enum Item {
     Group {
         items: Vec<Item>,
-        tr: Option<Tr>,
+        tr: Option<Box<Tr>>,
     },
     Path {
         shape: Prop<Bezier>,
         reversed: bool,
     },
     Rect {
-        p: Prop<Vec<f64>>,
-        s: Prop<Vec<f64>>,
-        r: Prop<Vec<f64>>,
+        p: Prop<Vals>,
+        s: Prop<Vals>,
+        r: Prop<Vals>,
         reversed: bool,
     },
     Ellipse {
-        p: Prop<Vec<f64>>,
-        s: Prop<Vec<f64>>,
+        p: Prop<Vals>,
+        s: Prop<Vals>,
         reversed: bool,
     },
     Star {
         star: bool,
-        p: Prop<Vec<f64>>,
-        or: Prop<Vec<f64>>,
-        ir: Prop<Vec<f64>>,
-        pt: Prop<Vec<f64>>,
-        r: Prop<Vec<f64>>,
+        p: Prop<Vals>,
+        or: Prop<Vals>,
+        ir: Prop<Vals>,
+        pt: Prop<Vals>,
+        r: Prop<Vals>,
         reversed: bool,
     },
     Fill {
-        c: Prop<Vec<f64>>,
-        o: Prop<Vec<f64>>,
+        c: Prop<Vals>,
+        o: Prop<Vals>,
         rule: FillRule,
     },
     Stroke {
-        c: Prop<Vec<f64>>,
-        o: Prop<Vec<f64>>,
+        c: Prop<Vals>,
+        o: Prop<Vals>,
         style: StrokeStyle,
     },
     GradientFill {
-        g: Gradient,
-        o: Prop<Vec<f64>>,
+        g: Box<Gradient>,
+        o: Prop<Vals>,
         rule: FillRule,
     },
     GradientStroke {
-        g: Gradient,
-        o: Prop<Vec<f64>>,
+        g: Box<Gradient>,
+        o: Prop<Vals>,
         style: StrokeStyle,
     },
     Trim {
-        s: Prop<Vec<f64>>,
-        e: Prop<Vec<f64>>,
-        o: Prop<Vec<f64>>,
+        s: Prop<Vals>,
+        e: Prop<Vals>,
+        o: Prop<Vals>,
     },
 }
 
@@ -716,7 +712,10 @@ fn parse_items(list: &Value) -> Vec<Item> {
             Some(match v["ty"].as_str()? {
                 "gr" => {
                     let items = v["it"].as_array().cloned().unwrap_or_default();
-                    let tr = items.iter().find(|i| i["ty"] == "tr").map(Tr::parse);
+                    let tr = items
+                        .iter()
+                        .find(|i| i["ty"] == "tr")
+                        .map(|t| Box::new(Tr::parse(t)));
                     Item::Group {
                         items: parse_items(&Value::Array(items)),
                         tr,
@@ -727,19 +726,19 @@ fn parse_items(list: &Value) -> Vec<Item> {
                     reversed,
                 },
                 "rc" => Item::Rect {
-                    p: numbers(&v["p"], vec![0., 0.]),
-                    s: numbers(&v["s"], vec![0., 0.]),
+                    p: numbers(&v["p"], smallvec![0., 0.]),
+                    s: numbers(&v["s"], smallvec![0., 0.]),
                     r: scalar(&v["r"], 0.),
                     reversed,
                 },
                 "el" => Item::Ellipse {
-                    p: numbers(&v["p"], vec![0., 0.]),
-                    s: numbers(&v["s"], vec![0., 0.]),
+                    p: numbers(&v["p"], smallvec![0., 0.]),
+                    s: numbers(&v["s"], smallvec![0., 0.]),
                     reversed,
                 },
                 "sr" => Item::Star {
                     star: v["sy"].as_i64() != Some(2),
-                    p: numbers(&v["p"], vec![0., 0.]),
+                    p: numbers(&v["p"], smallvec![0., 0.]),
                     or: scalar(&v["or"], 0.),
                     ir: scalar(&v["ir"], 0.),
                     pt: scalar(&v["pt"], 5.),
@@ -747,22 +746,22 @@ fn parse_items(list: &Value) -> Vec<Item> {
                     reversed,
                 },
                 "fl" => Item::Fill {
-                    c: numbers(&v["c"], vec![0., 0., 0.]),
+                    c: numbers(&v["c"], smallvec![0., 0., 0.]),
                     o: scalar(&v["o"], 100.),
                     rule,
                 },
                 "st" => Item::Stroke {
-                    c: numbers(&v["c"], vec![0., 0., 0.]),
+                    c: numbers(&v["c"], smallvec![0., 0., 0.]),
                     o: scalar(&v["o"], 100.),
                     style: StrokeStyle::parse(v),
                 },
                 "gf" => Item::GradientFill {
-                    g: Gradient::parse(v),
+                    g: Box::new(Gradient::parse(v)),
                     o: scalar(&v["o"], 100.),
                     rule,
                 },
                 "gs" => Item::GradientStroke {
-                    g: Gradient::parse(v),
+                    g: Box::new(Gradient::parse(v)),
                     o: scalar(&v["o"], 100.),
                     style: StrokeStyle::parse(v),
                 },
@@ -782,7 +781,7 @@ struct MaskDef {
     mode: char,
     inverted: bool,
     path: Prop<Bezier>,
-    opacity: Prop<Vec<f64>>,
+    opacity: Prop<Vals>,
 }
 
 #[derive(Clone, Debug)]
@@ -790,19 +789,19 @@ struct Layer {
     ty: i64,
     ind: Option<i64>,
     parent: Option<i64>,
-    ip: f64,
-    op: f64,
-    st: f64,
-    sr: f64,
+    ip: f32,
+    op: f32,
+    st: f32,
+    sr: f32,
     ks: Tr,
     shapes: Vec<Item>,
     ref_id: Option<String>,
-    tm: Option<Prop<Vec<f64>>>,
+    tm: Option<Prop<Vals>>,
     masks: Vec<MaskDef>,
     matte: i64,
     matte_source: bool,
     hidden: bool,
-    solid: Option<(f64, f64, [f32; 4])>,
+    solid: Option<(f32, f32, [f32; 4])>,
 }
 
 fn parse_color_hex(s: &str) -> [f32; 4] {
@@ -826,9 +825,12 @@ fn parse_layers(list: &Value) -> Vec<Layer> {
             ind: v["ind"].as_i64(),
             parent: v["parent"].as_i64(),
             ip: num(&v["ip"]),
-            op: v["op"].as_f64().unwrap_or(f64::MAX),
+            op: v["op"].as_f64().map_or(f32::MAX, |v| v as f32),
             st: num(&v["st"]),
-            sr: v["sr"].as_f64().filter(|s| *s != 0.).unwrap_or(1.),
+            sr: v["sr"]
+                .as_f64()
+                .filter(|s| *s != 0.)
+                .map_or(1., |v| v as f32),
             ks: Tr::parse(&v["ks"]),
             shapes: parse_items(&v["shapes"]),
             ref_id: v["refId"].as_str().map(str::to_string),
@@ -868,9 +870,9 @@ fn parse_layers(list: &Value) -> Vec<Layer> {
 pub struct Animation {
     pub width: u32,
     pub height: u32,
-    pub frame_rate: f64,
-    pub in_point: f64,
-    pub out_point: f64,
+    pub frame_rate: f32,
+    pub in_point: f32,
+    pub out_point: f32,
     layers: Vec<Layer>,
     assets: HashMap<String, Vec<Layer>>,
 }
@@ -900,7 +902,10 @@ impl Animation {
         Ok(Animation {
             width,
             height,
-            frame_rate: v["fr"].as_f64().filter(|f| *f > 0.).unwrap_or(60.),
+            frame_rate: v["fr"]
+                .as_f64()
+                .filter(|f| *f > 0.)
+                .map_or(60., |v| v as f32),
             in_point: num(&v["ip"]),
             out_point: num(&v["op"]),
             layers: parse_layers(&v["layers"]),
@@ -921,7 +926,7 @@ impl Animation {
     }
 
     pub fn render_into(&self, index: usize, pixmap: &mut Pixmap) {
-        let frame = self.in_point + index as f64;
+        let frame = self.in_point + index as f32;
         let base = Transform::from_scale(
             pixmap.width() as f32 / self.width.max(1) as f32,
             pixmap.height() as f32 / self.height.max(1) as f32,
@@ -932,7 +937,7 @@ impl Animation {
     fn draw_layers(
         &self,
         layers: &[Layer],
-        frame: f64,
+        frame: f32,
         base: Transform,
         alpha: f32,
         pixmap: &mut Pixmap,
@@ -996,12 +1001,12 @@ impl Animation {
     /// The layer's own time for its properties: rlottie evaluates a layer's
     /// transform, shapes and masks at its composition's frame (`mFrameNo`); the
     /// start time and the stretch only move a precomp's children (`timeRemap`).
-    fn local(_layer: &Layer, frame: f64) -> f64 {
+    fn local(_layer: &Layer, frame: f32) -> f32 {
         frame
     }
 
     /// `model::Layer::timeRemap`: the frame of a precomp's children.
-    fn child_frame(&self, layer: &Layer, frame: f64) -> f64 {
+    fn child_frame(&self, layer: &Layer, frame: f32) -> f32 {
         let f = match &layer.tm {
             Some(tm) => tm.f(frame) * self.frame_rate,
             None => frame - layer.st,
@@ -1009,7 +1014,7 @@ impl Animation {
         (f / layer.sr).trunc()
     }
 
-    fn layer_matrix(&self, layers: &[Layer], layer: &Layer, frame: f64, depth: usize) -> Transform {
+    fn layer_matrix(&self, layers: &[Layer], layer: &Layer, frame: f32, depth: usize) -> Transform {
         let own = layer.ks.matrix(Self::local(layer, frame));
         match layer.parent {
             Some(parent) if depth < 16 => match layers.iter().find(|l| l.ind == Some(parent)) {
@@ -1024,7 +1029,7 @@ impl Animation {
         &self,
         layers: &[Layer],
         layer: &Layer,
-        frame: f64,
+        frame: f32,
         base: Transform,
         w: u32,
         h: u32,
@@ -1044,7 +1049,7 @@ impl Animation {
             let mut data: Vec<u8> = one
                 .data()
                 .iter()
-                .map(|v| (f64::from(*v) * opacity) as u8)
+                .map(|v| (f32::from(*v) * opacity) as u8)
                 .collect();
             if def.inverted {
                 for v in &mut data {
@@ -1086,7 +1091,7 @@ impl Animation {
         &self,
         layers: &[Layer],
         layer: &Layer,
-        frame: f64,
+        frame: f32,
         base: Transform,
         alpha: f32,
         pixmap: &mut Pixmap,
@@ -1116,7 +1121,7 @@ impl Animation {
             }
             1 => {
                 if let Some((w, h, c)) = layer.solid
-                    && let Some(rect) = tiny_skia::Rect::from_xywh(0., 0., w as f32, h as f32)
+                    && let Some(rect) = tiny_skia::Rect::from_xywh(0., 0., w, h)
                 {
                     let mut paint = Paint {
                         anti_alias: true,
@@ -1138,7 +1143,7 @@ impl Animation {
 
 // ------------------------------------------------------------------ geometry ----
 
-type Pt = [f64; 2];
+type Pt = [f32; 2];
 
 /// One contour as cubic segments.
 #[derive(Clone, Debug)]
@@ -1149,23 +1154,22 @@ struct Contour {
 }
 
 fn bezier_contour(b: &Bezier, reversed: bool) -> Option<Contour> {
-    let n = b.v.len();
+    let n = b.pts.len();
     if n == 0 {
         return None;
     }
-    let get = |list: &[[f64; 2]], k: usize| list.get(k).copied().unwrap_or([0., 0.]);
     let mut segs = Vec::with_capacity(n);
     let count = if b.closed { n } else { n - 1 };
     for k in 0..count {
-        let a = b.v[k];
+        let a = b.pts[k][0];
         let next = (k + 1) % n;
-        let z = b.v[next];
-        let o = get(&b.o, k);
-        let i = get(&b.i, next);
+        let z = b.pts[next][0];
+        let o = b.pts[k][2];
+        let i = b.pts[next][1];
         segs.push([[a[0] + o[0], a[1] + o[1]], [z[0] + i[0], z[1] + i[1]], z]);
     }
     let c = Contour {
-        start: b.v[0],
+        start: b.pts[0][0],
         segs,
         closed: b.closed,
     };
@@ -1195,16 +1199,9 @@ fn bezier_path(b: &Bezier) -> Option<tiny_skia::Path> {
 fn to_path(contours: &[Contour]) -> Option<tiny_skia::Path> {
     let mut pb = PathBuilder::new();
     for c in contours {
-        pb.move_to(c.start[0] as f32, c.start[1] as f32);
+        pb.move_to(c.start[0], c.start[1]);
         for s in &c.segs {
-            pb.cubic_to(
-                s[0][0] as f32,
-                s[0][1] as f32,
-                s[1][0] as f32,
-                s[1][1] as f32,
-                s[2][0] as f32,
-                s[2][1] as f32,
-            );
+            pb.cubic_to(s[0][0], s[0][1], s[1][0], s[1][1], s[2][0], s[2][1]);
         }
         if c.closed {
             pb.close();
@@ -1214,11 +1211,8 @@ fn to_path(contours: &[Contour]) -> Option<tiny_skia::Path> {
 }
 
 fn map(m: &Transform, p: Pt) -> Pt {
-    let (x, y) = (p[0] as f32, p[1] as f32);
-    [
-        f64::from(m.sx * x + m.kx * y + m.tx),
-        f64::from(m.ky * x + m.sy * y + m.ty),
-    ]
+    let (x, y) = (p[0], p[1]);
+    [(m.sx * x + m.kx * y + m.tx), (m.ky * x + m.sy * y + m.ty)]
 }
 
 fn transform_contour(c: &Contour, m: &Transform) -> Contour {
@@ -1233,7 +1227,7 @@ fn transform_contour(c: &Contour, m: &Transform) -> Contour {
     }
 }
 
-const KAPPA: f64 = 0.552_284_749_8;
+const KAPPA: f32 = 0.552_284_8;
 
 fn ellipse(p: Pt, s: Pt, reversed: bool) -> Contour {
     let (rx, ry) = (s[0] / 2., s[1] / 2.);
@@ -1263,7 +1257,7 @@ fn line(a: Pt, b: Pt) -> [Pt; 3] {
     ]
 }
 
-fn rect(p: Pt, s: Pt, r: f64, reversed: bool) -> Contour {
+fn rect(p: Pt, s: Pt, r: f32, reversed: bool) -> Contour {
     let (w, h) = (s[0] / 2., s[1] / 2.);
     let r = r.min(w).min(h).max(0.);
     let (l, t, rt, b) = (p[0] - w, p[1] - h, p[0] + w, p[1] + h);
@@ -1301,15 +1295,15 @@ fn rect(p: Pt, s: Pt, r: f64, reversed: bool) -> Contour {
 fn star(
     star: bool,
     p: Pt,
-    outer: f64,
-    inner: f64,
-    points: f64,
-    rotation: f64,
+    outer: f32,
+    inner: f32,
+    points: f32,
+    rotation: f32,
     reversed: bool,
 ) -> Contour {
     let n = points.round().max(2.) as usize;
     let total = if star { n * 2 } else { n };
-    let step = std::f64::consts::TAU / total as f64;
+    let step = std::f32::consts::TAU / total as f32;
     let mut angle = (rotation - 90.).to_radians();
     let mut pts = Vec::with_capacity(total);
     for k in 0..total {
@@ -1329,7 +1323,7 @@ fn star(
     if reversed { reverse(&c) } else { c }
 }
 
-fn split(s0: Pt, s: &[Pt; 3], t: f64) -> ([Pt; 3], [Pt; 3]) {
+fn split(s0: Pt, s: &[Pt; 3], t: f32) -> ([Pt; 3], [Pt; 3]) {
     let lerp = |a: Pt, b: Pt| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
     let p01 = lerp(s0, s[0]);
     let p12 = lerp(s[0], s[1]);
@@ -1340,11 +1334,11 @@ fn split(s0: Pt, s: &[Pt; 3], t: f64) -> ([Pt; 3], [Pt; 3]) {
     ([p01, p012, mid], [p123, p23, s[2]])
 }
 
-fn seg_length(s0: Pt, s: &[Pt; 3]) -> f64 {
+fn seg_length(s0: Pt, s: &[Pt; 3]) -> f32 {
     let mut len = 0.;
     let mut prev = s0;
     for k in 1..=16 {
-        let u = f64::from(k) / 16.;
+        let u = f32::from(k as u8) / 16.;
         let v = 1. - u;
         let w = [v * v * v, 3. * v * v * u, 3. * v * u * u, u * u * u];
         let q = [
@@ -1358,7 +1352,7 @@ fn seg_length(s0: Pt, s: &[Pt; 3]) -> f64 {
 }
 
 /// The part of the contours between `from` and `to` (lengths along all of them).
-fn sub_path(contours: &[Contour], from: f64, to: f64) -> Vec<Contour> {
+fn sub_path(contours: &[Contour], from: f32, to: f32) -> Vec<Contour> {
     let mut out = Vec::new();
     let mut at = 0.;
     for c in contours {
@@ -1404,7 +1398,7 @@ fn sub_path(contours: &[Contour], from: f64, to: f64) -> Vec<Contour> {
     out
 }
 
-fn trim(contours: Vec<Contour>, s: f64, e: f64, o: f64) -> Vec<Contour> {
+fn trim(contours: Vec<Contour>, s: f32, e: f32, o: f32) -> Vec<Contour> {
     let (mut s, mut e) = (s / 100., e / 100.);
     if s > e {
         std::mem::swap(&mut s, &mut e);
@@ -1418,7 +1412,7 @@ fn trim(contours: Vec<Contour>, s: f64, e: f64, o: f64) -> Vec<Contour> {
     let shift = (o / 360.).rem_euclid(1.);
     s += shift;
     e += shift;
-    let total: f64 = contours
+    let total: f32 = contours
         .iter()
         .map(|c| {
             let mut s0 = c.start;
@@ -1429,7 +1423,7 @@ fn trim(contours: Vec<Contour>, s: f64, e: f64, o: f64) -> Vec<Contour> {
                     s0 = seg[2];
                     l
                 })
-                .sum::<f64>()
+                .sum::<f32>()
         })
         .sum();
     if s >= 1. {
@@ -1484,14 +1478,14 @@ impl StylePaint {
     }
 }
 
-fn solid(c: &[f64], alpha: f32) -> Shader<'static> {
+fn solid(c: &[f32], alpha: f32) -> Shader<'static> {
     let get = |k: usize| c.get(k).copied().unwrap_or(0.);
     let big = c.iter().take(3).any(|v| *v > 1.);
     let scale = if big { 255. } else { 1. };
     let color = tiny_skia::Color::from_rgba(
-        (get(0) / scale).clamp(0., 1.) as f32,
-        (get(1) / scale).clamp(0., 1.) as f32,
-        (get(2) / scale).clamp(0., 1.) as f32,
+        (get(0) / scale).clamp(0., 1.),
+        (get(1) / scale).clamp(0., 1.),
+        (get(2) / scale).clamp(0., 1.),
         alpha.clamp(0., 1.),
     )
     .unwrap_or(tiny_skia::Color::TRANSPARENT);
@@ -1500,16 +1494,16 @@ fn solid(c: &[f64], alpha: f32) -> Shader<'static> {
 
 #[derive(Clone, Copy)]
 struct TrimMod {
-    s: f64,
-    e: f64,
-    o: f64,
+    s: f32,
+    e: f32,
+    o: f32,
 }
 
 /// Walks a group's items bottom up (`rlottie`'s order): styles collect the paths
 /// above them, trims change those paths.
 fn walk(
     items: &[Item],
-    f: f64,
+    f: f32,
     m: Transform,
     alpha: f32,
     parent_styles: &[usize],
@@ -1521,7 +1515,7 @@ fn walk(
     for item in items.iter().rev() {
         match item {
             Item::Fill { c, o, rule } => {
-                let a = alpha * (o.f(f) / 100.).clamp(0., 1.) as f32;
+                let a = alpha * (o.f(f) / 100.).clamp(0., 1.);
                 active.push(styles.len());
                 styles.push(StylePaint {
                     kind: (a > 0.).then(|| StyleKind::Fill(solid(&c.at(f), a), *rule)),
@@ -1530,7 +1524,7 @@ fn walk(
                 });
             }
             Item::Stroke { c, o, style } => {
-                let a = alpha * (o.f(f) / 100.).clamp(0., 1.) as f32;
+                let a = alpha * (o.f(f) / 100.).clamp(0., 1.);
                 active.push(styles.len());
                 styles.push(StylePaint {
                     kind: style
@@ -1542,7 +1536,7 @@ fn walk(
                 });
             }
             Item::GradientFill { g, o, rule } => {
-                let a = alpha * (o.f(f) / 100.).clamp(0., 1.) as f32;
+                let a = alpha * (o.f(f) / 100.).clamp(0., 1.);
                 active.push(styles.len());
                 styles.push(StylePaint {
                     kind: g
@@ -1553,7 +1547,7 @@ fn walk(
                 });
             }
             Item::GradientStroke { g, o, style } => {
-                let a = alpha * (o.f(f) / 100.).clamp(0., 1.) as f32;
+                let a = alpha * (o.f(f) / 100.).clamp(0., 1.);
                 active.push(styles.len());
                 styles.push(StylePaint {
                     kind: match (g.shader(f, a, Transform::identity()), style.stroke(f)) {

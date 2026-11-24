@@ -1,8 +1,10 @@
 //! Spoiler particles, ported from `lib_ui/ui/effects/spoiler_mess.cpp`
 //! (`DefaultDescriptorText`): 9000 particles drawn into a square tile of 60 frames,
 //! 33 ms each; hidden text is covered by that tile repeated, in the palette's spoiler
-//! color. The tile is generated once per scale (tens of milliseconds) and tinted
-//! once per color.
+//! color. The tile is generated once per scale (tens of milliseconds, kept as
+//! one byte of coverage a pixel, like tdesktop's `Format_Alpha8` frames) and
+//! tinted per color; a tinted tile not painted for a while leaves memory and
+//! the GPU atlas (6 MB each at 125%).
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -22,11 +24,14 @@ const FADE_OUT: f64 = 200.;
 /// Coverage of every frame of the tile, `size` x `size` device pixels.
 struct Mask {
     size: usize,
-    frames: Vec<Vec<f32>>,
+    frames: Vec<Vec<u8>>,
 }
 
+/// Tinted tiles not painted for this long are dropped.
+const TINTED_KEEP: std::time::Duration = std::time::Duration::from_secs(10);
+
 static MASKS: LazyLock<Mutex<HashMap<u32, Arc<Mask>>>> = LazyLock::new(Default::default);
-type Tinted = HashMap<(u32, u32), (Arc<RenderImage>, usize)>;
+type Tinted = HashMap<(u32, u32), (Arc<RenderImage>, usize, Instant)>;
 static TINTED: LazyLock<Mutex<Tinted>> = LazyLock::new(Default::default);
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
@@ -196,7 +201,7 @@ fn generate(scale: f32) -> Mask {
                     }
                 }
             }
-            buf
+            buf.iter().map(|c| (c * 255.).round() as u8).collect()
         })
         .collect();
     Mask { size, frames }
@@ -205,8 +210,9 @@ fn generate(scale: f32) -> Mask {
 /// The tile in `color`, all frames, and its size in device pixels.
 fn tinted(color: Color, scale: f32) -> (Arc<RenderImage>, usize) {
     let key = (color.rgba(), scale.to_bits());
-    if let Some(t) = TINTED.lock().unwrap().get(&key) {
-        return t.clone();
+    if let Some(t) = TINTED.lock().unwrap().get_mut(&key) {
+        t.2 = Instant::now();
+        return (t.0.clone(), t.1);
     }
     let mask = {
         let cached = MASKS.lock().unwrap().get(&scale.to_bits()).cloned();
@@ -235,15 +241,58 @@ fn tinted(color: Color, scale: f32) -> (Arc<RenderImage>, usize) {
             let mut img = image::RgbaImage::new(mask.size as u32, mask.size as u32);
             for (px, c) in img.pixels_mut().zip(coverage) {
                 // GPUI expects BGRA.
-                px.0 = [b, g, r, (c * a * 255.).round() as u8];
+                px.0 = [b, g, r, (f32::from(*c) * a).round() as u8];
             }
             image::Frame::new(img)
         })
         .collect();
     let image = Arc::new(RenderImage::new(smallvec::SmallVec::from_vec(frames)));
-    let out = (image, mask.size);
-    TINTED.lock().unwrap().insert(key, out.clone());
-    out
+    TINTED
+        .lock()
+        .unwrap()
+        .insert(key, (image.clone(), mask.size, Instant::now()));
+    (image, mask.size)
+}
+
+/// Sizes for the memory report (`TDR_MEMORY`).
+pub fn stats() -> String {
+    let masks: usize = MASKS
+        .lock()
+        .unwrap()
+        .values()
+        .map(|m| m.frames.iter().map(Vec::len).sum::<usize>())
+        .sum();
+    let tinted = TINTED.lock().unwrap();
+    let bytes: usize = tinted
+        .values()
+        .map(|t| {
+            (0..t.0.frame_count())
+                .filter_map(|k| t.0.as_bytes(k).map(<[u8]>::len))
+                .sum::<usize>()
+        })
+        .sum();
+    format!(
+        "spoilers: masks {:.1} MB, tinted {} ({:.1} MB)",
+        masks as f64 / 1048576.,
+        tinted.len(),
+        bytes as f64 / 1048576.,
+    )
+}
+
+/// Called once per window frame: tinted tiles not painted for a while leave
+/// memory and the GPU atlas.
+pub fn begin_frame(window: &mut Window) {
+    let mut stale = Vec::new();
+    TINTED.lock().unwrap().retain(|_, t| {
+        let keep = t.2.elapsed() < TINTED_KEEP;
+        if !keep {
+            stale.push(t.0.clone());
+        }
+        keep
+    });
+    for image in stale {
+        let _ = window.drop_image(image);
+    }
 }
 
 /// Covers `rect` with the particles (`FillSpoilerRect`), the tiles aligned to
@@ -293,7 +342,7 @@ mod tests {
         assert_eq!(mask.size, 128);
         assert_eq!(mask.frames.len(), FRAMES);
         for frame in &mask.frames {
-            let covered = frame.iter().filter(|c| **c > 0.).count();
+            let covered = frame.iter().filter(|c| **c > 0).count();
             // About a third of the particles are alive at any time.
             assert!(covered > 1000, "{covered}");
         }

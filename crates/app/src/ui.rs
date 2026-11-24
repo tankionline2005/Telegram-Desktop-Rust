@@ -808,8 +808,8 @@ pub struct MainView {
     window_active: bool,
     /// Member counts from full chat info ("906 members").
     members: HashMap<PeerKey, String>,
-    /// Decoded userpics by peer, with their photo id.
-    userpics: HashMap<PeerKey, (i64, Arc<RenderImage>)>,
+    /// Userpics by peer: photo id, file, and the decoded image while it is shown.
+    userpics: HashMap<PeerKey, Userpic>,
     /// Photos already asked for.
     userpic_requests: RefCell<HashSet<i64>>,
     /// Draft edits made here or pushed from the server since the chat list was last
@@ -2140,8 +2140,17 @@ impl MainView {
                 peer,
                 photo_id,
                 image,
+                bytes,
             } => {
-                self.userpics.insert(peer, (photo_id, image));
+                self.userpics.insert(
+                    peer,
+                    Userpic {
+                        photo_id,
+                        bytes,
+                        image: RefCell::new(Some(image)),
+                        used: std::cell::Cell::new(Instant::now()),
+                    },
+                );
             }
             Update::Connected(connected) => self.set_connected(connected, cx),
             // The accounts keep these (the menu reads them there).
@@ -2744,10 +2753,11 @@ impl MainView {
     ) -> AnyElement {
         let p = self.palette();
         if !saved && let (Some(peer), Some((photo_id, dc_id))) = (peer, photo) {
-            if let Some((loaded, image)) = self.userpics.get(&peer)
-                && *loaded == photo_id
+            if let Some(pic) = self.userpics.get(&peer)
+                && pic.photo_id == photo_id
+                && let Some(image) = pic.image()
             {
-                return img(image.clone())
+                return img(image)
                     .flex_none()
                     .size(px(size))
                     .rounded_full()
@@ -4753,6 +4763,9 @@ impl MainView {
         crate::repaint::set_paused(!window.is_window_active());
         crate::custom_emoji::begin_frame(window);
         crate::emoji::begin_frame(window);
+        crate::spoiler::begin_frame(window);
+        self.trim_userpics(window);
+        self.trim_text_cache();
         crate::vector::begin_frame(window);
         self.update_emoji_suggest(window, cx);
         self.update_emoji_preview(window);
@@ -5412,5 +5425,80 @@ impl MainView {
                 )
             }))
             .into_any_element()
+    }
+}
+
+/// A loaded userpic: its file stays, the decoded image only while it is shown
+/// (`USERPIC_KEEP`), so hundreds of chats seen once cost their small files, not
+/// their images in memory and in the GPU atlas.
+struct Userpic {
+    photo_id: i64,
+    bytes: Arc<[u8]>,
+    image: RefCell<Option<Arc<RenderImage>>>,
+    used: std::cell::Cell<Instant>,
+}
+
+/// Decoded userpics not shown for this long are dropped.
+const USERPIC_KEEP: Duration = Duration::from_secs(60);
+
+impl Userpic {
+    /// The image, decoded again if it was dropped (a millisecond).
+    fn image(&self) -> Option<Arc<RenderImage>> {
+        self.used.set(Instant::now());
+        let mut image = self.image.borrow_mut();
+        if image.is_none() {
+            *image = crate::bridge::userpic_image(&self.bytes);
+        }
+        image.clone()
+    }
+}
+
+impl MainView {
+    /// The window's part of the memory report (`TDR_MEMORY`), every few seconds.
+    fn report_memory(&self) {
+        static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+        if !crate::memory::on() {
+            return;
+        }
+        let mut last = LAST.lock().unwrap();
+        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(4)) {
+            return;
+        }
+        *last = Some(Instant::now());
+        let decoded: Vec<usize> = self
+            .userpics
+            .values()
+            .filter_map(|p| {
+                p.image
+                    .borrow()
+                    .as_ref()
+                    .and_then(|i| i.as_bytes(0))
+                    .map(<[u8]>::len)
+            })
+            .collect();
+        let files: usize = self.userpics.values().map(|p| p.bytes.len()).sum();
+        crate::memory::set_ui_stats(format!(
+            "userpics {} (decoded {}, {:.1} MB; files {:.1} MB), message layouts {},              chats {}, messages {}, extra chats {}",
+            self.userpics.len(),
+            decoded.len(),
+            decoded.iter().sum::<usize>() as f64 / 1048576.,
+            files as f64 / 1048576.,
+            self.text_ui.cache.borrow().len(),
+            self.dialogs.len(),
+            self.messages.len(),
+            self.extra_chats.len(),
+        ));
+    }
+
+    /// Drops the decoded userpics not shown lately (with their atlas places).
+    fn trim_userpics(&mut self, window: &mut Window) {
+        self.report_memory();
+        for pic in self.userpics.values() {
+            if pic.used.get().elapsed() > USERPIC_KEEP
+                && let Some(image) = pic.image.borrow_mut().take()
+            {
+                let _ = window.drop_image(image);
+            }
+        }
     }
 }

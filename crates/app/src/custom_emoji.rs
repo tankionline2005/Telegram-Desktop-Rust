@@ -3,13 +3,17 @@
 //! documents and files come from the data thread (`Update::CustomEmoji`), and each
 //! (emoji, size) is one instance shared by every place that paints it, as there.
 //!
-//! Like tdesktop's `Renderer`, an instance shows its first frame as soon as it is
-//! rendered and plays from it at the animation's own rate (one frame per paint at
-//! most, `Cache::paintCurrentFrame`), while workers render ahead of the frame on
-//! screen (`kPreloadFrames`) until all frames (at most `kMaxFrames`) are kept.
-//! Differences that make it faster and lighter:
-//! - the workers serve the emoji painted last first (a stack, not a queue) and
-//!   skip the ones scrolled away, so the visible ones never wait behind them;
+//! An instance plays at the animation's own rate (one frame per paint at most,
+//! `Cache::paintCurrentFrame`) over all its frames (at most `kMaxFrames`).
+//! Differences from tdesktop, which shows the first frame as soon as it is
+//! rendered and renders ahead of the one on screen (`kPreloadFrames`):
+//! - an emoji shows its loading silhouette until all its frames are rendered,
+//!   then plays smoothly from the first: with many new emoji at once (a set
+//!   just opened) they come one after another, in reading order, instead of
+//!   all playing in jerks while the renderers catch up (asked by the user);
+//! - a worker renders one emoji to its end; the emoji on screen go first (the
+//!   last painted frame, then in the order they were painted), the one in the
+//!   long press preview before all (`focus`), and those scrolled away wait;
 //! - kept frames are compressed in memory (each frame XOR the previous one, zero
 //!   runs, decoded in microseconds; text colored emoji keep only alpha): about
 //!   2.5 times less than tdesktop's uncompressed frames (deflate gains little
@@ -82,8 +86,8 @@ enum Doc {
 
 /// `kMaxFrames`: longer animations are cut (and then loop).
 const MAX_FRAMES: usize = 180;
-/// `kPreloadFrames`, a bit more: frames rendered ahead of the one on screen.
-const PRELOAD_FRAMES: usize = 8;
+/// The preview's emoji goes first while it was painted this recently.
+const FOCUS_KEEP: Duration = Duration::from_millis(300);
 /// A frame is stored whole every this many frames (the rest as differences).
 const KEY_EVERY: usize = 8;
 /// Compressed frames kept in memory for unfinished emoji off screen (finished
@@ -95,9 +99,9 @@ const FILES_BUDGET: usize = 2 << 20;
 /// back from the disk cache at once).
 const INSTANCE_KEEP: Duration = Duration::from_secs(10);
 /// The disk cache: the blob format's version (a new renderer or format makes
-/// a new cache) and its size (segments of 32 MB).
+/// a new cache) and its size (segments of 32 MB: 256 MB, started anew when full).
 const STORE_VERSION: u64 = 1;
-const STORE_SEGMENTS: u32 = 12;
+const STORE_SEGMENTS: u32 = 8;
 const BLOB_MAGIC: u32 = 0x4543_4454;
 /// Workers stop rendering an emoji that was not painted for this long.
 const IDLE: Duration = Duration::from_millis(400);
@@ -131,6 +135,10 @@ struct Instance {
     /// The frame on screen and when it was shown.
     frame: usize,
     shown_at: Option<Instant>,
+    /// The window paint and the paint order it was last painted in (workers
+    /// take the emoji on screen in reading order).
+    seen_frame: u64,
+    seen_order: u64,
     /// The paint counter of the last advance (once per window paint).
     advanced: u64,
     painted: Instant,
@@ -151,6 +159,8 @@ impl Instance {
             alpha_only: false,
             side,
             frame: 0,
+            seen_frame: 0,
+            seen_order: 0,
             shown_at: None,
             advanced: 0,
             painted: Instant::now(),
@@ -321,9 +331,11 @@ struct State {
     retired: Vec<Arc<RenderImage>>,
     /// Window paints so far (`begin_frame`).
     counter: u64,
-    /// New instances (served last in, first out) and ones that need more frames.
-    fresh: Vec<Key>,
-    more: std::collections::VecDeque<Key>,
+    /// Instances waiting for a worker, and the paints so far (their order).
+    queued: Vec<Key>,
+    paints: u64,
+    /// The long press preview's emoji and when it was painted.
+    focus: Option<(Key, Instant)>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -371,7 +383,7 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     f(guard.get_or_insert_with(State::default))
 }
 
-fn queue(s: &mut State, key: Key, fresh: bool) {
+fn queue(s: &mut State, key: Key) {
     let Some(i) = s.instances.get_mut(&key) else {
         return;
     };
@@ -379,13 +391,20 @@ fn queue(s: &mut State, key: Key, fresh: bool) {
         return;
     }
     i.job = Job::Queued;
-    if fresh {
-        s.fresh.push(key);
-    } else {
-        s.more.push_back(key);
-    }
+    s.queued.push(key);
     start_workers();
     WAKE.notify_one();
+}
+
+/// The emoji in the long press preview: rendered before all others.
+pub fn focus(id: i64, side: u32) {
+    with(|s| s.focus = Some(((id, side), Instant::now())));
+}
+
+fn focused(s: &State) -> Option<Key> {
+    s.focus
+        .filter(|(_, at)| at.elapsed() < FOCUS_KEEP)
+        .map(|(key, _)| key)
 }
 
 fn start_workers() {
@@ -412,19 +431,36 @@ struct Task {
 
 fn take_task(s: &mut State) -> Option<Task> {
     let now = Instant::now();
-    loop {
-        let key = s.fresh.pop().or_else(|| s.more.pop_front())?;
-        let Some(i) = s.instances.get_mut(&key) else {
-            continue;
-        };
-        if i.job != Job::Queued {
-            continue;
+    // Scrolled away: left for when it is painted again.
+    let instances = &mut s.instances;
+    s.queued.retain(|key| match instances.get_mut(key) {
+        Some(i) if i.job == Job::Queued => {
+            if now.duration_since(i.painted) > IDLE {
+                i.job = Job::Idle;
+                false
+            } else {
+                true
+            }
         }
-        // Scrolled away: left for when it is painted again.
-        if now.duration_since(i.painted) > IDLE {
-            i.job = Job::Idle;
-            continue;
-        }
+        _ => false,
+    });
+    let focus = focused(s);
+    let k = s
+        .queued
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, key)| {
+            let i = &s.instances[*key];
+            (
+                Some(**key) != focus,
+                std::cmp::Reverse(i.seen_frame),
+                i.seen_order,
+            )
+        })
+        .map(|(k, _)| k)?;
+    let key = s.queued.swap_remove(k);
+    {
+        let i = s.instances.get_mut(&key)?;
         i.job = Job::Running;
         let task = Task {
             key,
@@ -437,7 +473,7 @@ fn take_task(s: &mut State) -> Option<Task> {
             Some(Doc::File { format, bytes }) => Some((*format, bytes.clone())),
             _ => None,
         };
-        return Some(Task { file, ..task });
+        Some(Task { file, ..task })
     }
 }
 
@@ -498,45 +534,69 @@ fn run(task: Task) {
     let Source::Lottie(anim) = &*source;
     let count = anim.frame_count().min(MAX_FRAMES);
     let step = (1000. / anim.frame_rate.max(1.)).round().max(1.) as u32;
-    let Some(mut pixmap) = tdr_lottie::tiny_skia::Pixmap::new(side, side) else {
-        return fail(key);
+    // The preview's emoji is rendered on every core, a batch of frames at a
+    // time (pushed in order: each is packed against the previous one).
+    let threads = if with(|s| focused(s) == Some(key)) {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    } else {
+        1
     };
     let mut k = task.from;
-    let mut raw = Vec::with_capacity((side * side * 4) as usize);
     while k < count {
-        pixmap.fill(tdr_lottie::tiny_skia::Color::TRANSPARENT);
-        anim.render_into(k, &mut pixmap);
-        raw.clear();
-        for p in pixmap.pixels() {
-            let c = p.demultiply();
-            if task.alpha_only {
-                raw.push(c.alpha());
-            } else {
-                raw.extend_from_slice(&[c.blue(), c.green(), c.red(), c.alpha()]);
+        let batch: Vec<usize> = (k..count.min(k + threads * 2)).collect();
+        let frames: Vec<Vec<u8>> = if threads > 1 && batch.len() > 1 {
+            std::thread::scope(|scope| {
+                let parts: Vec<_> = (0..threads)
+                    .map(|t| {
+                        let mine: Vec<usize> =
+                            batch.iter().copied().skip(t).step_by(threads).collect();
+                        scope.spawn(move || {
+                            mine.into_iter()
+                                .map(|f| (f, render_frame(anim, f, side, task.alpha_only)))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                let mut all: Vec<(usize, Vec<u8>)> = parts
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap_or_default())
+                    .collect();
+                all.sort_by_key(|(f, _)| *f);
+                all.into_iter().map(|(_, raw)| raw).collect()
+            })
+        } else {
+            batch
+                .iter()
+                .map(|f| render_frame(anim, *f, side, task.alpha_only))
+                .collect()
+        };
+        let mut go_on = true;
+        for raw in frames {
+            k += 1;
+            // To the end while the emoji is on screen, unless the preview's emoji
+            // waits for a worker.
+            go_on = with(|s| {
+                let focus = focused(s).filter(|f| *f != key && s.queued.contains(f));
+                let Some(i) = s.instances.get_mut(&key) else {
+                    return false;
+                };
+                if i.frames() + 1 != k {
+                    return false;
+                }
+                i.alpha_only = task.alpha_only;
+                i.push(&raw, step);
+                if k == count {
+                    i.finished = true;
+                    i.source = None;
+                    persist(key, i);
+                    return false;
+                }
+                focus.is_none() && i.painted.elapsed() <= IDLE
+            });
+            if !go_on {
+                break;
             }
         }
-        k += 1;
-        // Stored at once (the first frame shows as soon as it is ready); goes on
-        // while the emoji is on screen and not far enough ahead.
-        let go_on = with(|s| {
-            let Some(i) = s.instances.get_mut(&key) else {
-                return false;
-            };
-            if i.frames() + 1 != k {
-                return false;
-            }
-            i.alpha_only = task.alpha_only;
-            i.push(&raw, step);
-            if k == count {
-                i.finished = true;
-                i.source = None;
-                persist(key, i);
-                return false;
-            }
-            let ahead = i.frames() > i.frame + PRELOAD_FRAMES;
-            let first = i.frames() == 1;
-            !first && !ahead && i.painted.elapsed() <= IDLE
-        });
         if !go_on {
             break;
         }
@@ -547,6 +607,29 @@ fn run(task: Task) {
             i.source = Some(keep);
         }
     });
+}
+
+/// One frame as BGRA (or alpha only), straight alpha.
+fn render_frame(
+    anim: &tdr_lottie::Animation,
+    frame: usize,
+    side: u32,
+    alpha_only: bool,
+) -> Vec<u8> {
+    let Some(mut pixmap) = tdr_lottie::tiny_skia::Pixmap::new(side, side) else {
+        return Vec::new();
+    };
+    anim.render_into(frame, &mut pixmap);
+    let mut raw = Vec::with_capacity((side * side * if alpha_only { 1 } else { 4 }) as usize);
+    for p in pixmap.pixels() {
+        let c = p.demultiply();
+        if alpha_only {
+            raw.push(c.alpha());
+        } else {
+            raw.extend_from_slice(&[c.blue(), c.green(), c.red(), c.alpha()]);
+        }
+    }
+    raw
 }
 
 fn fail(key: Key) {
@@ -883,15 +966,20 @@ pub fn paint_ex(
         let counter = s.counter;
         let now = Instant::now();
         let key = (id, side);
+        s.paints += 1;
+        let order = s.paints;
         let i = s
             .instances
             .entry(key)
             .or_insert_with(|| from_disk(key).unwrap_or_else(|| Instance::new(side)));
         i.painted = now;
-        let (frames, job, finished) = (i.frames(), i.job, i.finished);
-        if frames == 0 {
+        i.seen_frame = counter;
+        i.seen_order = order;
+        let (job, finished) = (i.job, i.finished);
+        // The silhouette until every frame is rendered.
+        if !finished {
             if has_file && job == Job::Idle {
-                queue(s, key, true);
+                queue(s, key);
             } else if matches!(s.docs.get(&id), Some(Doc::Dropped)) {
                 s.docs.insert(id, Doc::Requested);
                 s.wanted.push(id);
@@ -905,7 +993,6 @@ pub fn paint_ex(
             crate::repaint::at(due.max(now + Duration::from_millis(8)));
         }
         let frame = i.frame;
-        let more = !finished && i.frames() < frame + PRELOAD_FRAMES && job == Job::Idle;
         let color_key = if text_color && i.alpha_only {
             let c = gpui::Rgba::from(color);
             let to = |v: f32| (v.clamp(0., 1.) * 255.).round() as u32;
@@ -955,9 +1042,6 @@ pub fn paint_ex(
                 image
             }
         };
-        if more {
-            queue(s, key, false);
-        }
         Ok(image)
     });
     let scale = window.scale_factor();

@@ -228,11 +228,13 @@ pub enum Update {
         peer: PeerKey,
         text: String,
     },
-    /// A userpic is ready to draw.
+    /// A userpic is ready to draw: decoded, and its file (the window keeps only
+    /// the file of userpics not shown lately and decodes it again when needed).
     Userpic {
         peer: PeerKey,
         photo_id: i64,
         image: Arc<RenderImage>,
+        bytes: Arc<[u8]>,
     },
     /// An opened chat's header data, for chats not in the loaded chat list.
     ChatInfo(Box<DialogItem>),
@@ -1473,7 +1475,7 @@ pub struct Paths {
 /// size, off the UI thread.
 const USERPIC_SIZE: u32 = 96;
 
-fn userpic_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+pub(crate) fn userpic_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
     let decoded = image::load_from_memory(bytes).ok()?.to_rgba8();
     let mut scaled = image::imageops::resize(
         &decoded,
@@ -1669,6 +1671,7 @@ fn spawn_userpics(
                                 peer,
                                 photo_id,
                                 image,
+                                bytes: bytes.into(),
                             });
                         }
                         _ => {
@@ -1726,6 +1729,7 @@ fn spawn_userpics(
                                 peer,
                                 photo_id,
                                 image,
+                                bytes: bytes.into(),
                             });
                         }
                     }
