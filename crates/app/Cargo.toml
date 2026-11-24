@@ -26,6 +26,7 @@ anyhow = "1.0.104"
 tracing = "0.1.44"
 unicode-segmentation = "1.13.3"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+memmap2 = "0.9"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 smallvec = "1"
 raw-window-handle = "0.6.2"
@@ -43,6 +44,9 @@ qrcode = { version = "0.14.1", default-features = false }
 # Same version and a subset of the features GPUI enables: no extra build.
 windows = { version = "0.61", features = [
     "Win32_Globalization",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",

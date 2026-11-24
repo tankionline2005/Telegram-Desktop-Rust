@@ -18,12 +18,11 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    App, AvailableSpace, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, Style, UTF16Selection, Window,
-    actions, div, fill, linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgba,
-    size,
+    App, AvailableSpace, Bounds, ContentMask, Context, CursorStyle, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
+    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, SharedString, Size, Style, UTF16Selection, Window, actions, div, fill,
+    linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgba, size,
 };
 use tdr_theme::{Color, Palette};
 use unicode_segmentation::*;
@@ -35,6 +34,7 @@ use crate::rich_text::{
 actions!(
     text_input,
     [
+        PastePlain,
         Backspace,
         Delete,
         Left,
@@ -162,6 +162,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-down", SelectDown, Some(CONTEXT)),
         KeyBinding::new("secondary-a", SelectAll, Some(CONTEXT)),
         KeyBinding::new("secondary-v", Paste, Some(CONTEXT)),
+        // `insertFromMimeDataInner`: Ctrl+Shift+V drops the formatting.
+        KeyBinding::new("secondary-shift-v", PastePlain, Some(CONTEXT)),
         KeyBinding::new("secondary-c", Copy, Some(CONTEXT)),
         KeyBinding::new("secondary-x", Cut, Some(CONTEXT)),
         KeyBinding::new("home", Home, Some(CONTEXT)),
@@ -260,6 +262,10 @@ pub struct TextInput {
     replaced: Vec<Replaced>,
     /// Emoji suggestions over the field (the message field).
     suggest: Option<Rc<RefCell<crate::emoji_suggest::Suggest>>>,
+    /// The message field keeps formatting and custom emoji pasted from the
+    /// clipboard (`FieldTagMimeProcessor`); the cell says whether custom emoji
+    /// need Premium there.
+    rich_paste: Option<Rc<std::cell::Cell<bool>>>,
 }
 
 /// One replacement made while typing.
@@ -471,13 +477,19 @@ impl TextInput {
             instant_replaces: false,
             replaced: Vec::new(),
             suggest: None,
+            rich_paste: None,
         }
     }
 
     /// The message field: instant replaces and emoji suggestions.
-    pub fn enable_emoji_helpers(&mut self, suggest: Rc<RefCell<crate::emoji_suggest::Suggest>>) {
+    pub fn enable_emoji_helpers(
+        &mut self,
+        suggest: Rc<RefCell<crate::emoji_suggest::Suggest>>,
+        custom_locked: Rc<std::cell::Cell<bool>>,
+    ) {
         self.instant_replaces = true;
         self.suggest = Some(suggest);
+        self.rich_paste = Some(custom_locked);
     }
 
     /// The caret's place in the window for a byte offset (the suggestions point
@@ -1351,6 +1363,13 @@ impl TextInput {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if self.paste_tagged(cx) {
+            return;
+        }
+        self.paste_plain(&PastePlain, window, cx);
+    }
+
+    fn paste_plain(&mut self, _: &PastePlain, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.last_edit = None;
             self.replace_text_in_range(None, &text.replace("\r\n", "\n"), window, cx);
@@ -1384,7 +1403,66 @@ impl TextInput {
         cx.notify();
     }
 
+    /// tdesktop's tagged text from the clipboard in place of the selection, its
+    /// formatting and custom emoji kept (`insertFromMimeDataInner` with the
+    /// field's tag processor). `false` when there is none.
+    fn paste_tagged(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(locked) = self.rich_paste.as_ref().map(|l| l.get()) else {
+            return false;
+        };
+        let Some(tagged) = crate::clipboard::read_tagged() else {
+            return false;
+        };
+        if tagged.text.is_empty() {
+            return false;
+        }
+        let mut text = tagged.text.clone();
+        if self.single_line {
+            text = text.replace('\n', " ");
+        }
+        let r = self.valid(self.selected_range.clone());
+        self.edit(r.clone(), &text, EditKind::Other);
+        let start = r.start;
+        for (range, id) in &tagged.tags {
+            for part in crate::clipboard::split_tags(id) {
+                let tag = match part {
+                    "**" => Tag::Bold,
+                    "__" => Tag::Italic,
+                    "^^" => Tag::Underline,
+                    "~~" => Tag::Strike,
+                    "`" => Tag::Code,
+                    "||" => Tag::Spoiler,
+                    ">" | ">^" => Tag::Blockquote,
+                    p if p.starts_with("```") => Tag::Pre,
+                    p => match crate::clipboard::custom_emoji_id(p) {
+                        // Premium emoji stay plain without Premium.
+                        Some(id)
+                            if !locked || crate::custom_emoji::info(id).is_none_or(|i| i.free) =>
+                        {
+                            Tag::CustomEmoji(id)
+                        }
+                        _ => continue,
+                    },
+                };
+                self.tags.push(TagSpan {
+                    range: start + range.start..start + range.end,
+                    tag,
+                });
+            }
+        }
+        normalize(&self.content, &mut self.tags);
+        let end = start + text.len();
+        self.selected_range = end..end;
+        self.last_edit = None;
+        self.text_changed_for_suggest(true);
+        cx.notify();
+        true
+    }
+
     pub fn paste_text(&mut self, cx: &mut Context<Self>) {
+        if self.paste_tagged(cx) {
+            return;
+        }
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             let r = self.selected_range.clone();
             let mut text = text.replace("\r\n", "\n");
@@ -1407,12 +1485,38 @@ impl TextInput {
         self.copy_selection(cx);
     }
 
+    /// `createMimeDataFromSelectionInner`: the selection with its tags.
     pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.valid(self.selected_range.clone())].to_string(),
-            ));
+        if self.selected_range.is_empty() {
+            return;
         }
+        let r = self.valid(self.selected_range.clone());
+        let singles: Vec<(Range<usize>, String)> = self
+            .tags
+            .iter()
+            .filter_map(|t| {
+                let (s, e) = (t.range.start.max(r.start), t.range.end.min(r.end));
+                let tag = match t.tag {
+                    Tag::Bold => "**".to_string(),
+                    Tag::Italic => "__".to_string(),
+                    Tag::Underline => "^^".to_string(),
+                    Tag::Strike => "~~".to_string(),
+                    Tag::Code => "`".to_string(),
+                    Tag::Pre => "```".to_string(),
+                    Tag::Blockquote => ">".to_string(),
+                    Tag::Spoiler => "||".to_string(),
+                    Tag::CustomEmoji(id) => crate::clipboard::custom_emoji_link(id),
+                };
+                (s < e).then(|| (s - r.start..e - r.start, tag))
+            })
+            .collect();
+        crate::clipboard::copy(
+            crate::clipboard::Tagged {
+                text: self.content[r].to_string(),
+                tags: crate::clipboard::combine(&singles),
+            },
+            cx,
+        );
     }
 
     fn cut(&mut self, _: &Cut, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2075,6 +2179,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::end))
             .on_action(cx.listener(Self::show_character_palette))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::paste_plain))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::enter))

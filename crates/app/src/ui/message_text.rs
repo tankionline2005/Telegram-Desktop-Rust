@@ -567,8 +567,8 @@ impl MainView {
         let Some(entry) = cache.get(&s.key) else {
             return false;
         };
-        let text = entry.measured.rich.selected_text(s.range.clone());
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        let tagged = entry.measured.rich.selected_tagged(s.range.clone());
+        crate::clipboard::copy(tagged, cx);
         true
     }
 
@@ -599,9 +599,13 @@ impl MainView {
     }
 
     /// A message's shown text ("Copy Text").
-    pub(super) fn message_text(&self, key: TextKey) -> Option<String> {
+    /// A message's whole text with its tags (`TextForMimeData`).
+    pub(super) fn message_text(&self, key: TextKey) -> Option<crate::clipboard::Tagged> {
         let cache = self.text_ui.cache.borrow();
-        cache.get(&key).map(|e| e.measured.rich.text.clone())
+        cache.get(&key).map(|e| {
+            let rich = &e.measured.rich;
+            rich.selected_tagged(0..rich.text.len())
+        })
     }
 
     /// `Data::Session::hideShownSpoilers`: showing another chat hides every spoiler

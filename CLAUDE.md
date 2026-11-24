@@ -198,3 +198,19 @@
   `data/emoji-keywords/`). The field (`text_input`) finds the query and forwards
   Enter/Tab/arrows/Esc to the shared `emoji_suggest::Suggest`; `MainView` fills its
   rows and draws them (`ui/emoji_suggest_box.rs`).
+- GPUI is vendored in `vendor/gpui` (0.2.2 plus `tdr patch` changes listed in
+  `vendor/gpui/TDR-PATCHES.md`: atlas tiles deallocated, Segment Heap in its manifest).
+  It is excluded from the workspace and from rustfmt; change it only with a marked patch.
+- Memory: `mapped_store` keeps rendered custom emoji frames and cut emoji images in
+  memory-mapped files under `data/cache` (`cache-demo` for the demo), outside the
+  process's private memory. `TDR_MEMORY=1` prints heap and holders every 5 s
+  (`memory.rs`, a counting global allocator), `TDR_MEMORY=big` the stacks of blocks
+  of 4 MB and more. Demo load: `TDR_DEMO_EMOJI=N` (copies of the demo animations) or
+  `real` (custom emoji from the file cache, read only). Measure the private working set
+  (Task Manager's "Memory") with `Win32_PerfFormattedData_PerfProc_Process`.
+- Clipboard: `clipboard.rs` writes and reads tdesktop's `application/x-td-field-text` /
+  `-tags` formats (copy from messages and the field keeps formatting and custom emoji).
+  Demo paste checks overwrite the user's clipboard: save and restore it, skip if it holds
+  anything but text.
+- PowerShell paths with `[` `]` (this folder) need `-LiteralPath`; copy files with bash.
+

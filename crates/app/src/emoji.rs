@@ -1,7 +1,9 @@
 //! Emoji images (lib_ui's `Ui::Emoji`): tdesktop's own pictures, never the system
 //! font's. The eight sprites (`emoji_N.webp`, 32 x 16 images of 72 px) are decoded
-//! once on a worker thread and scaled per size (`UniversalImages::generate`); single
-//! emoji are cut from them on demand.
+//! once per size on worker threads and every emoji is cut and scaled on its own
+//! (`UniversalImages::generate`) into a disk cache read through a memory mapping
+//! (`mapped_store`; tdesktop caches its scaled sprites on disk too): later runs
+//! decode nothing, and only the images on screen take the app's own memory.
 //!
 //! In text, an emoji is laid out as a space of its width (`emoji_font`) and its image
 //! is painted over it: see [`shape_text`].
@@ -49,12 +51,27 @@ const SPRITE_BYTES: [&[u8]; tdr_emoji::SPRITES] = [
 /// linear filtering, an image touching its edge would bleed its neighbour.
 const PAD: u32 = 1;
 
+/// Images not painted for this long leave memory and the GPU atlas (they come
+/// back from the disk cache at once).
+const IMAGE_KEEP: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Sprites decoded at once the first time a size is needed (each takes ~11 MB
+/// while decoded).
+const DECODERS: usize = 3;
+
+struct Shown {
+    image: Arc<RenderImage>,
+    painted: std::time::Instant,
+}
+
 #[derive(Default)]
 struct Cache {
-    /// Scaled sprites by image size (device pixels).
-    sprites: HashMap<u32, Vec<Option<Arc<image::RgbaImage>>>>,
+    /// Sizes being cut from the sprites.
     loading: HashSet<u32>,
-    images: HashMap<(u16, u32), Arc<RenderImage>>,
+    /// Cut images when the disk cache is not available.
+    fallback: HashMap<(u16, u32), Arc<[u8]>>,
+    images: HashMap<(u16, u32), Shown>,
+    retired: Vec<Arc<RenderImage>>,
 }
 
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
@@ -64,15 +81,49 @@ fn with_cache<R>(f: impl FnOnce(&mut Cache) -> R) -> R {
     f(guard.get_or_insert_with(Cache::default))
 }
 
-/// Starts preparing the sprites for `sizes` (those not ready or loading yet).
+static STORE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+static STORE: std::sync::OnceLock<Option<Mutex<crate::mapped_store::Store>>> =
+    std::sync::OnceLock::new();
+
+/// Where the cut images are cached (`mapped_store`): every emoji at each size
+/// is cut from the sprites once, then read back from a mapped file.
+pub fn set_cache_dir(dir: std::path::PathBuf) {
+    let _ = STORE_DIR.set(dir);
+}
+
+fn store() -> Option<std::sync::MutexGuard<'static, crate::mapped_store::Store>> {
+    STORE
+        .get_or_init(|| {
+            // The sprites themselves are the version: new pictures, new cache.
+            let version = SPRITE_BYTES.iter().fold(
+                {
+                    tdr_emoji::init();
+                    tdr_emoji::all().len() as u64
+                },
+                |h, b| (h ^ b.len() as u64).wrapping_mul(0x0000_0100_0000_01b3),
+            );
+            crate::mapped_store::Store::open(STORE_DIR.get()?, "emoji-images", version, 4)
+                .map(Mutex::new)
+        })
+        .as_ref()
+        .map(|m| m.lock().unwrap())
+}
+
+/// The marker stored once every emoji of a size is cut.
+fn done_key(size: u32) -> crate::mapped_store::Key {
+    (-1, size)
+}
+
+/// Starts cutting the images for `sizes` (those not cached or cutting yet).
 pub fn prepare(sizes: &[u32]) {
     let missing: Vec<u32> = with_cache(|c| {
         let missing: Vec<u32> = sizes
             .iter()
             .copied()
-            .filter(|s| *s > 0 && !c.sprites.contains_key(s) && !c.loading.contains(s))
+            .filter(|s| *s > 0 && !c.loading.contains(s))
             .collect::<HashSet<_>>()
             .into_iter()
+            .filter(|s| !store().is_some_and(|st| st.contains(done_key(*s))))
             .collect();
         c.loading.extend(&missing);
         missing
@@ -81,96 +132,156 @@ pub fn prepare(sizes: &[u32]) {
         return;
     }
     tdr_emoji::init();
-    // A thread per sprite: decoding one takes a quarter of a second.
-    let left = Arc::new(std::sync::atomic::AtomicUsize::new(SPRITE_BYTES.len()));
-    for (index, bytes) in SPRITE_BYTES.iter().enumerate() {
+    // A few sprites at a time (decoding one takes a quarter of a second).
+    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let left = Arc::new(std::sync::atomic::AtomicUsize::new(DECODERS));
+    for _ in 0..DECODERS {
         let missing = missing.clone();
+        let next = next.clone();
         let left = left.clone();
         std::thread::spawn(move || {
-            match image::load_from_memory_with_format(bytes, image::ImageFormat::WebP) {
-                Ok(universal) => {
-                    let universal = universal.to_rgba8();
-                    for &size in &missing {
-                        let scaled = Arc::new(scale_sprite(&universal, size));
-                        with_cache(|c| {
-                            let list = c
-                                .sprites
-                                .entry(size)
-                                .or_insert_with(|| vec![None; tdr_emoji::SPRITES]);
-                            list[index] = Some(scaled);
-                        });
+            loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let Some(bytes) = SPRITE_BYTES.get(index) else {
+                    break;
+                };
+                match image::load_from_memory_with_format(bytes, image::ImageFormat::WebP) {
+                    Ok(universal) => {
+                        let universal = universal.to_rgba8();
+                        for &size in &missing {
+                            cut_sprite(index, &universal, size);
+                        }
                     }
+                    Err(_) => tracing::warn!(sprite = index, "emoji: sprite not decoded"),
                 }
-                Err(_) => tracing::warn!(sprite = index, "emoji: sprite not decoded"),
             }
             if left.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                for size in &missing {
+                    if let Some(mut st) = store() {
+                        let _ = st.put(done_key(*size), &[&[1]]);
+                    }
+                }
                 with_cache(|c| {
                     for size in &missing {
                         c.loading.remove(size);
                     }
                 });
+                crate::repaint::after_ms(0);
             }
         });
     }
 }
 
-/// Every image of a sprite scaled to `size` on its own (no bleeding between cells).
-fn scale_sprite(universal: &image::RgbaImage, size: u32) -> image::RgbaImage {
+/// Cuts every image of sprite `index` at `size` (each scaled on its own: no
+/// bleeding between cells), with its transparent border, as GPUI's BGRA.
+fn cut_sprite(index: usize, universal: &image::RgbaImage, size: u32) {
     let cell = tdr_emoji::UNIVERSAL_SIZE;
     let columns = universal.width() / cell;
-    let rows = universal.height() / cell;
-    let mut out = image::RgbaImage::new(columns * size, rows * size);
-    for row in 0..rows {
-        for column in 0..columns {
-            let source =
-                image::imageops::crop_imm(universal, column * cell, row * cell, cell, cell)
-                    .to_image();
-            let scaled =
-                image::imageops::resize(&source, size, size, image::imageops::FilterType::Triangle);
-            image::imageops::replace(
-                &mut out,
-                &scaled,
-                i64::from(column * size),
-                i64::from(row * size),
-            );
+    let side = size + 2 * PAD;
+    let mut cut = vec![0u8; (side * side * 4) as usize];
+    for emoji in 0..tdr_emoji::all().len() {
+        let Some(one) = tdr_emoji::get(emoji as u16) else {
+            continue;
+        };
+        if one.sprite() != index {
+            continue;
+        }
+        let (column, row) = (one.column() as u32, one.row() as u32);
+        if column >= columns {
+            continue;
+        }
+        let source =
+            image::imageops::crop_imm(universal, column * cell, row * cell, cell, cell).to_image();
+        let scaled =
+            image::imageops::resize(&source, size, size, image::imageops::FilterType::Triangle);
+        cut.fill(0);
+        for (dy, line) in scaled.rows().enumerate() {
+            for (dx, p) in line.enumerate() {
+                let at = (((PAD + dy as u32) * side + PAD + dx as u32) * 4) as usize;
+                cut[at..at + 4].copy_from_slice(&[p[2], p[1], p[0], p[3]]);
+            }
+        }
+        let key = (emoji as u16, size);
+        if store()
+            .and_then(|mut st| st.put((i64::from(key.0), key.1), &[&cut]))
+            .is_none()
+        {
+            with_cache(|c| {
+                c.fallback.insert(key, Arc::from(cut.as_slice()));
+            });
         }
     }
-    out
+}
+
+/// Called once per window frame: images not painted for a while leave memory
+/// and the GPU atlas.
+pub fn begin_frame(window: &mut Window) {
+    let retired = with_cache(|c| {
+        let now = std::time::Instant::now();
+        c.images.retain(|_, v| {
+            let keep = now.duration_since(v.painted) < IMAGE_KEEP;
+            if !keep {
+                c.retired.push(v.image.clone());
+            }
+            keep
+        });
+        std::mem::take(&mut c.retired)
+    });
+    for image in retired {
+        let _ = window.drop_image(image);
+    }
+}
+
+/// Sizes for the memory report (`TDR_MEMORY`).
+pub fn stats() -> String {
+    with_cache(|c| {
+        let images: usize = c
+            .images
+            .values()
+            .filter_map(|v| v.image.as_bytes(0).map(<[u8]>::len))
+            .sum();
+        let fallback: usize = c.fallback.values().map(|b| b.len()).sum();
+        format!(
+            "emoji: images {} ({:.1} MB), not cached {:.1} MB",
+            c.images.len(),
+            images as f64 / 1048576.,
+            fallback as f64 / 1048576.,
+        )
+    })
 }
 
 /// The image of emoji `index` at `size` device pixels with its transparent border,
 /// or `None` while the sprites are prepared (another frame is asked for).
 pub fn image(index: u16, size: u32, window: &mut Window) -> Option<Arc<RenderImage>> {
+    let now = std::time::Instant::now();
     let found = with_cache(|c| {
-        if let Some(image) = c.images.get(&(index, size)) {
-            return Some(Some(image.clone()));
+        if let Some(v) = c.images.get_mut(&(index, size)) {
+            v.painted = now;
+            return Some(v.image.clone());
         }
-        let one = tdr_emoji::get(index)?;
-        let sprite = c.sprites.get(&size)?.get(one.sprite())?.clone()?;
-        let mut cut = image::RgbaImage::new(size + 2 * PAD, size + 2 * PAD);
-        let x = one.column() as u32 * size;
-        let y = one.row() as u32 * size;
-        for dy in 0..size {
-            for dx in 0..size {
-                let p = sprite.get_pixel(x + dx, y + dy);
-                // GPUI expects BGRA.
-                cut.put_pixel(PAD + dx, PAD + dy, image::Rgba([p[2], p[1], p[0], p[3]]));
-            }
-        }
+        let side = size + 2 * PAD;
+        let bytes: Vec<u8> = match c.fallback.get(&(index, size)) {
+            Some(b) => b.to_vec(),
+            None => store()?.get((i64::from(index), size))?.to_vec(),
+        };
+        let cut = image::RgbaImage::from_raw(side, side, bytes)?;
         let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
             cut
         )]));
-        c.images.insert((index, size), image.clone());
-        Some(Some(image))
+        c.images.insert(
+            (index, size),
+            Shown {
+                image: image.clone(),
+                painted: now,
+            },
+        );
+        Some(image)
     });
-    match found {
-        Some(image) => image,
-        None => {
-            prepare(&[size_normal(), size_large(), size]);
-            window.request_animation_frame();
-            None
-        }
+    if found.is_none() {
+        prepare(&[size_normal(), size_large(), size]);
+        window.request_animation_frame();
     }
+    found
 }
 
 /// Paints emoji `index` as a `size` device pixels square with its top left at
@@ -403,20 +514,4 @@ pub fn recent_list() -> Vec<u16> {
         .unwrap()
         .as_mut()
         .map_or_else(Vec::new, |r| r.list())
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    #[ignore]
-    fn sprite_timing() {
-        let t = std::time::Instant::now();
-        let u =
-            image::load_from_memory_with_format(super::SPRITE_BYTES[0], image::ImageFormat::WebP)
-                .unwrap()
-                .to_rgba8();
-        let decoded = t.elapsed();
-        let _ = super::scale_sprite(&u, 22);
-        println!("decode {decoded:?}, scale {:?}", t.elapsed() - decoded);
-    }
 }

@@ -6,9 +6,13 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[global_allocator]
+static ALLOCATOR: memory::Counting = memory::Counting;
+
 mod accounts;
 mod anim;
 mod bridge;
+mod clipboard;
 mod custom_emoji;
 mod emoji;
 mod emoji_font;
@@ -18,7 +22,9 @@ mod icons;
 mod instance;
 mod intro;
 mod lottie;
+mod mapped_store;
 mod markdown;
+mod memory;
 mod one_line;
 mod placement;
 mod popup_menu;
@@ -58,7 +64,7 @@ pub const REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
 pub static STARTED: std::sync::LazyLock<std::time::Instant> =
     std::sync::LazyLock::new(std::time::Instant::now);
 
-fn data_dir() -> PathBuf {
+pub fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
 }
 
@@ -199,6 +205,11 @@ fn main() {
     install_crash_log();
 
     let demo = std::env::args().any(|a| a == "--demo");
+    // Rendered emoji are cached on disk; the demo keeps its own cache (its fake
+    // emoji, and a demo may run beside the app).
+    let cache_dir = data_dir().join(if demo { "cache-demo" } else { "cache" });
+    custom_emoji::set_cache_dir(cache_dir.clone());
+    emoji::set_cache_dir(cache_dir);
     let force_dark = std::env::args().any(|a| a == "--dark");
     let force_light = std::env::args().any(|a| a == "--light");
     let open_on_start = std::env::args().find_map(|a| {
@@ -240,6 +251,7 @@ fn main() {
     Application::new().run(move |cx: &mut App| {
         tracing::info!(elapsed = ?STARTED.elapsed(), "ui: platform ready");
         profile::init();
+        memory::init();
         cx.text_system()
             .add_fonts(vec![
                 Cow::Borrowed(

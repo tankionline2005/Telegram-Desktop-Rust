@@ -886,3 +886,63 @@ pub fn bubble_tail_image(right: bool, rgba: u32, w: u32, h: u32) -> Arc<RenderIm
 
 /// The transparent border of [`bubble_tail_image`], device pixels.
 pub const TAIL_PAD: u32 = PAD;
+
+/// The right edge of a pill `h` device pixels high over an `outer` background
+/// (`SearchWithGroups::ensureRounding`'s `_rounding`, its right half): `outer`
+/// outside the half circle, transparent inside. Painted over the pill's
+/// content, it rounds what a rectangular clip leaves square. Returns the image
+/// and its transparent border (device pixels).
+pub fn round_edge_image(outer: gpui::Rgba, h: u32) -> (Arc<RenderImage>, u32) {
+    use resvg::tiny_skia::{BlendMode, Paint, PathBuilder, Pixmap, Rect, Transform};
+    type Edges = HashMap<(u32, u32), Arc<RenderImage>>;
+    static EDGES: LazyLock<Mutex<Edges>> = LazyLock::new(Default::default);
+    let to = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
+    let rgba = u32::from_be_bytes([to(outer.r), to(outer.g), to(outer.b), to(outer.a)]);
+    let key = (rgba, h);
+    if let Some(image) = EDGES.lock().unwrap().get(&key) {
+        return (image.clone(), PAD);
+    }
+    let h = h.max(2);
+    let half = h / 2;
+    // `_rounding` is `h + 4` wide: the half shown starts `half` from its right.
+    let full_w = h + 4;
+    let left = (full_w - half) as f32;
+    let mut pixmap = Pixmap::new(half + 2 * PAD, h + 2 * PAD).expect("edge pixmap");
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(to(outer.r), to(outer.g), to(outer.b), to(outer.a));
+    if let Some(rect) = Rect::from_xywh(PAD as f32, PAD as f32, half as f32, h as f32) {
+        pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+    }
+    let radius = h as f32 / 2.;
+    let mut pb = PathBuilder::new();
+    if let Some(rect) = Rect::from_xywh(PAD as f32 - left, PAD as f32, full_w as f32, h as f32) {
+        // A rounded rectangle: two half circles joined by straight sides.
+        let (l, t, r, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+        let k = 0.552_284_8 * radius;
+        pb.move_to(l + radius, t);
+        pb.line_to(r - radius, t);
+        pb.cubic_to(r - radius + k, t, r, t + radius - k, r, t + radius);
+        pb.cubic_to(r, b - radius + k, r - radius + k, b, r - radius, b);
+        pb.line_to(l + radius, b);
+        pb.cubic_to(l + radius - k, b, l, b - radius + k, l, b - radius);
+        pb.cubic_to(l, t + radius - k, l + radius - k, t, l + radius, t);
+        pb.close();
+    }
+    if let Some(path) = pb.finish() {
+        let clear = Paint {
+            anti_alias: true,
+            blend_mode: BlendMode::Clear,
+            ..Paint::default()
+        };
+        pixmap.fill_path(
+            &path,
+            &clear,
+            resvg::tiny_skia::FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+    let image = crate::vector::to_image(&pixmap);
+    EDGES.lock().unwrap().insert(key, image.clone());
+    (image, PAD)
+}

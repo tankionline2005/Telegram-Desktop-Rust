@@ -3173,11 +3173,35 @@ fn demo_emoji_sets() -> Update {
         creator: false,
         thumb_document_id: None,
     };
+    let mut stress: Vec<_> = (0..demo_stress_count())
+        .filter_map(|k| match demo_custom_emoji(DEMO_STRESS_ID + k) {
+            Some(Update::CustomEmoji { doc, .. }) => Some(doc),
+            _ => None,
+        })
+        .collect();
+    stress.extend(
+        demo_real_ids()
+            .into_iter()
+            .filter_map(|id| match demo_real_doc(id, false) {
+                Some(Update::CustomEmoji { doc, .. }) => Some(doc),
+                _ => None,
+            }),
+    );
+    let mut installed = vec![EmojiSet {
+        info: info(1, "tdesktop animations @tdesktop", true),
+        emoji: emoji.clone(),
+    }];
+    if !stress.is_empty() {
+        installed.push(EmojiSet {
+            info: tdr_data::emoji_sets::SetInfo {
+                count: stress.len() as i32,
+                ..info(3, "Stress", true)
+            },
+            emoji: stress,
+        });
+    }
     Update::EmojiSets {
-        installed: vec![EmojiSet {
-            info: info(1, "tdesktop animations @tdesktop", true),
-            emoji: emoji.clone(),
-        }],
+        installed,
         featured: vec![EmojiSet {
             info: info(2, "Featured demo", false),
             emoji,
@@ -3185,8 +3209,67 @@ fn demo_emoji_sets() -> Update {
     }
 }
 
+/// The first id of the stress set (`TDR_DEMO_EMOJI=N`: N more custom emoji
+/// for memory and speed checks, the demo animations under other ids).
+const DEMO_STRESS_ID: i64 = 20_000;
+
+fn demo_stress_count() -> i64 {
+    std::env::var("TDR_DEMO_EMOJI")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// `TDR_DEMO_EMOJI=real`: the custom emoji in the file cache (public sets'
+/// animations, read only) as the stress set, for checks with real animations.
+fn demo_real_cache() -> Option<&'static std::sync::Mutex<FileCache>> {
+    static CACHE: std::sync::OnceLock<Option<std::sync::Mutex<FileCache>>> =
+        std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            (std::env::var("TDR_DEMO_EMOJI").as_deref() == Ok("real"))
+                .then(|| FileCache::open_read_only(crate::data_dir().join("files")).ok())
+                .flatten()
+                .map(std::sync::Mutex::new)
+        })
+        .as_ref()
+}
+
+fn demo_real_doc(id: i64, with_file: bool) -> Option<Update> {
+    let mut cache = demo_real_cache()?.lock().unwrap();
+    let blob = cache.get(&format!("emoji-doc:{id}")).ok()??;
+    let doc = tdr_data::emoji_sets::decode_document(&blob)?;
+    let bytes = if with_file {
+        cache.get(&format!("emoji-file:{id}")).ok()??
+    } else {
+        Vec::new()
+    };
+    Some(Update::CustomEmoji { doc, bytes })
+}
+
+fn demo_real_ids() -> Vec<i64> {
+    let Some(cache) = demo_real_cache() else {
+        return Vec::new();
+    };
+    let keys = cache
+        .lock()
+        .unwrap()
+        .keys("emoji-file:", 5000)
+        .unwrap_or_default();
+    keys.iter()
+        .filter_map(|k| k.strip_prefix("emoji-file:")?.parse().ok())
+        .collect()
+}
+
 fn demo_custom_emoji(id: i64) -> Option<Update> {
-    let (_, alt, bytes) = DEMO_CUSTOM_EMOJI.iter().find(|e| e.0 == id)?;
+    if let Some(update) = demo_real_doc(id, true) {
+        return Some(update);
+    }
+    let (_, alt, bytes) = if (DEMO_STRESS_ID..DEMO_STRESS_ID + demo_stress_count()).contains(&id) {
+        &DEMO_CUSTOM_EMOJI[((id - DEMO_STRESS_ID) % DEMO_CUSTOM_EMOJI.len() as i64) as usize]
+    } else {
+        DEMO_CUSTOM_EMOJI.iter().find(|e| e.0 == id)?
+    };
     Some(Update::CustomEmoji {
         doc: tdr_data::emoji_sets::EmojiDocument {
             id,
@@ -4030,6 +4113,13 @@ pub fn start_demo(
                         group("Celebrate", 1, &["🎉", "🥳", "🎂"]),
                         group("Wow", 2, &["😮", "🤩", "💎"]),
                         group("Robots", 3, &["🤖", "👾"]),
+                        // More than the pill holds: the strip scrolls and is cut.
+                        group("Hearts", 1, &["❤", "💕"]),
+                        group("Party", 0, &["🎉", "🎊"]),
+                        group("Gems", 2, &["💎", "💍"]),
+                        group("Aliens", 3, &["👽", "👾"]),
+                        group("Hands", 0, &["👍", "👏"]),
+                        group("Cakes", 1, &["🎂", "🍰"]),
                     ]));
                 }
                 Command::LoadCustomEmoji(ids) => {

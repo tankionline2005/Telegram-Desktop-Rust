@@ -429,11 +429,88 @@ impl Rich {
         self.spans.get(k).filter(|s| s.range.start <= index)
     }
 
-    /// The selected text, for the clipboard.
-    pub fn selected_text(&self, range: Range<usize>) -> String {
+    /// The selected text with tdesktop's tags (`toTextForMimeData` and
+    /// `ConvertEntitiesToTextTags`): formatting, text links, quotes, code
+    /// blocks and custom emoji, for the clipboard.
+    pub fn selected_tagged(&self, range: Range<usize>) -> crate::clipboard::Tagged {
         let start = floor_boundary(&self.text, range.start.min(self.text.len()));
         let end = floor_boundary(&self.text, range.end.min(self.text.len()));
-        self.text[start..end].to_string()
+        let mut singles: Vec<(Range<usize>, String)> = Vec::new();
+        let mut add = |r: Range<usize>, tag: String| {
+            let (s, e) = (r.start.max(start), r.end.min(end));
+            if s < e {
+                singles.push((s - start..e - start, tag));
+            }
+        };
+        let in_pre = |i: usize| {
+            let k = self.paragraphs.partition_point(|p| p.range.end < i);
+            self.paragraphs
+                .get(k)
+                .and_then(|p| p.quote)
+                .is_some_and(|q| self.quotes[q].pre)
+        };
+        for span in &self.spans {
+            for (flag, tag) in [
+                (BOLD, "**"),
+                (ITALIC, "__"),
+                (UNDERLINE, "^^"),
+                (STRIKE, "~~"),
+                (SPOILER, "||"),
+                (MONO, "`"),
+            ] {
+                if span.flags & flag != 0 && !(flag == MONO && in_pre(span.range.start)) {
+                    add(span.range.clone(), tag.to_string());
+                }
+            }
+            // Text links (`CustomUrl`); plain addresses are found again.
+            if let Some(Link::Url(url)) = span.link.and_then(|id| self.link(id))
+                && self.text.get(span.range.clone()) != Some(url.as_str())
+            {
+                add(span.range.clone(), url.clone());
+            }
+        }
+        // Quotes and code blocks over their paragraphs.
+        let mut k = 0;
+        while k < self.paragraphs.len() {
+            let Some(q) = self.paragraphs[k].quote else {
+                k += 1;
+                continue;
+            };
+            let from = self.paragraphs[k].range.start;
+            let mut till = self.paragraphs[k].range.end;
+            while self
+                .paragraphs
+                .get(k + 1)
+                .is_some_and(|p| p.quote == Some(q))
+            {
+                k += 1;
+                till = self.paragraphs[k].range.end;
+            }
+            let quote = &self.quotes[q];
+            let tag = match (quote.pre, quote.header.as_str()) {
+                (true, "") => "```".to_string(),
+                (true, language)
+                    if language
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '+') =>
+                {
+                    format!("```{language}")
+                }
+                (true, _) => "```".to_string(),
+                (false, _) => ">".to_string(),
+            };
+            add(from..till, tag);
+            k += 1;
+        }
+        for (r, glyph) in &self.emoji {
+            if let crate::emoji::Glyph::Custom(id) = glyph {
+                add(r.clone(), crate::clipboard::custom_emoji_link(*id));
+            }
+        }
+        crate::clipboard::Tagged {
+            text: self.text[start..end].to_string(),
+            tags: crate::clipboard::combine(&singles),
+        }
     }
 
     /// The word around `index` (a double click selects it).

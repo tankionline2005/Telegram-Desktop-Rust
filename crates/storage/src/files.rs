@@ -46,6 +46,8 @@ pub struct FileCache {
     conn: Connection,
     config: FileCacheConfig,
     total: u64,
+    /// Opened for reading only: nothing is pruned or marked used.
+    read_only: bool,
 }
 
 fn now() -> i64 {
@@ -79,9 +81,35 @@ impl FileCache {
             conn,
             config,
             total: total as u64,
+            read_only: false,
         };
         cache.prune(now())?;
         Ok(cache)
+    }
+
+    /// Opens an existing cache for reading only (checks and the demo): nothing
+    /// is changed, a running app may keep using it.
+    pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        let conn = Connection::open_with_flags(
+            dir.join("index.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        Ok(Self {
+            dir,
+            conn,
+            config: FileCacheConfig::default(),
+            total: 0,
+            read_only: true,
+        })
+    }
+
+    /// The keys starting with `prefix`, at most `limit`.
+    pub fn keys(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
+        self.conn
+            .prepare("SELECT key FROM files WHERE key LIKE ?1 || '%' ORDER BY rowid LIMIT ?2")?
+            .query_map(params![prefix, limit as i64], |r| r.get(0))?
+            .collect()
     }
 
     fn path(&self, rowid: i64) -> PathBuf {
@@ -121,9 +149,11 @@ impl FileCache {
                 }
             },
         };
-        self.conn
-            .prepare_cached("UPDATE files SET last_access = ?2 WHERE rowid = ?1")?
-            .execute(params![rowid, now()])?;
+        if !self.read_only {
+            self.conn
+                .prepare_cached("UPDATE files SET last_access = ?2 WHERE rowid = ?1")?
+                .execute(params![rowid, now()])?;
+        }
         Ok(Some(data))
     }
 

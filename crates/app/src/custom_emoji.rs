@@ -15,7 +15,11 @@
 //!   2.5 times less than tdesktop's uncompressed frames (deflate gains little
 //!   more on these frames and unpacks several times slower), so scrolling back
 //!   shows them at once instead of rendering them again; only the frame on
-//!   screen is a GPU image.
+//!   screen is a GPU image;
+//! - an animation rendered to its end goes to a disk cache read through a
+//!   memory mapping (`mapped_store`): its frames leave the app's own memory at
+//!   once (Windows keeps them in its file cache, read back at memory speed) and
+//!   after a restart emoji show without being rendered again.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -32,22 +36,8 @@ pub struct Info {
     pub text_color: bool,
     pub free: bool,
     /// The vector thumbnail (`photoPathSize`), drawn while loading (parsed
-    /// when first drawn: sets bring thousands of documents).
-    pub path: Option<Arc<LazyPath>>,
-}
-
-/// A vector thumbnail's bytes and, once drawn, its path.
-pub struct LazyPath {
-    bytes: Vec<u8>,
-    parsed: OnceLock<Option<resvg::tiny_skia::Path>>,
-}
-
-impl LazyPath {
-    fn get(&self) -> Option<&resvg::tiny_skia::Path> {
-        self.parsed
-            .get_or_init(|| crate::vector_thumb::parse(&self.bytes))
-            .as_ref()
-    }
+    /// only when a silhouette image is made: sets bring thousands of documents).
+    pub path: Option<Arc<[u8]>>,
 }
 
 impl Info {
@@ -57,12 +47,7 @@ impl Info {
             set: doc.set,
             text_color: doc.text_color,
             free: doc.free,
-            path: doc.path.clone().map(|bytes| {
-                Arc::new(LazyPath {
-                    bytes,
-                    parsed: OnceLock::new(),
-                })
-            }),
+            path: doc.path.as_deref().map(Arc::from),
         }
     }
 }
@@ -90,6 +75,8 @@ enum Doc {
         format: EmojiFormat,
         bytes: Arc<[u8]>,
     },
+    /// The file was let go to save memory (asked for again when needed).
+    Dropped,
     Failed,
 }
 
@@ -99,11 +86,19 @@ const MAX_FRAMES: usize = 180;
 const PRELOAD_FRAMES: usize = 8;
 /// A frame is stored whole every this many frames (the rest as differences).
 const KEY_EVERY: usize = 8;
-/// Compressed frames kept for emoji off screen, in bytes.
-const BUDGET: usize = 48 << 20;
-/// Files kept in memory for emoji without frames (they come back from the
-/// file cache when painted again).
-const FILES_BUDGET: usize = 8 << 20;
+/// Compressed frames kept in memory for unfinished emoji off screen (finished
+/// ones are on disk), in bytes.
+const BUDGET: usize = 8 << 20;
+/// Files kept in memory (they come back from the file cache when needed).
+const FILES_BUDGET: usize = 2 << 20;
+/// Instances of finished emoji off screen this long are dropped (they come
+/// back from the disk cache at once).
+const INSTANCE_KEEP: Duration = Duration::from_secs(10);
+/// The disk cache: the blob format's version (a new renderer or format makes
+/// a new cache) and its size (segments of 32 MB).
+const STORE_VERSION: u64 = 1;
+const STORE_SEGMENTS: u32 = 12;
+const BLOB_MAGIC: u32 = 0x4543_4454;
 /// Workers stop rendering an emoji that was not painted for this long.
 const IDLE: Duration = Duration::from_millis(400);
 /// GPU images of emoji not painted for this long are dropped.
@@ -123,8 +118,10 @@ enum Job {
 
 /// One emoji at one size (`Ui::CustomEmoji::Instance`).
 struct Instance {
-    /// Frames packed one after another (`pack`), `offsets[k]..offsets[k + 1]`.
+    /// Frames packed one after another (`pack`), `offsets[k]..offsets[k + 1]`:
+    /// in memory while rendered, then in the disk cache.
     data: Vec<u8>,
+    disk: Option<&'static [u8]>,
     offsets: Vec<usize>,
     durations: Vec<u16>,
     finished: bool,
@@ -147,6 +144,7 @@ impl Instance {
     fn new(side: u32) -> Self {
         Self {
             data: Vec::new(),
+            disk: None,
             offsets: vec![0],
             durations: Vec::new(),
             finished: false,
@@ -166,8 +164,61 @@ impl Instance {
         self.durations.len()
     }
 
+    /// Memory held (frames on disk are not).
     fn bytes(&self) -> usize {
-        self.data.capacity() + self.offsets.capacity() * 8 + self.durations.capacity() * 2
+        self.data.capacity()
+            + self.offsets.capacity() * 8
+            + self.durations.capacity() * 2
+            + self.unpacked.as_ref().map_or(0, |u| u.1.capacity())
+    }
+
+    fn packed(&self) -> &[u8] {
+        self.disk.unwrap_or(&self.data)
+    }
+
+    /// The disk cache's blob: frames, flags, side, durations, offsets, data.
+    fn blob_header(&self) -> Vec<u8> {
+        let n = self.frames();
+        let mut out = Vec::with_capacity(12 + n * 6 + 4);
+        out.extend_from_slice(&BLOB_MAGIC.to_le_bytes());
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+        out.push(u8::from(self.alpha_only));
+        out.push(0);
+        out.extend_from_slice(&self.side.to_le_bytes());
+        for d in &self.durations {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        for o in &self.offsets {
+            out.extend_from_slice(&(*o as u32).to_le_bytes());
+        }
+        out
+    }
+
+    /// A finished instance from the disk cache's blob.
+    fn from_blob(blob: &'static [u8], side: u32) -> Option<Self> {
+        let u16_at = |at: usize| Some(u16::from_le_bytes(blob.get(at..at + 2)?.try_into().ok()?));
+        let u32_at = |at: usize| Some(u32::from_le_bytes(blob.get(at..at + 4)?.try_into().ok()?));
+        if u32_at(0)? != BLOB_MAGIC || u32_at(8)? != side {
+            return None;
+        }
+        let n = usize::from(u16_at(4)?);
+        let alpha_only = *blob.get(6)? != 0;
+        let durations: Vec<u16> = (0..n).map(|k| u16_at(12 + 2 * k)).collect::<Option<_>>()?;
+        let at = 12 + 2 * n;
+        let offsets: Vec<usize> = (0..=n)
+            .map(|k| u32_at(at + 4 * k).map(|v| v as usize))
+            .collect::<Option<_>>()?;
+        let data = blob.get(at + 4 * (n + 1)..)?;
+        if n == 0 || offsets.windows(2).any(|w| w[0] > w[1]) || offsets[n] != data.len() {
+            return None;
+        }
+        let mut i = Instance::new(side);
+        i.disk = Some(data);
+        i.offsets = offsets;
+        i.durations = durations;
+        i.finished = true;
+        i.alpha_only = alpha_only;
+        Some(i)
     }
 
     fn push(&mut self, raw: &[u8], duration: u32) {
@@ -205,7 +256,7 @@ impl Instance {
             buf.fill(0);
         }
         while from <= k {
-            let packed = &self.data[self.offsets[from]..self.offsets[from + 1]];
+            let packed = &self.packed()[self.offsets[from]..self.offsets[from + 1]];
             unpack_into(packed, &mut buf);
             from += 1;
         }
@@ -276,6 +327,43 @@ struct State {
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+static STORE: OnceLock<Option<Mutex<crate::mapped_store::Store>>> = OnceLock::new();
+static STORE_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// Where the disk cache lives (before the first emoji is painted).
+pub fn set_cache_dir(dir: std::path::PathBuf) {
+    let _ = STORE_DIR.set(dir);
+}
+
+fn store() -> Option<std::sync::MutexGuard<'static, crate::mapped_store::Store>> {
+    STORE
+        .get_or_init(|| {
+            let dir = STORE_DIR.get()?;
+            crate::mapped_store::Store::open(dir, "emoji-frames", STORE_VERSION, STORE_SEGMENTS)
+                .map(Mutex::new)
+        })
+        .as_ref()
+        .map(|m| m.lock().unwrap())
+}
+
+/// A finished instance goes to the disk cache: its frames leave memory.
+fn persist(key: Key, i: &mut Instance) {
+    if !i.finished || i.disk.is_some() || i.frames() == 0 {
+        return;
+    }
+    let header = i.blob_header();
+    let Some(blob) = store().and_then(|mut st| st.put(key, &[&header, &i.data])) else {
+        return;
+    };
+    i.disk = Some(&blob[header.len()..]);
+    i.data = Vec::new();
+}
+
+/// An instance from the disk cache, if it is there.
+fn from_disk(key: Key) -> Option<Instance> {
+    let blob = store()?.get(key)?;
+    Instance::from_blob(blob, key.1)
+}
 static WAKE: Condvar = Condvar::new();
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
@@ -401,6 +489,7 @@ fn run(task: Task) {
                     }
                     i.finished = true;
                     i.unpacked = None;
+                    persist(key, i);
                 }
             });
         }
@@ -441,6 +530,7 @@ fn run(task: Task) {
             if k == count {
                 i.finished = true;
                 i.source = None;
+                persist(key, i);
                 return false;
             }
             let ahead = i.frames() > i.frame + PRELOAD_FRAMES;
@@ -621,14 +711,22 @@ pub fn begin_frame(window: &mut Window) {
 fn trim(s: &mut State, now: Instant) {
     let mut total = 0;
     let mut off: Vec<(Instant, Key, usize)> = Vec::new();
+    let mut drop_now = Vec::new();
     for (key, i) in s.instances.iter_mut() {
-        let bytes = i.bytes();
-        total += bytes;
         if now.duration_since(i.painted) > SHOWN_KEEP && i.job == Job::Idle {
             i.source = None;
             i.unpacked = None;
-            off.push((i.painted, *key, bytes));
+            persist(*key, i);
+            if i.disk.is_some() && now.duration_since(i.painted) > INSTANCE_KEEP {
+                drop_now.push(*key);
+                continue;
+            }
+            off.push((i.painted, *key, i.bytes()));
         }
+        total += i.bytes();
+    }
+    for key in drop_now {
+        s.instances.remove(&key);
     }
     off.sort_by_key(|o| o.0);
     for (_, key, bytes) in off {
@@ -638,13 +736,20 @@ fn trim(s: &mut State, now: Instant) {
         s.instances.remove(&key);
         total -= bytes;
     }
-    let with_frames: std::collections::HashSet<i64> = s.instances.keys().map(|k| k.0).collect();
+    // Files of emoji rendered (or not shown) go first; a dropped one is asked
+    // for again only if it has to be rendered.
+    let rendering: std::collections::HashSet<i64> = s
+        .instances
+        .iter()
+        .filter(|(_, i)| !i.finished)
+        .map(|(k, _)| k.0)
+        .collect();
     let mut files = 0;
     let mut spare = Vec::new();
     for (id, doc) in &s.docs {
         if let Doc::File { bytes, .. } = doc {
             files += bytes.len();
-            if !with_frames.contains(id) {
+            if !rendering.contains(id) {
                 spare.push((*id, bytes.len()));
             }
         }
@@ -653,9 +758,52 @@ fn trim(s: &mut State, now: Instant) {
         if files <= FILES_BUDGET {
             break;
         }
-        s.docs.remove(&id);
+        s.docs.insert(id, Doc::Dropped);
         files -= len;
     }
+}
+
+/// Sizes for the memory report (`TDR_MEMORY`).
+pub fn stats() -> String {
+    with(|s| {
+        let frames: usize = s.instances.values().map(Instance::bytes).sum();
+        let on_disk = s.instances.values().filter(|i| i.disk.is_some()).count();
+        let sources = s.instances.values().filter(|i| i.source.is_some()).count();
+        let unpacked: usize = s
+            .instances
+            .values()
+            .filter_map(|i| i.unpacked.as_ref().map(|u| u.1.capacity()))
+            .sum();
+        let files: usize = s
+            .docs
+            .values()
+            .map(|d| match d {
+                Doc::File { bytes, .. } => bytes.len(),
+                _ => 0,
+            })
+            .sum();
+        let shown: usize = s.shown.values().map(|v| image_bytes(&v.image)).sum();
+        format!(
+            "custom emoji: {} instances ({} on disk), in memory {:.1} MB, unpacked {:.1} MB, \
+             {} sources, files {:.1} MB ({} docs), shown {} ({:.1} MB), info {}",
+            s.instances.len(),
+            on_disk,
+            frames as f64 / 1048576.,
+            unpacked as f64 / 1048576.,
+            sources,
+            files as f64 / 1048576.,
+            s.docs.len(),
+            s.shown.len(),
+            shown as f64 / 1048576.,
+            s.info.len(),
+        )
+    })
+}
+
+fn image_bytes(image: &RenderImage) -> usize {
+    (0..image.frame_count())
+        .filter_map(|k| image.as_bytes(k).map(<[u8]>::len))
+        .sum()
 }
 
 /// The ids to ask the data thread for (since the last call).
@@ -738,12 +886,15 @@ pub fn paint_ex(
         let i = s
             .instances
             .entry(key)
-            .or_insert_with(|| Instance::new(side));
+            .or_insert_with(|| from_disk(key).unwrap_or_else(|| Instance::new(side)));
         i.painted = now;
         let (frames, job, finished) = (i.frames(), i.job, i.finished);
         if frames == 0 {
             if has_file && job == Job::Idle {
                 queue(s, key, true);
+            } else if matches!(s.docs.get(&id), Some(Doc::Dropped)) {
+                s.docs.insert(id, Doc::Requested);
+                s.wanted.push(id);
             }
             return Err(s.info.get(&id).and_then(|i| i.path.clone()));
         }
@@ -820,9 +971,7 @@ pub fn paint_ex(
             true
         }
         Err(Some(path)) => {
-            if let Some(path) = path.get()
-                && let Some(image) = loading_image(id, side, path, color, loading, x, scale)
-            {
+            if let Some(image) = loading_image(id, side, &path, color, loading, x, scale) {
                 let _ = window.paint_image(bounds, Corners::default(), image, 0, false);
             }
             false
@@ -841,7 +990,7 @@ static SHIMMER_START: OnceLock<Instant> = OnceLock::new();
 fn loading_image(
     id: i64,
     side: u32,
-    path: &resvg::tiny_skia::Path,
+    path: &[u8],
     color: gpui::Hsla,
     loading: Loading,
     x: f32,
@@ -910,6 +1059,7 @@ fn loading_image(
     if cached.is_some() {
         return cached;
     }
+    let path = crate::vector_thumb::parse(path)?;
     let mut pixmap = Pixmap::new(side.max(1), side.max(1))?;
     let paint = Paint {
         shader,
@@ -918,7 +1068,7 @@ fn loading_image(
     };
     let k = side as f32 / 512.;
     pixmap.fill_path(
-        path,
+        &path,
         &paint,
         FillRule::EvenOdd,
         Transform::from_scale(k, k),

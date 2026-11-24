@@ -749,6 +749,8 @@ pub struct MainView {
     emoji_preview: emoji_preview::EmojiPreview,
     /// Emoji suggestions over the message field (shared with it).
     emoji_suggest: std::rc::Rc<std::cell::RefCell<crate::emoji_suggest::Suggest>>,
+    /// Custom emoji need Premium in the open chat (the field's paste reads it).
+    custom_locked: std::rc::Rc<std::cell::Cell<bool>>,
     /// The set the "Remove" box asks about.
     emoji_set_removing: Option<(tdr_data::emoji_sets::SetRef, String)>,
     /// The chat list's share of the window (tdesktop's dialogs width ratios).
@@ -905,7 +907,10 @@ impl MainView {
         let emoji_suggest = std::rc::Rc::new(std::cell::RefCell::new(
             crate::emoji_suggest::Suggest::default(),
         ));
-        input.update(cx, |i, _| i.enable_emoji_helpers(emoji_suggest.clone()));
+        let custom_locked = std::rc::Rc::new(std::cell::Cell::new(true));
+        input.update(cx, |i, _| {
+            i.enable_emoji_helpers(emoji_suggest.clone(), custom_locked.clone())
+        });
         if let Some(dir) = accounts
             .read(cx)
             .emoji_settings_path()
@@ -1035,6 +1040,7 @@ impl MainView {
             emoji_panel: emoji_panel::EmojiPanel::new(accounts.read(cx).emoji_settings_path()),
             emoji_set_box: None,
             emoji_suggest,
+            custom_locked,
             emoji_preview: Default::default(),
             emoji_set_removing: None,
             columns: Columns::default(),
@@ -4722,6 +4728,7 @@ impl Focusable for MainView {
 
 impl Render for MainView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.custom_locked.set(self.custom_emoji_locked(cx));
         if crate::profile::off("view") {
             // Performance experiment: an empty frame, every vsync.
             window.request_animation_frame();
@@ -4745,6 +4752,7 @@ impl MainView {
         crate::repaint::begin();
         crate::repaint::set_paused(!window.is_window_active());
         crate::custom_emoji::begin_frame(window);
+        crate::emoji::begin_frame(window);
         crate::vector::begin_frame(window);
         self.update_emoji_suggest(window, cx);
         self.update_emoji_preview(window);

@@ -992,24 +992,22 @@ impl MainView {
                     })),
             );
         }
-        let strip = strip.on_scroll_wheel(cx.listener(
-            move |this, e: &gpui::ScrollWheelEvent, window, cx| {
-                let d = e.delta.pixel_delta(window.line_height());
-                let delta = if d.x.abs() > d.y.abs() { d.x } else { d.y };
-                let now = this
-                    .emoji_panel
-                    .groups_left
-                    .unwrap_or(pill_w)
-                    .clamp(min, max);
-                this.emoji_panel.groups_left = Some((now + f32::from(delta)).clamp(min, max));
-                cx.notify();
-            },
-        ));
+        // `moveGroupsTo`'s fade over the search button, shown once the field
+        // is pushed under it (in the pill's coordinates).
+        let field_x = fade_start + field_left;
+        let fade = (field_x < fade_start).then(|| {
+            if field_x < fade_start / 2. {
+                1.
+            } else {
+                (fade_start - field_x) / (fade_start / 2.)
+            }
+        });
         GroupsStrip {
             element: strip.into_any_element(),
-            field_left,
+            field_x,
             field_width,
-            pushed: field_left < -lg(1.),
+            fade,
+            range: (min, max, pill_w),
         }
     }
 
@@ -2216,14 +2214,47 @@ impl MainView {
         });
         let search = self.emoji_panel.search.clone().map(|field| {
             let [ml, mt, mr, _] = SEARCH_MARGIN;
-            div()
+            let pill_w = width - lg(ml) - lg(mr);
+            let pill_bg = c(p.window_bg_over);
+            let outer = c(p.emoji_pan_bg);
+            let search_button = div()
+                .id("emoji-search-icon")
+                .flex_none()
+                .w(px(33.))
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(chosen_group.is_some(), |d| d.cursor_pointer())
+                .child(if chosen_group.is_some() {
+                    icon(Icon::EmojiBack, p.menu_icon_fg, window)
+                } else {
+                    icon(Icon::EmojiSearch, p.emoji_icon_fg, window)
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        // `_back`: out of the group, the strip to its start.
+                        if this.emoji_panel.chosen_group.take().is_some() {
+                            this.emoji_panel.groups_left = None;
+                            this.emoji_panel.results = None;
+                            this.emoji_panel.over = Over::None;
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }),
+                );
+            let range = groups_strip.as_ref().map(|strip| strip.range);
+            let pill = div()
                 .absolute()
                 .left(gpx(lg(ml)))
                 .top(px(mt))
-                .w(gpx(width - lg(ml) - lg(mr)))
+                .w(gpx(pill_w))
                 .h(px(SEARCH_HEIGHT))
                 .rounded(px(SEARCH_HEIGHT / 2.))
-                .bg(c(p.window_bg_over))
+                .bg(pill_bg)
+                .overflow_hidden()
                 .flex()
                 .items_center()
                 .cursor_text()
@@ -2234,95 +2265,126 @@ impl MainView {
                         cx.stop_propagation();
                     }
                 })
-                .child(
-                    div()
-                        .id("emoji-search-icon")
-                        .flex_none()
-                        .w(px(33.))
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .when(chosen_group.is_some(), |d| d.cursor_pointer())
-                        .child(if chosen_group.is_some() {
-                            icon(Icon::EmojiBack, p.menu_icon_fg, window)
-                        } else {
-                            icon(Icon::EmojiSearch, p.emoji_icon_fg, window)
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, window, cx| {
-                                // `_back`: out of the group, the strip to its start.
-                                if this.emoji_panel.chosen_group.take().is_some() {
-                                    this.emoji_panel.groups_left = None;
-                                    this.emoji_panel.results = None;
-                                    this.emoji_panel.over = Over::None;
-                                    window.prevent_default();
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }
-                            }),
-                        ),
-                )
-                .child(match &groups_strip {
-                    // `moveGroupsTo`: the field ends where the groups start,
-                    // pushed under a fade when they are scrolled over it.
-                    Some(strip) => div()
-                        .relative()
-                        .flex_1()
-                        .h_full()
-                        .min_w(px(0.))
-                        .overflow_hidden()
+                // `SearchWithGroups::wheelEvent`: the wheel over the pill moves
+                // the groups and never reaches the panel.
+                .on_scroll_wheel(cx.listener(
+                    move |this, e: &gpui::ScrollWheelEvent, window, cx| {
+                        cx.stop_propagation();
+                        let Some((min, max, pill_w)) = range else {
+                            return;
+                        };
+                        let d = e.delta.pixel_delta(window.line_height());
+                        let delta = if d.x.abs() > d.y.abs() { d.x } else { d.y };
+                        let now = this
+                            .emoji_panel
+                            .groups_left
+                            .unwrap_or(pill_w)
+                            .clamp(min, max);
+                        this.emoji_panel.groups_left =
+                            Some((now + f32::from(delta)).clamp(min, max));
+                        cx.notify();
+                    },
+                ));
+            match groups_strip {
+                // Under each other: the groups, the field, the fade, the search
+                // button, the rounded right edge (`initEdges`).
+                Some(strip) => {
+                    let mut transparent = pill_bg;
+                    transparent.a = 0.;
+                    let fade_start = lg(33.);
+                    pill.child(strip.element)
                         .child(
                             div()
+                                .id("emoji-search-field")
                                 .absolute()
                                 .top_0()
-                                .left(gpx(strip.field_left))
+                                .left(gpx(strip.field_x))
                                 .w(gpx(strip.field_width))
                                 .h_full()
                                 .flex()
                                 .items_center()
-                                .when(strip.pushed, |d| d.opacity(0.))
+                                .occlude()
                                 .child(field.clone()),
                         )
-                        .into_any_element(),
-                    None => div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .child(field.clone())
-                        .into_any_element(),
-                })
-                .children(groups_strip.map(|strip| strip.element))
-                .when(has_query, |d| {
-                    // `TabbedSearch`'s cancel: clears the query.
-                    let field = field.clone();
-                    d.child(
-                        div()
-                            .id("emoji-search-cancel")
-                            .flex_none()
-                            .size(px(SEARCH_HEIGHT))
-                            .cursor_pointer()
-                            .child(
-                                canvas(
-                                    |_, _, _| {},
-                                    move |bounds, _, window, _| {
-                                        super::chrome::paint_cross(bounds, cancel_color, window)
-                                    },
-                                )
-                                .size_full(),
+                        .children(strip.fade.map(|opacity| {
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .h_full()
+                                .flex()
+                                .opacity(opacity)
+                                .child(div().w(gpx(fade_start)).h_full().bg(pill_bg))
+                                .child(div().w(gpx(lg(GROUPS_FADE_WIDTH))).h_full().bg(
+                                    gpui::linear_gradient(
+                                        90.,
+                                        gpui::linear_color_stop(pill_bg, 0.),
+                                        gpui::linear_color_stop(transparent, 1.),
+                                    ),
+                                ))
+                        }))
+                        .child(search_button.absolute().top_0().left_0().occlude())
+                        .child(
+                            canvas(
+                                |_, _, _| {},
+                                move |bounds, _, window, _| {
+                                    let scale = window.scale_factor();
+                                    let h = (f32::from(bounds.size.height) * scale).round() as u32;
+                                    let (image, pad) = crate::icons::round_edge_image(outer, h);
+                                    let pad = pad as f32 / scale;
+                                    let w = (h / 2) as f32 / scale;
+                                    let right = bounds.origin.x + bounds.size.width;
+                                    let at = Bounds::new(
+                                        point(right - gpx(w + pad), bounds.origin.y - gpx(pad)),
+                                        gpui::size(
+                                            gpx(w + 2. * pad),
+                                            bounds.size.height + gpx(2. * pad),
+                                        ),
+                                    );
+                                    let _ =
+                                        window.paint_image(at, Corners::default(), image, 0, false);
+                                },
                             )
-                            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                                this.emoji_panel.cancel_over = *hovered;
-                                cx.notify();
-                            }))
-                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                                window.prevent_default();
-                                cx.stop_propagation();
-                                field.update(cx, |f, cx| f.set_text(String::new(), cx));
-                                window.focus(&field.focus_handle(cx));
-                            }),
-                    )
-                })
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
+                        )
+                }
+                None => pill
+                    .child(search_button)
+                    .child(div().flex_1().min_w(px(0.)).child(field.clone()))
+                    .when(has_query, |d| {
+                        // `TabbedSearch`'s cancel: clears the query.
+                        let field = field.clone();
+                        d.child(
+                            div()
+                                .id("emoji-search-cancel")
+                                .flex_none()
+                                .size(px(SEARCH_HEIGHT))
+                                .cursor_pointer()
+                                .child(
+                                    canvas(
+                                        |_, _, _| {},
+                                        move |bounds, _, window, _| {
+                                            super::chrome::paint_cross(bounds, cancel_color, window)
+                                        },
+                                    )
+                                    .size_full(),
+                                )
+                                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                    this.emoji_panel.cancel_over = *hovered;
+                                    cx.notify();
+                                }))
+                                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                    field.update(cx, |f, cx| f.set_text(String::new(), cx));
+                                    window.focus(&field.focus_handle(cx));
+                                }),
+                        )
+                    }),
+            }
         });
         div()
             .id("emoji-list")
@@ -2665,12 +2727,17 @@ impl MainView {
 /// The search's groups strip and the field's place beside it.
 struct GroupsStrip {
     element: AnyElement,
-    /// The field's left (from the search button's right) and width.
-    field_left: f32,
+    /// The field's left in the pill and its width.
+    field_x: f32,
     field_width: f32,
-    /// The field is pushed under the fade: its text is hidden.
-    pushed: bool,
+    /// The fade's opacity while the field is pushed under it.
+    fade: Option<f32>,
+    /// The strip's left edge limits and the pill's width (the wheel's moves).
+    range: (f32, f32, f32),
 }
+
+/// `fadeLeft`'s width (`fade_horizontal`).
+const GROUPS_FADE_WIDTH: f32 = 20.;
 
 /// `defaultTabbedSearch`: `groupWidth`, `groupSkip`, `defaultFieldWidth`, and
 /// `kCategoryIconSizeOverride`.

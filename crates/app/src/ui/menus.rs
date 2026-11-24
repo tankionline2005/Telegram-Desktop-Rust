@@ -749,9 +749,8 @@ impl MainView {
                 field(window, cx);
             }
             MenuAction::CopyText(peer, id) => {
-                let text = self.message_text((peer, id));
-                if let Some(text) = text {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                if let Some(tagged) = self.message_text((peer, id)) {
+                    crate::clipboard::copy(tagged, cx);
                 }
             }
             MenuAction::CopySelected => {
