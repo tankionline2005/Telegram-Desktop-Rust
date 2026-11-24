@@ -198,7 +198,9 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("TDR_LOG")
-                .unwrap_or_else(|_| "warn".into()),
+                // tiny-skia warns of every empty path a Lottie frame fills
+                // (thousands a minute while emoji render).
+                .unwrap_or_else(|_| "warn,tiny_skia=error".into()),
         )
         .with_writer(std::io::stderr)
         .init();

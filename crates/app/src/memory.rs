@@ -236,4 +236,59 @@ mod tests {
             parsed / 1024,
         );
     }
+
+    /// Heap taken by syntax highlighting of code in many languages.
+    #[test]
+    #[ignore]
+    fn prism_heap() {
+        let before = super::live();
+        let h =
+            tdr_prism::Highlighter::load(include_bytes!("../../../assets/libprisma/grammars.dat"));
+        eprintln!("grammars loaded: {} KB", (super::live() - before) / 1024);
+        let code = "fn main() { let x = 10; println!(\"Hello, {}!\", x); } // comment
+                    def add(a, b):
+    return a + b
+#include <stdio.h>
+int main(void) { return 0; }";
+        let languages = [
+            "rust",
+            "python",
+            "c",
+            "cpp",
+            "csharp",
+            "java",
+            "javascript",
+            "typescript",
+            "go",
+            "kotlin",
+            "swift",
+            "php",
+            "ruby",
+            "haskell",
+            "elixir",
+            "erlang",
+            "lua",
+            "sql",
+            "bash",
+            "objectivec",
+            "scala",
+            "dart",
+            "json",
+            "css",
+            "markup",
+        ];
+        let mut at = super::live();
+        for (k, lang) in languages.iter().enumerate() {
+            let t = std::time::Instant::now();
+            let _ = h.highlight(code, lang);
+            let now = super::live();
+            eprintln!(
+                "{k:>2} {lang:<12} +{:>6} KB (total {:>6} KB), {:?}",
+                (now as i64 - at as i64) / 1024,
+                (now - before) / 1024,
+                t.elapsed()
+            );
+            at = now;
+        }
+    }
 }

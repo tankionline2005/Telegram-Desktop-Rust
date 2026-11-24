@@ -9,7 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 # Prism's grammars are JavaScript regular expressions: lookaround and backreferences.
-fancy-regex = "0.14"
+fancy-regex = "0.20"
 
 [lints]
 workspace = true

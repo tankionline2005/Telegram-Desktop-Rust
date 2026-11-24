@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::RenderImage;
 use tdr_data::describe::{self, PeerKind as ChatKind};
@@ -931,19 +931,46 @@ fn add_syntax(out: &str, converted: &mut Vec<TextEntity>) {
 }
 
 /// tdesktop's syntax highlighting (libprisma), remembered: histories are sent
-/// again on every change, the code stays the same.
+/// again on every change, the code stays the same. The highlighter (its
+/// grammars and the patterns compiled so far: ~20 MB for 25 languages) is let
+/// go after a minute unused and loaded again for new code (milliseconds).
 fn syntax_colors(code: &str, language: &str) -> Vec<(std::ops::Range<usize>, u8)> {
     use std::sync::{LazyLock, Mutex};
     type Cache = HashMap<(String, String), Vec<(std::ops::Range<usize>, u8)>>;
-    static HIGHLIGHTER: LazyLock<tdr_prism::Highlighter> = LazyLock::new(|| {
-        tdr_prism::Highlighter::load(include_bytes!("../../../assets/libprisma/grammars.dat"))
-    });
+    static HIGHLIGHTER: Mutex<Option<(tdr_prism::Highlighter, Instant)>> = Mutex::new(None);
     static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Default::default);
+    static RELEASER: std::sync::Once = std::sync::Once::new();
+    const KEEP: Duration = Duration::from_secs(60);
     let key = (language.to_string(), code.to_string());
     if let Some(runs) = CACHE.lock().unwrap().get(&key) {
         return runs.clone();
     }
-    let runs = HIGHLIGHTER.highlight(code, language);
+    RELEASER.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("syntax-release".into())
+            .spawn(|| {
+                loop {
+                    std::thread::sleep(KEEP / 2);
+                    let mut h = HIGHLIGHTER.lock().unwrap();
+                    if h.as_ref().is_some_and(|(_, used)| used.elapsed() > KEEP) {
+                        *h = None;
+                    }
+                }
+            });
+    });
+    let runs = {
+        let mut h = HIGHLIGHTER.lock().unwrap();
+        let (highlighter, used) = h.get_or_insert_with(|| {
+            (
+                tdr_prism::Highlighter::load(include_bytes!(
+                    "../../../assets/libprisma/grammars.dat"
+                )),
+                Instant::now(),
+            )
+        });
+        *used = Instant::now();
+        highlighter.highlight(code, language)
+    };
     let mut cache = CACHE.lock().unwrap();
     if cache.len() > 500 {
         cache.clear();
