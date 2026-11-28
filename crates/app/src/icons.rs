@@ -166,6 +166,12 @@ pub enum Icon {
     PremiumLock,
     /// `emojiEmpty`: the panel's search found nothing.
     EmojiEmpty,
+    /// `stripBubble`: the reaction strip's tail and its shadow.
+    ReactionsBubble,
+    ReactionsBubbleShadow,
+    /// `stripExpandPanel`: the round under the strip's expand arrow, the arrow.
+    ReactionsRoundBig,
+    ReactionsExpandPanel,
     /// `defaultTabbedSearchBack`: out of a chosen emoji group.
     EmojiBack,
     SmallClose,
@@ -323,6 +329,12 @@ impl Icon {
             Icon::MenuRestore => Source::Png(icon_bytes!("menu__restore")),
             Icon::PremiumLock => Source::Png(icon_bytes!("emoji__premium_lock")),
             Icon::EmojiEmpty => Source::Png(icon_bytes!("emoji_empty")),
+            Icon::ReactionsBubble => Source::Png(icon_bytes!("chat__reactions_bubble")),
+            Icon::ReactionsBubbleShadow => {
+                Source::Png(icon_bytes!("chat__reactions_bubble_shadow"))
+            }
+            Icon::ReactionsRoundBig => Source::Png(icon_bytes!("chat__reactions_round_big")),
+            Icon::ReactionsExpandPanel => Source::Png(icon_bytes!("chat__reactions_expand_panel")),
             Icon::EmojiBack => Source::Png(icon_bytes!("emoji__emoji_back")),
             Icon::SmallClose => Source::Png(icon_bytes!("simple_close")),
             Icon::MenuDiscussion => Source::Png(icon_bytes!("menu__discussion")),

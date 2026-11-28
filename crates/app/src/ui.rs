@@ -42,6 +42,7 @@ mod layers;
 mod main_menu;
 mod menus;
 mod message_text;
+mod reactions;
 mod settings;
 mod threads;
 
@@ -747,6 +748,7 @@ pub struct MainView {
     emoji_set_box: Option<emoji_set_box::SetBox>,
     /// The held custom emoji's large preview.
     emoji_preview: emoji_preview::EmojiPreview,
+    reactions_ui: reactions::ReactionsUi,
     /// Emoji suggestions over the message field (shared with it).
     emoji_suggest: std::rc::Rc<std::cell::RefCell<crate::emoji_suggest::Suggest>>,
     /// Custom emoji need Premium in the open chat (the field's paste reads it).
@@ -1042,6 +1044,7 @@ impl MainView {
             emoji_suggest,
             custom_locked,
             emoji_preview: Default::default(),
+            reactions_ui: Default::default(),
             emoji_set_removing: None,
             columns: Columns::default(),
             columns_path: None,
@@ -1987,6 +1990,10 @@ impl MainView {
                     .collect();
                 crate::emoji_suggest::apply_difference(remote, &lang, version, changes);
                 self.emoji_keywords_came(cx);
+            }
+            Update::AvailableReactions { list, top } => {
+                self.reactions_came(list, top);
+                cx.notify();
             }
             Update::EmojiGroups(groups) => {
                 self.emoji_panel.groups = groups;
@@ -3556,7 +3563,18 @@ impl MainView {
         let entities: &[crate::rich_text::TextEntity] =
             if caption_only { &[] } else { &item.entities };
         let measured = self.rich_measured(text_key, &text, entities, window);
-        let text_w = measured.natural_width(skip_w);
+        // `refreshInfoSkipBlock`: with reactions the text has no skip block,
+        // the reactions take it.
+        let reactions = item.reactions.as_ref().filter(|r| !r.buttons.is_empty());
+        let text_skip = if reactions.is_some() {
+            (0., 0.)
+        } else {
+            (skip_w, skip_h)
+        };
+        let text_w = measured.natural_width(text_skip.0);
+        let reactions_w = reactions.map_or(0., |r| {
+            Self::reactions_max_width(r, skip_w, window).min(max_text)
+        });
         let name_w = sender.map_or(0., |(name, _)| {
             text_width(window, name, FONT_SIZE, FontWeight::SEMIBOLD)
         });
@@ -3598,6 +3616,7 @@ impl MainView {
         };
         // Whole device pixels; the text is laid out at this width.
         let inner = (text_w
+            .max(reactions_w)
             .max(name_w)
             .max(media_w)
             .max(forwarded_w)
@@ -3608,8 +3627,17 @@ impl MainView {
             * scale::get())
         .ceil()
             / scale::get();
-        let text_layout = self.rich_layout(text_key, &measured, inner, (skip_w, skip_h));
+        let text_layout = self.rich_layout(text_key, &measured, inner, text_skip);
         let text_h = text_layout.height;
+        let reactions_layout = reactions.map(|r| {
+            (
+                r,
+                Self::layout_reactions(r, inner, (skip_w, skip_h), window),
+            )
+        });
+        let reactions_h = reactions_layout
+            .as_ref()
+            .map_or(0., |(_, l)| lg(reactions::MEDIA_IN_BUBBLE_SKIP) + l.height);
 
         let small = px(MSG_RADIUS_SMALL);
         let large = px(MSG_RADIUS_LARGE);
@@ -3782,6 +3810,16 @@ impl MainView {
                     .child(one_line(m.clone()))
             }))
             .child(text_view)
+            .children(reactions_layout.as_ref().map(|(r, layout)| {
+                div()
+                    .w(gpui::px(inner))
+                    .pt(gpui::px(lg(reactions::MEDIA_IN_BUBBLE_SKIP)))
+                    .child(
+                        self.render_reactions(
+                            pane.peer, item.id, r, layout, item.out, pane.live, view,
+                        ),
+                    )
+            }))
             .child(info)
             .when(comments_h > 0., |d| d.pb(gpui::px(pad_y + comments_h)))
             .children(comments.map(|text| {
@@ -3829,6 +3867,7 @@ impl MainView {
             + comments_h
             + reply_h
             + text_h
+            + reactions_h
             + text_font.height
                 * (sender.is_some() as u8 + forwarded.is_some() as u8 + media_line.is_some() as u8)
                     as f32;
@@ -4739,6 +4778,13 @@ impl Focusable for MainView {
 impl Render for MainView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.custom_locked.set(self.custom_emoji_locked(cx));
+        self.ask_reactions();
+        self.reactions_ui.premium = self
+            .accounts
+            .read(cx)
+            .active()
+            .and_then(|s| s.me.as_ref())
+            .is_some_and(|m| m.premium);
         if crate::profile::off("view") {
             // Performance experiment: an empty frame, every vsync.
             window.request_animation_frame();

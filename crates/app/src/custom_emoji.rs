@@ -948,6 +948,20 @@ pub fn paint(
     paint_ex(id, origin, side, color, Loading::Silhouette, window)
 }
 
+/// The first frame of `id`, not playing (`AnimatedIcon::frame`: a reaction's
+/// icon under a message).
+pub fn paint_still(id: i64, origin: Point<Pixels>, side: u32, window: &mut Window) -> bool {
+    paint_inner(
+        id,
+        origin,
+        side,
+        gpui::Hsla::default(),
+        Loading::Silhouette,
+        true,
+        window,
+    )
+}
+
 /// `paint` with what to draw while it loads.
 pub fn paint_ex(
     id: i64,
@@ -955,6 +969,18 @@ pub fn paint_ex(
     side: u32,
     color: gpui::Hsla,
     loading: Loading,
+    window: &mut Window,
+) -> bool {
+    paint_inner(id, origin, side, color, loading, false, window)
+}
+
+fn paint_inner(
+    id: i64,
+    origin: Point<Pixels>,
+    side: u32,
+    color: gpui::Hsla,
+    loading: Loading,
+    still: bool,
     window: &mut Window,
 ) -> bool {
     let _timer = crate::profile::Timer::new("custom_emoji::paint");
@@ -986,13 +1012,13 @@ pub fn paint_ex(
             }
             return Err(s.info.get(&id).and_then(|i| i.path.clone()));
         }
-        if !paused {
+        if !paused && !still {
             i.advance(now, counter);
         }
-        if let Some(due) = i.next_due() {
+        if !still && let Some(due) = i.next_due() {
             crate::repaint::at(due.max(now + Duration::from_millis(8)));
         }
-        let frame = i.frame;
+        let frame = if still { 0 } else { i.frame };
         let color_key = if text_color && i.alpha_only {
             let c = gpui::Rgba::from(color);
             let to = |v: f32| (v.clamp(0., 1.) * 255.).round() as u32;

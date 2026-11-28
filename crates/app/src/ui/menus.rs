@@ -32,6 +32,8 @@ pub(super) struct OpenMenu {
     tag: MenuTag,
     /// The phone number's owner, for the userpic.
     phone_author: Option<Author>,
+    /// A message's menu: the reaction strip over it.
+    pub(super) strip: Option<super::reactions::StripState>,
 }
 
 /// The highlight under one-line code and its hint beside the message. Moving to
@@ -301,6 +303,7 @@ impl MainView {
             menu: PopupMenu::new(entries, true, at).top_right_origin(),
             tag: MenuTag::Other,
             phone_author: None,
+            strip: None,
         });
     }
 
@@ -310,6 +313,7 @@ impl MainView {
             menu,
             tag: MenuTag::Other,
             phone_author: None,
+            strip: None,
         });
     }
 
@@ -321,6 +325,7 @@ impl MainView {
             menu: PopupMenu::new(entries, true, at),
             tag,
             phone_author: None,
+            strip: None,
         });
     }
 
@@ -400,6 +405,7 @@ impl MainView {
             menu: PopupMenu::new(entries, false, at),
             tag: MenuTag::Other,
             phone_author: None,
+            strip: None,
         });
         cx.notify();
     }
@@ -554,7 +560,20 @@ impl MainView {
                 action: MenuAction::OpenEmojiSet(id, access_hash),
             });
         }
+        let service = item.service.is_some();
         self.open_menu(e, at, MenuTag::Message);
+        // `AttachSelectorToMenu`: reactions over the menu of a message that
+        // takes them (not service messages).
+        if !service {
+            let keys = self.strip_reactions();
+            if let Some(open) = self.text_ui.menu.as_mut()
+                && !keys.is_empty()
+            {
+                let [_, et, _, _] = super::reactions::STRIP_EXTEND.map(crate::scale::lg);
+                open.menu.reserve_top = et + crate::scale::lg(super::reactions::STRIP_SHADOW[1]);
+                open.strip = Some(super::reactions::StripState::new(key.0, key.1, keys));
+            }
+        }
     }
 
     /// `PhoneClickHandler::onClick`.
@@ -676,6 +695,27 @@ impl MainView {
         }
     }
 
+    pub(super) fn menu_strip_mut(&mut self) -> Option<&mut super::reactions::StripState> {
+        self.text_ui.menu.as_mut().and_then(|m| m.strip.as_mut())
+    }
+
+    /// A reaction of the strip was chosen (`Selector::chosen`): the menu goes and
+    /// the reaction is toggled; the expand button waits for the full panel.
+    pub(super) fn strip_chosen(&mut self, key: Option<tdr_data::describe::ReactionKey>) {
+        let Some(open) = &mut self.text_ui.menu else {
+            return;
+        };
+        let (Some(key), Some(strip)) = (key, &open.strip) else {
+            return;
+        };
+        let _ = self.commands.send(Command::ToggleReaction {
+            peer: strip.peer,
+            msg_id: strip.msg_id,
+            key,
+        });
+        open.menu.hide();
+    }
+
     fn menu_area(window: &Window) -> Bounds<Pixels> {
         Bounds::new(point(gpui::px(0.), gpui::px(0.)), window.viewport_size())
     }
@@ -688,7 +728,27 @@ impl MainView {
         if self.text_ui.menu.as_ref().is_some_and(|m| m.menu.gone()) {
             self.text_ui.menu = None;
         }
+        // The strip's width decides the menu's (`AdjustMenuGeometryForSelector`).
+        let area = Self::menu_area(window);
+        if let Some(open) = self.text_ui.menu.as_mut()
+            && let Some(strip) = open.strip.as_mut()
+        {
+            open.menu.min_width = 0.;
+            let natural = open.menu.geometry(area, window).w;
+            open.menu.min_width = strip.fit(natural);
+        }
         let open = self.text_ui.menu.as_ref()?;
+        let strip = open
+            .strip
+            .as_ref()
+            .filter(|_| !open.menu.hiding())
+            .map(|strip| {
+                if strip.animating() {
+                    window.request_animation_frame();
+                }
+                let g = open.menu.geometry(area, window);
+                self.render_strip(strip, (g.x, g.y, g.w), window, &cx.entity().downgrade())
+            });
         let colors = MenuColors::from(self.palette());
         let userpic = open.phone_author.as_ref().map(|a| {
             self.userpic(
@@ -701,7 +761,7 @@ impl MainView {
             )
         });
         let view = cx.entity().downgrade();
-        Some(crate::popup_menu::render(
+        let menu = crate::popup_menu::render(
             &open.menu,
             &colors,
             Self::menu_area(window),
@@ -710,7 +770,18 @@ impl MainView {
             move |event, window, cx| {
                 let _ = view.update(cx, |this, cx| this.on_menu_event(event, window, cx));
             },
-        ))
+        );
+        Some(match strip {
+            Some(strip) => div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .size_full()
+                .child(menu)
+                .child(strip)
+                .into_any_element(),
+            None => menu,
+        })
     }
 
     fn on_menu_event(&mut self, event: MenuEvent, window: &mut Window, cx: &mut Context<Self>) {

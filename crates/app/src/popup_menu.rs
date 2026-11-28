@@ -32,7 +32,7 @@ const RADIUS: f32 = 8.;
 const SHOW_MS: f32 = 200.;
 const HIDE_MS: f32 = 150.;
 const WIDTH_MIN: f32 = 156.;
-const WIDTH_MAX: f32 = 300.;
+pub const WIDTH_MAX: f32 = 300.;
 // defaultPanelAnimation.
 const START_WIDTH: f32 = 0.5;
 const WIDTH_DURATION: f32 = 0.6;
@@ -325,6 +325,10 @@ pub struct PopupMenu {
     parent: Option<(f32, f32)>,
     /// `setForcedOrigin(TopRight)`: the anchor is the top right corner.
     top_right: bool,
+    /// Room kept above the menu (a reaction strip over it,
+    /// `setAdditionalMenuPadding`) and its width at least (`setForceWidth`).
+    pub reserve_top: f32,
+    pub min_width: f32,
 }
 
 /// Mouse input over a menu.
@@ -407,6 +411,8 @@ impl PopupMenu {
             child: None,
             parent: None,
             top_right: false,
+            reserve_top: 0.,
+            min_width: 0.,
         }
     }
 
@@ -622,8 +628,9 @@ impl PopupMenu {
             rows.push((y, h));
             y += h;
         }
-        let w = width.max(lg(WIDTH_MIN));
+        let w = width.max(lg(WIDTH_MIN)).max(self.min_width);
         let h = y + lg(st.scroll_padding);
+        let reserve = self.reserve_top;
         let (ax, ay) = (f32::from(self.anchor.x), f32::from(self.anchor.y));
         let (left, top) = (f32::from(area.origin.x), f32::from(area.origin.y));
         let (right, bottom) = (
@@ -631,7 +638,7 @@ impl PopupMenu {
             top + f32::from(area.size.height),
         );
         let from_right = self.top_right || ax + w > right;
-        let from_bottom = ay + h > bottom;
+        let from_bottom = ay + reserve + h > bottom;
         // A submenu that does not fit on the right goes left of its parent.
         let flipped = match self.parent {
             Some((parent_x, _)) if from_right => parent_x - w,
@@ -639,7 +646,8 @@ impl PopupMenu {
             _ => ax,
         };
         let x = flipped.clamp(left, (right - w).max(left));
-        let y = if from_bottom { ay - h } else { ay }.clamp(top, (bottom - h).max(top));
+        let y = if from_bottom { ay - h } else { ay + reserve }
+            .clamp(top + reserve, (bottom - h).max(top + reserve));
         Geometry {
             x: x.round(),
             y: y.round(),

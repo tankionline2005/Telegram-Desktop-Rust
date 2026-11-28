@@ -218,4 +218,10 @@
   long press preview (`custom_emoji::focus`) goes first, on all cores. `tdr-lottie`
   keeps numbers in `f32` (as rlottie); check renderer changes against reference frames
   with the ignored test `memory::tests::lottie_reference` (`LOTTIE_REF`, `LOTTIE_MODE`).
+- Reactions: `describe::Reactions` (parsed, `updateMessageReactions` patches the cached
+  message), `tdr_data::reactions` (available/top/send), `Sync::toggle_reaction` (local
+  echo, then `messages.sendReaction`), `bridge::MessageReactions` on `MessageItem`; the UI
+  is `ui/reactions.rs` (pills under the text, the strip over a message's menu). Reaction
+  icons are documents downloaded like custom emoji (`known_docs` in the bridge) and drawn
+  with `custom_emoji::paint_still` (first frame). Demo: Alice and the groups have reactions.
 

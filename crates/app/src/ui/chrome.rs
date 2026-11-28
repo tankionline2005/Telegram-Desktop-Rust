@@ -497,6 +497,18 @@ impl MainView {
         color: Color,
         round: bool,
     ) -> Option<Div> {
+        self.ripple_layer_rgba(id, w, h, c(color), round)
+    }
+
+    /// [`Self::ripple_layer`] in any color.
+    pub(super) fn ripple_layer_rgba(
+        &self,
+        id: &str,
+        w: f32,
+        h: f32,
+        color: gpui::Rgba,
+        round: bool,
+    ) -> Option<Div> {
         let r = self.button_ripples.iter().find(|r| r.id.as_ref() == id)?;
         let shown = ease_out_quint(r.start.elapsed().as_secs_f32() * 1000. / RIPPLE_SHOW);
         let fade = r.released.map_or(1., |t| {
@@ -505,7 +517,7 @@ impl MainView {
         if fade <= 0. {
             return None;
         }
-        let mut color = c(color);
+        let mut color = color;
         color.a *= fade;
         let layer = if round {
             // An icon button's round area: the ripple fills it from the middle.

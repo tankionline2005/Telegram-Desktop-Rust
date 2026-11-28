@@ -15,6 +15,7 @@ pub mod emoji_keywords;
 pub mod emoji_sets;
 pub mod filters;
 pub mod login;
+pub mod reactions;
 
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,7 @@ use tdr_updates::{Action, Engine, Item, Output, State};
 use tracing::{debug, info, warn};
 
 pub use tdr_storage;
+pub use tdr_tl;
 
 /// Formatting of a message being sent, in UTF-16 offsets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1368,6 +1370,152 @@ impl Sync {
     }
 
     /// Sends a text message and records it in the cache.
+    /// `HistoryItem::toggleReaction`: our reaction `key` to a message is chosen
+    /// (in place of ours without Premium, beside them with it, up to three) or
+    /// taken back. The message shows it at once (`reactionsWithLocal`), then
+    /// `messages.sendReaction` sends all ours.
+    pub async fn toggle_reaction(
+        &mut self,
+        peer: PeerKey,
+        msg_id: i32,
+        key: &describe::ReactionKey,
+    ) -> Result<Applied> {
+        let premium = self
+            .store
+            .peer(PeerKey::user(self.self_id))?
+            .map(|p| describe::peer_info(&p).premium)
+            .unwrap_or(false);
+        let Some(row) = self.store.message(peer, msg_id)? else {
+            return Ok(Applied::default());
+        };
+        let Some((layer, bytes)) = &row.raw else {
+            return Ok(Applied::default());
+        };
+        if *layer != tdr_tl::LAYER {
+            return Ok(Applied::default());
+        }
+        let Ok(mut message) = <enums::Message as tdr_tl::Deserializable>::from_bytes(
+            &tdr_tl::Bytes::copy_from_slice(bytes),
+        ) else {
+            return Ok(Applied::default());
+        };
+        let slot = match &mut message {
+            enums::Message::Message(m) => &mut m.reactions,
+            enums::Message::Service(m) => &mut m.reactions,
+            enums::Message::Empty(_) => return Ok(Applied::default()),
+        };
+        let mut r = match slot.take() {
+            Some(enums::MessageReactions::MessageReactions(r)) => *r,
+            None => types::MessageReactions {
+                min: false,
+                can_see_list: false,
+                reactions_as_tags: false,
+                results: Vec::new(),
+                recent_reactions: None,
+                top_reactors: None,
+            },
+        };
+        let tl = key.tl();
+        // Ours, in the order we chose them.
+        let mut chosen: Vec<(i32, enums::Reaction)> = r
+            .results
+            .iter()
+            .filter_map(|c| {
+                let enums::ReactionCount::ReactionCount(c) = c;
+                c.chosen_order.map(|o| (o, c.reaction.clone()))
+            })
+            .collect();
+        chosen.sort_by_key(|(o, _)| *o);
+        let mut chosen: Vec<enums::Reaction> = chosen.into_iter().map(|(_, r)| r).collect();
+        let adding = !chosen.contains(&tl);
+        if adding {
+            let limit = if premium { 3 } else { 1 };
+            chosen.push(tl.clone());
+            while chosen.len() > limit {
+                chosen.remove(0);
+            }
+        } else {
+            chosen.retain(|c| *c != tl);
+        }
+        // The local copy: counts, our order and our recent entry.
+        let me: enums::Peer = types::PeerUser {
+            user_id: self.self_id,
+        }
+        .into();
+        for c in &mut r.results {
+            let enums::ReactionCount::ReactionCount(c) = c;
+            let now_mine = chosen.contains(&c.reaction);
+            if c.chosen_order.is_some() && !now_mine {
+                c.count -= 1;
+                c.chosen_order = None;
+            }
+        }
+        for (order, reaction) in chosen.iter().enumerate() {
+            let order = order as i32 + 1;
+            match r.results.iter_mut().find_map(|c| {
+                let enums::ReactionCount::ReactionCount(c) = c;
+                (c.reaction == *reaction).then_some(c)
+            }) {
+                Some(c) => {
+                    if c.chosen_order.is_none() {
+                        c.count += 1;
+                    }
+                    c.chosen_order = Some(order);
+                }
+                None => r.results.push(
+                    types::ReactionCount {
+                        chosen_order: Some(order),
+                        reaction: reaction.clone(),
+                        count: 1,
+                    }
+                    .into(),
+                ),
+            }
+        }
+        r.results.retain(|c| {
+            let enums::ReactionCount::ReactionCount(c) = c;
+            c.count > 0
+        });
+        if let Some(recent) = &mut r.recent_reactions {
+            recent.retain(|p| {
+                let enums::MessagePeerReaction::MessagePeerReaction(p) = p;
+                !(p.peer_id == me && !chosen.contains(&p.reaction))
+            });
+            if adding {
+                recent.insert(
+                    0,
+                    types::MessagePeerReaction {
+                        big: false,
+                        unread: false,
+                        my: true,
+                        peer_id: me.clone(),
+                        date: row.date,
+                        reaction: tl.clone(),
+                    }
+                    .into(),
+                );
+            }
+        }
+        *slot = (!r.results.is_empty()).then(|| r.into());
+        let mut applied = Applied::default();
+        if let Some(local) = convert::message_row(&message) {
+            self.store.write(|w| w.put_message(&local))?;
+            applied.edited += 1;
+        }
+        let access_hash = self.store.access_hash(peer)?;
+        let Some(input) = convert::input_peer(peer, access_hash) else {
+            return Ok(applied);
+        };
+        let keys: Vec<describe::ReactionKey> = chosen
+            .iter()
+            .filter_map(describe::ReactionKey::of)
+            .collect();
+        let updates = reactions::send(&self.client, input, msg_id, &keys, adding).await?;
+        let mut more = self.feed(updates).await?;
+        more.edited += applied.edited;
+        Ok(more)
+    }
+
     pub async fn send_text(
         &mut self,
         peer: PeerKey,
@@ -1793,6 +1941,34 @@ fn apply_update(
             if let Some(row) = convert::message_row(&x.message) {
                 w.put_message(&row)?;
                 applied.edited += 1;
+            }
+        }
+        // `HistoryItem::updateReactions`: the cached message gets them (a `min`
+        // list keeps which we chose).
+        U::MessageReactions(x) => {
+            let peer = convert::peer_key(&x.peer);
+            if let Some(row) = w.message(peer, x.msg_id)?
+                && let Some((layer, bytes)) = &row.raw
+                && *layer == tdr_tl::LAYER
+                && let Ok(mut message) = <enums::Message as tdr_tl::Deserializable>::from_bytes(
+                    &tdr_tl::Bytes::copy_from_slice(bytes),
+                )
+            {
+                let changed = match &mut message {
+                    enums::Message::Message(m) => {
+                        m.reactions = Some(describe::reactions(&x.reactions, m.reactions.as_ref()));
+                        true
+                    }
+                    enums::Message::Service(m) => {
+                        m.reactions = Some(describe::reactions(&x.reactions, m.reactions.as_ref()));
+                        true
+                    }
+                    enums::Message::Empty(_) => false,
+                };
+                if changed && let Some(row) = convert::message_row(&message) {
+                    w.put_message(&row)?;
+                    applied.edited += 1;
+                }
             }
         }
         U::DeleteMessages(x) => {

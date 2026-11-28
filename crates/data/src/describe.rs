@@ -118,6 +118,124 @@ pub struct MessageInfo {
     pub forward: Option<Forward>,
     /// Formatting and links of the text (`message.entities`).
     pub entities: Vec<Entity>,
+    /// Its reactions (`message.reactions`).
+    pub reactions: Option<Reactions>,
+}
+
+/// A reaction (`Data::ReactionId`): an emoji, a custom emoji or the paid star.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ReactionKey {
+    Emoji(String),
+    Custom(i64),
+    Paid,
+}
+
+impl ReactionKey {
+    pub fn of(reaction: &enums::Reaction) -> Option<ReactionKey> {
+        match reaction {
+            enums::Reaction::Emoji(e) => Some(ReactionKey::Emoji(e.emoticon.clone())),
+            enums::Reaction::CustomEmoji(c) => Some(ReactionKey::Custom(c.document_id)),
+            enums::Reaction::Paid => Some(ReactionKey::Paid),
+            enums::Reaction::Empty => None,
+        }
+    }
+
+    pub fn tl(&self) -> enums::Reaction {
+        match self {
+            ReactionKey::Emoji(e) => tdr_tl::types::ReactionEmoji {
+                emoticon: e.clone(),
+            }
+            .into(),
+            ReactionKey::Custom(id) => {
+                tdr_tl::types::ReactionCustomEmoji { document_id: *id }.into()
+            }
+            ReactionKey::Paid => enums::Reaction::Paid,
+        }
+    }
+}
+
+/// One reaction of a message and how many chose it (`MessageReaction`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactionCount {
+    pub key: ReactionKey,
+    pub count: i32,
+    /// Ours: the order we chose it in (`my`).
+    pub chosen_order: Option<i32>,
+}
+
+/// A message's reactions (`messageReactions`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Reactions {
+    pub list: Vec<ReactionCount>,
+    /// Who reacted lately, with what (`recent_reactions`; `my`: we did).
+    pub recent: Vec<(PeerKey, ReactionKey, bool)>,
+    /// Saved Messages tags (`reactions_as_tags`).
+    pub tags: bool,
+    pub can_see_list: bool,
+}
+
+/// `HistoryItem::updateReactions`: the reactions of `reactions`; a `min` list
+/// (without ours) keeps which ones we chose from `old`.
+pub fn reactions(
+    reactions: &enums::MessageReactions,
+    old: Option<&enums::MessageReactions>,
+) -> enums::MessageReactions {
+    let enums::MessageReactions::MessageReactions(new) = reactions;
+    if !new.min {
+        return reactions.clone();
+    }
+    let Some(enums::MessageReactions::MessageReactions(old)) = old else {
+        return reactions.clone();
+    };
+    let mut merged = (**new).clone();
+    for r in &mut merged.results {
+        let enums::ReactionCount::ReactionCount(r) = r;
+        r.chosen_order = old.results.iter().find_map(|o| {
+            let enums::ReactionCount::ReactionCount(o) = o;
+            (o.reaction == r.reaction)
+                .then_some(o.chosen_order)
+                .flatten()
+        });
+    }
+    merged.into()
+}
+
+fn reactions_of(r: &enums::MessageReactions) -> Option<Reactions> {
+    let enums::MessageReactions::MessageReactions(r) = r;
+    let list: Vec<ReactionCount> = r
+        .results
+        .iter()
+        .filter_map(|c| {
+            let enums::ReactionCount::ReactionCount(c) = c;
+            Some(ReactionCount {
+                key: ReactionKey::of(&c.reaction)?,
+                count: c.count,
+                chosen_order: c.chosen_order,
+            })
+        })
+        .filter(|c| c.count > 0)
+        .collect();
+    if list.is_empty() {
+        return None;
+    }
+    Some(Reactions {
+        list,
+        recent: r
+            .recent_reactions
+            .iter()
+            .flatten()
+            .filter_map(|p| {
+                let enums::MessagePeerReaction::MessagePeerReaction(p) = p;
+                Some((
+                    crate::convert::peer_key(&p.peer_id),
+                    ReactionKey::of(&p.reaction)?,
+                    p.my,
+                ))
+            })
+            .collect(),
+        tags: r.reactions_as_tags,
+        can_see_list: r.can_see_list,
+    })
 }
 
 /// A formatting or link entity of a message text (`MessageEntity`). Offsets are in
@@ -367,6 +485,7 @@ pub fn message_info(row: &MessageRow) -> MessageInfo {
                 }
             }),
             entities: m.entities.as_deref().map(entities).unwrap_or_default(),
+            reactions: m.reactions.as_ref().and_then(reactions_of),
         },
         Some(enums::Message::Service(m)) => MessageInfo {
             service: Some(service(&m.action)),

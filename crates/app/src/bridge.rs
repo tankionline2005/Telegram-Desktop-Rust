@@ -78,6 +78,15 @@ pub enum Command {
     LoadEmojiSets,
     /// The emoji search's groups (`messages.getEmojiGroups`).
     LoadEmojiGroups,
+    /// The server's reactions (`messages.getAvailableReactions`), once.
+    LoadReactions,
+    /// Our reaction to a message is chosen or taken back
+    /// (`HistoryItem::toggleReaction`).
+    ToggleReaction {
+        peer: PeerKey,
+        msg_id: i32,
+        key: describe::ReactionKey,
+    },
     /// Emoji keywords: which of `languages` the server has, then each one's
     /// keywords since the version kept (`versions`).
     RefreshEmojiKeywords {
@@ -177,6 +186,11 @@ pub enum Update {
     },
     /// The emoji search's groups.
     EmojiGroups(Vec<tdr_data::emoji_sets::EmojiGroup>),
+    /// The server's reactions with their animations' documents.
+    AvailableReactions {
+        list: Vec<tdr_data::reactions::Available>,
+        top: Vec<describe::ReactionKey>,
+    },
     /// The installed emoji sets (the user's order) and the featured ones.
     EmojiSets {
         installed: Vec<EmojiSet>,
@@ -684,6 +698,104 @@ pub struct MessageItem {
     /// The thread it belongs to (`reply_to_top_id`, or the replied message when
     /// that is the root): its reply to the root is not shown inside the thread.
     pub thread_root: Option<i32>,
+    /// Its reactions under the text (`Reactions::InlineList`).
+    pub reactions: Option<MessageReactions>,
+}
+
+/// A message's reactions as drawn (`InlineListData`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MessageReactions {
+    pub buttons: Vec<ReactionButton>,
+    /// Saved Messages tags (`reactions_as_tags`): drawn as tags.
+    pub tags: bool,
+}
+
+/// One reaction under a message: its count or who chose it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReactionButton {
+    pub key: describe::ReactionKey,
+    pub count: i32,
+    /// Ours (`MessageReaction::my`).
+    pub chosen: bool,
+    /// Their userpics instead of the count (`InlineListData::recent`).
+    pub userpics: Option<Vec<Author>>,
+}
+
+/// The order of the server's emoji reactions (`Reactions::list(Type::All)`),
+/// for sorting reactions of equal count.
+static REACTION_ORDER: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// `InlineListDataFromMessage` and `InlineList::layoutButtons`: the buttons in
+/// tdesktop's order, with userpics where all who reacted are known (always in
+/// private chats, else at most three).
+fn reaction_buttons(
+    reactions: Option<&describe::Reactions>,
+    private: Option<PeerKey>,
+    me: PeerKey,
+    author: &mut dyn FnMut(PeerKey) -> Author,
+) -> Option<MessageReactions> {
+    use describe::ReactionKey;
+    let r = reactions?;
+    let mut list: Vec<&describe::ReactionCount> = r.list.iter().collect();
+    if !r.tags {
+        let order = REACTION_ORDER.lock().unwrap();
+        let rank = |k: &ReactionKey| match k {
+            ReactionKey::Emoji(e) => order.iter().position(|o| o == e).unwrap_or(order.len()),
+            _ => order.len() + 1,
+        };
+        list.sort_by(|a, b| {
+            let without_mine =
+                |c: &describe::ReactionCount| c.count - i32::from(c.chosen_order.is_some());
+            (b.key == ReactionKey::Paid)
+                .cmp(&(a.key == ReactionKey::Paid))
+                .then(without_mine(b).cmp(&without_mine(a)))
+                .then(rank(&a.key).cmp(&rank(&b.key)))
+        });
+    }
+    let show_userpics = private.is_some() || {
+        let mut sum = 0;
+        list.iter().all(|c| {
+            sum += c.count;
+            let known = r.recent.iter().filter(|(_, k, _)| *k == c.key).count();
+            sum <= 3 && known as i32 == c.count
+        }) && list
+            .iter()
+            .all(|c| r.recent.iter().any(|(_, k, _)| *k == c.key))
+    };
+    let buttons = list
+        .into_iter()
+        .map(|c| {
+            let mine = c.chosen_order.is_some();
+            let userpics = (show_userpics && !r.tags).then(|| match private {
+                Some(user) => {
+                    let mut pics = Vec::new();
+                    if !mine || c.count > 1 {
+                        pics.push(author(user));
+                    }
+                    if mine {
+                        pics.push(author(me));
+                    }
+                    pics
+                }
+                None => r
+                    .recent
+                    .iter()
+                    .filter(|(_, k, _)| *k == c.key)
+                    .map(|(p, _, _)| author(*p))
+                    .collect(),
+            });
+            ReactionButton {
+                key: c.key.clone(),
+                count: c.count,
+                chosen: mine,
+                userpics,
+            }
+        })
+        .collect();
+    Some(MessageReactions {
+        buttons,
+        tags: r.tags,
+    })
 }
 
 /// What a channel post shows besides its text (`Message` with `isPost`).
@@ -1311,6 +1423,17 @@ fn message_items(store: &Storage, peer: PeerKey, messages: &[MessageRow]) -> Vec
                     .as_ref()
                     .and_then(|r| reply_line(store, peer, r, &ctx)),
                 thread_root: info.reply.as_ref().and_then(|r| r.top_id.or(r.msg_id)),
+                reactions: reaction_buttons(
+                    info.reactions.as_ref(),
+                    (peer.kind == PeerKind::User && !is_saved).then_some(peer),
+                    PeerKey::user(ctx.self_id),
+                    &mut |k| {
+                        authors
+                            .entry(k)
+                            .or_insert_with(|| author_of(store, k))
+                            .clone()
+                    },
+                ),
                 media,
                 service: service.filter(|_| !call),
                 edited: info.edited,
@@ -2297,6 +2420,7 @@ fn send_history(
                         post: None,
                         reply: None,
                         thread_root: None,
+                        reactions: None,
                     });
                 }
             }
@@ -2460,6 +2584,10 @@ async fn run(
     // Custom emoji files are small and many on screen at once: their own, wider
     // limit, so they never wait behind userpics (8 at a time measured best).
     let emoji_downloads = Arc::new(tokio::sync::Semaphore::new(8));
+    // Documents known without `getCustomEmojiDocuments` (the reactions'
+    // animations): downloaded like custom emoji when one is painted.
+    let known_docs: Arc<std::sync::Mutex<HashMap<i64, tdr_data::tdr_tl::enums::Document>>> =
+        Default::default();
     let mut loading: HashSet<i64> = HashSet::new();
 
     // 3. Commands and live updates.
@@ -2707,6 +2835,33 @@ async fn run(
                         Err(e) => error!("read: {e}"),
                     },
                     Command::LoadCustomEmoji(_) => {}
+                    Command::LoadReactions => {
+                        let client = client.clone();
+                        let tx = tx.clone();
+                        let known = known_docs.clone();
+                        tokio::spawn(async move {
+                            match tdr_data::reactions::available(&client).await {
+                                Ok((list, raw)) => {
+                                    *REACTION_ORDER.lock().unwrap() =
+                                        list.iter().map(|r| r.emoticon.clone()).collect();
+                                    {
+                                        let mut known = known.lock().unwrap();
+                                        for doc in raw {
+                                            if let tdr_data::tdr_tl::enums::Document::Document(d) = &doc {
+                                                known.insert(d.id, doc);
+                                            }
+                                        }
+                                    }
+                                    let top = tdr_data::reactions::top(&client)
+                                        .await
+                                        .map_err(|e| tracing::debug!("top reactions: {e}"))
+                                        .unwrap_or_default();
+                                    let _ = tx.send(Update::AvailableReactions { list, top });
+                                }
+                                Err(e) => tracing::debug!("available reactions: {e}"),
+                            }
+                        });
+                    }
                     Command::LoadEmojiGroups => {
                         let client = client.clone();
                         let tx = tx.clone();
@@ -2795,22 +2950,32 @@ async fn run(
                     // documents (`getCustomEmojiDocuments`) and download the files.
                     Command::FetchCustomEmoji(ids) => {
                         let ids: Vec<i64> = ids.into_iter().filter(|id| loading.insert(*id)).collect();
-                        if !ids.is_empty() {
+                        let (known, ids) = {
+                            let map = known_docs.lock().unwrap();
+                            let known: Vec<tdr_data::tdr_tl::enums::Document> =
+                                ids.iter().filter_map(|id| map.get(id).cloned()).collect();
+                            let rest: Vec<i64> =
+                                ids.into_iter().filter(|id| !map.contains_key(id)).collect();
+                            (known, rest)
+                        };
+                        if !ids.is_empty() || !known.is_empty() {
                             let client = client.clone();
                             let done = pics.clone();
                             let downloads = emoji_downloads.clone();
                             let tx = tx.clone();
                             tokio::spawn(async move {
-                                let docs = match tdr_data::emoji_sets::custom_emoji_documents(&client, &ids).await {
-                                    Ok(docs) => docs,
-                                    Err(e) => {
-                                        tracing::debug!("custom emoji documents: {e}");
-                                        for id in ids {
-                                            let _ = tx.send(Update::CustomEmojiFailed(id));
+                                let mut docs = known;
+                                if !ids.is_empty() {
+                                    match tdr_data::emoji_sets::custom_emoji_documents(&client, &ids).await {
+                                        Ok(more) => docs.extend(more),
+                                        Err(e) => {
+                                            tracing::debug!("custom emoji documents: {e}");
+                                            for id in ids {
+                                                let _ = tx.send(Update::CustomEmojiFailed(id));
+                                            }
                                         }
-                                        return;
                                     }
-                                };
+                                }
                                 let mut tasks = Vec::new();
                                 for raw in docs {
                                     let Some(doc) = tdr_data::emoji_sets::emoji_document(&raw) else {
@@ -3074,6 +3239,21 @@ async fn run(
                             }
                         };
                         let _ = tx.send(Update::BankCard { number, data });
+                    }
+                    Command::ToggleReaction { peer, msg_id, key } => {
+                        match sync.toggle_reaction(peer, msg_id, &key).await {
+                            Ok(_) => {
+                                if open == Some(peer) {
+                                    send_history(sync.store(), peer, &shown, None, &tx)?;
+                                }
+                            }
+                            Err(e) => {
+                                error!("reaction: {e}");
+                                if open == Some(peer) {
+                                    send_history(sync.store(), peer, &shown, None, &tx)?;
+                                }
+                            }
+                        }
                     }
                     Command::Send {
                         peer,
@@ -3401,6 +3581,79 @@ fn demo_formatted(date: i32) -> Vec<(bool, String, Vec<TextEntity>)> {
     vec![(false, a, ae), (true, b, be), (false, c, ce)]
 }
 
+/// The demo's reactions: some messages of Alice's chat (userpics), the groups
+/// (counts, a custom emoji) and the channel.
+fn demo_reactions(chat: i64, m: &MessageItem) -> Option<MessageReactions> {
+    use describe::ReactionKey as K;
+    if m.service.is_some() || chat == 3 {
+        return None;
+    }
+    let private = chat == 1;
+    let button = |key: K, count: i32, chosen: bool, pics: &[bool]| ReactionButton {
+        key,
+        count,
+        chosen,
+        userpics: private.then(|| pics.iter().map(|out| demo_author(*out)).collect()),
+    };
+    match m.id % 4 {
+        1 => Some(MessageReactions {
+            buttons: vec![
+                button(K::Emoji("❤".into()), 2, true, &[false, true]),
+                button(K::Emoji("👍".into()), 1, false, &[false]),
+            ],
+            tags: false,
+        }),
+        3 if !private => Some(MessageReactions {
+            buttons: vec![
+                button(K::Emoji("🔥".into()), 12, false, &[]),
+                button(K::Custom(DEMO_CUSTOM_EMOJI[1].0), 5, true, &[]),
+                button(K::Emoji("😂".into()), 3, false, &[]),
+                button(K::Emoji("🎉".into()), 1_234, false, &[]),
+            ],
+            tags: false,
+        }),
+        _ => None,
+    }
+}
+
+/// `toggleReaction` on the demo's list (no Premium: one of ours).
+fn demo_toggle(
+    reactions: Option<MessageReactions>,
+    key: &describe::ReactionKey,
+    private: bool,
+) -> Option<MessageReactions> {
+    let mut r = reactions.unwrap_or_default();
+    let was = r.buttons.iter().any(|b| b.chosen && b.key == *key);
+    for b in &mut r.buttons {
+        if b.chosen {
+            b.chosen = false;
+            b.count -= 1;
+            if let Some(pics) = &mut b.userpics {
+                pics.retain(|a| a.key != demo_author(true).key);
+            }
+        }
+    }
+    if !was {
+        match r.buttons.iter_mut().find(|b| b.key == *key) {
+            Some(b) => {
+                b.chosen = true;
+                b.count += 1;
+                if let Some(pics) = &mut b.userpics {
+                    pics.push(demo_author(true));
+                }
+            }
+            None => r.buttons.push(ReactionButton {
+                key: key.clone(),
+                count: 1,
+                chosen: true,
+                userpics: private.then(|| vec![demo_author(true)]),
+            }),
+        }
+    }
+    r.buttons.retain(|b| b.count > 0);
+    (!r.buttons.is_empty()).then_some(r)
+}
+
 fn demo_author(out: bool) -> Author {
     if out {
         Author {
@@ -3430,6 +3683,8 @@ pub fn start_demo(
 ) {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Command>();
     let (up_tx, up_rx) = mpsc::unbounded_channel();
+    // Reactions changed by clicks: (chat, message) to what it shows now.
+    let mut demo_reacted: HashMap<(i64, i32), Option<MessageReactions>> = HashMap::new();
     let now = Local::now();
     let today = move |h: u32, m: u32| {
         now.date_naive()
@@ -3826,6 +4081,7 @@ pub fn start_demo(
                     post: None,
                     reply: None,
                     thread_root: None,
+                    reactions: None,
                 }
             })
             .collect();
@@ -3852,6 +4108,7 @@ pub fn start_demo(
                 post: None,
                 reply: None,
                 thread_root: None,
+                reactions: None,
             });
         }
         // Older demo messages appear 20 at a time when the user scrolls up.
@@ -4047,6 +4304,7 @@ pub fn start_demo(
                                 quote: false,
                             }),
                             thread_root: Some(root),
+                            reactions: None,
                         });
                     }
                     let _ = channel;
@@ -4130,6 +4388,122 @@ pub fn start_demo(
                 Command::LoadEmojiSets => {
                     let _ = up_tx.send(demo_emoji_sets());
                 }
+                Command::LoadReactions => {
+                    let list: Vec<tdr_data::reactions::Available> = [
+                        "👍",
+                        "👎",
+                        "❤",
+                        "🔥",
+                        "🥰",
+                        "👏",
+                        "😁",
+                        "🤔",
+                        "🤯",
+                        "😱",
+                        "🤬",
+                        "😢",
+                        "🎉",
+                        "🤩",
+                        "🤮",
+                        "💩",
+                        "🙏",
+                        "👌",
+                        "🕊",
+                        "🤡",
+                        "🥱",
+                        "🥴",
+                        "😍",
+                        "🐳",
+                        "❤\u{200d}🔥",
+                        "🌚",
+                        "🌭",
+                        "💯",
+                        "🤣",
+                        "⚡",
+                        "🍌",
+                        "🏆",
+                        "💔",
+                        "🤨",
+                        "😐",
+                        "🍓",
+                        "🍾",
+                        "💋",
+                        "🖕",
+                        "😈",
+                        "😴",
+                        "😭",
+                        "🤓",
+                        "👻",
+                        "👨\u{200d}💻",
+                        "👀",
+                        "🎃",
+                        "🙈",
+                        "😇",
+                        "😨",
+                        "🤝",
+                        "✍",
+                        "🤗",
+                        "🫡",
+                        "🎅",
+                        "🎄",
+                        "☃",
+                        "💅",
+                        "🤪",
+                        "🗿",
+                        "🆒",
+                        "💘",
+                        "🙉",
+                        "🦄",
+                        "😘",
+                        "💊",
+                        "🙊",
+                        "😎",
+                        "👾",
+                        "🤷\u{200d}♂",
+                        "🤷",
+                        "🤷\u{200d}♀",
+                        "😡",
+                        "😂",
+                        "😮",
+                    ]
+                    .iter()
+                    .map(|e| tdr_data::reactions::Available {
+                        emoticon: (*e).to_string(),
+                        title: String::new(),
+                        premium: false,
+                        inactive: false,
+                        center: None,
+                        select: None,
+                        appear: None,
+                        activate: None,
+                        effect: None,
+                        around: None,
+                    })
+                    .collect();
+                    *REACTION_ORDER.lock().unwrap() =
+                        list.iter().map(|r| r.emoticon.clone()).collect();
+                    let top = [
+                        "👍", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🎉", "🤩",
+                    ]
+                    .iter()
+                    .map(|e| describe::ReactionKey::Emoji((*e).to_string()))
+                    .collect();
+                    let _ = up_tx.send(Update::AvailableReactions { list, top });
+                    continue;
+                }
+                Command::ToggleReaction { peer, msg_id, key } => {
+                    let current = demo_reacted
+                        .get(&(peer.id, msg_id))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            history
+                                .iter()
+                                .find(|m| m.id == msg_id)
+                                .and_then(|m| demo_reactions(peer.id, m))
+                        });
+                    demo_reacted
+                        .insert((peer.id, msg_id), demo_toggle(current, &key, peer.id == 1));
+                }
                 Command::LoadEmojiGroups => {
                     let group = |title: &str, icon: usize, emoticons: &[&str]| {
                         tdr_data::emoji_sets::EmojiGroup {
@@ -4186,6 +4560,7 @@ pub fn start_demo(
                                 post: None,
                                 reply: None,
                                 thread_root: None,
+                                reactions: None,
                             }
                         })
                         .collect();
@@ -4242,6 +4617,7 @@ pub fn start_demo(
                         post: None,
                         reply: None,
                         thread_root: None,
+                        reactions: None,
                     });
                 }
             }
@@ -4341,6 +4717,12 @@ pub fn start_demo(
                             discussion: Some(PeerKey::user(2)),
                         });
                     }
+                }
+                for m in &mut messages {
+                    m.reactions = match demo_reacted.get(&(i + 1, m.id)) {
+                        Some(r) => r.clone(),
+                        None => demo_reactions(i + 1, m),
+                    };
                 }
                 let _ = up_tx.send(Update::History {
                     peer: PeerKey::user(i + 1),
