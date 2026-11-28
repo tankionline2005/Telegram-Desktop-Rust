@@ -3,15 +3,15 @@
 
 repo = "telegramdesktop/tdesktop"
 channel = "stable"
-tag = "v7.4.1"
-commit = "157f5cfc85e2dd1fa67f129a5e31a81db5ddeb19"
-published_at = "2026-11-06T19:19:58Z"
-layer = 233
+tag = "v7.4.7"
+commit = "85d55638476185e9af32aac888371ef9da06cfb9"
+published_at = "2026-11-26T21:51:27Z"
+layer = 234
 
 [[vendored]]
 path = "schema/api.tl"
 upstream = "Telegram/SourceFiles/mtproto/scheme/api.tl"
-sha256 = "c2bbefcaec3285ba46c8af8f429c7012fe5aea253fd16d4be089f91c7c3fa71e"
+sha256 = "4f9282f98a5c4044abcbec290143e62ba744a0dcb48b2f5d2f37f7af15b7d454"
 
 [[vendored]]
 path = "schema/mtproto.tl"
@@ -33,13 +33,13 @@ sha256 = "364fcd7288453377e16db9c733fd98699b161248bc62cc62f78d58d909951d3a"
 path = "assets/fonts/OpenSans-Regular.ttf"
 upstream = "fonts/OpenSans-Regular.ttf"
 submodule = "Telegram/lib_ui"
-sha256 = "937353fd9cadf5b72ffde38b4a45907c9649a30528ac15af51684a725dd681b4"
+sha256 = "5ec42afe823c0b4c3872c8f6f675928582d2ad3ca5ee9c6c3f80f3a7b1102a4a"
 
 [[vendored]]
 path = "assets/fonts/OpenSans-SemiBold.ttf"
 upstream = "fonts/OpenSans-SemiBold.ttf"
 submodule = "Telegram/lib_ui"
-sha256 = "974e2260bc5709e097bcf1b058771ca8884b9809b369264f476e08a8da037d25"
+sha256 = "4483efa5503ad0edc81eab9e9f7550f057c03bcccf54c155a98641f14016df9e"
 
 [[vendored]]
 path = "assets/tdesktop-icons/dialogs__dialogs_menu.png"
@@ -363,13 +363,13 @@ sha256 = "84079616525580051388a68d5c06e3efb50829fb2ed5effdbccc8b9d94a0deef"
 path = "assets/fonts/OpenSans-Italic.ttf"
 upstream = "fonts/OpenSans-Italic.ttf"
 submodule = "Telegram/lib_ui"
-sha256 = "1207b0474e4a02f8c0e394c0a46bc6000b85467ea086999cdc1cd69e6c3df1e1"
+sha256 = "e64b5b33a6f78660e5b34018ecb46eca1c795263051c3c464c6285de7322a244"
 
 [[vendored]]
 path = "assets/fonts/OpenSans-SemiBoldItalic.ttf"
 upstream = "fonts/OpenSans-SemiBoldItalic.ttf"
 submodule = "Telegram/lib_ui"
-sha256 = "7b1f2bba5b751f412118a5baeeadaddd334d2af59d62b1da2542e3c314b4d24b"
+sha256 = "01a9f2411054390e0073de45e6ce1efd281b750d4b79efedbb626813bd6fca33"
 
 [[vendored]]
 path = "assets/tdesktop-icons/menu__calendar.png"
@@ -491,9 +491,6 @@ path = "assets/tdesktop-icons/menu__invite@3x.png"
 upstream = "Telegram/Resources/icons/menu/invite@3x.png"
 sha256 = "40fd0c3d214050a11838b70f20c1156115ecd5c7a9ef30264c51e593eb6a8a48"
 
-
-
-
 [[vendored]]
 path = "assets/tdesktop-icons/menu__pin.png"
 upstream = "Telegram/Resources/icons/menu/pin.png"
@@ -538,9 +535,6 @@ sha256 = "b657187aed5416e6973775066258092e068a8db53a31403471ed387c39fa8b87"
 path = "assets/tdesktop-icons/menu__select@3x.png"
 upstream = "Telegram/Resources/icons/menu/select@3x.png"
 sha256 = "a394b83b8de203f9ae7e6a4fed5c4fb4ab2c30c6d94d1010ae461a781813a045"
-
-
-
 
 [[vendored]]
 path = "assets/tdesktop-icons/payments__payment_card.png"
@@ -2773,6 +2767,3 @@ sha256 = "19fd5ef3e48cca8e30c39913ed6138157bd9aa2552724923eda49eb3f623f498"
 path = "assets/tdesktop-icons/chat__reactions_expand_panel@3x.png"
 upstream = "Telegram/Resources/icons/chat/reactions_expand_panel@3x.png"
 sha256 = "2e7787ad618f4bb17a2f97bdf125611e171a5793bcc5596bc29e5cad7f7d44ef"
-
-
-
