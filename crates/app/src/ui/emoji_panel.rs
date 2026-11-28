@@ -149,6 +149,12 @@ pub(super) struct SetSection {
     premium: bool,
 }
 
+impl SetSection {
+    pub(super) fn title(&self) -> &str {
+        &self.info.title
+    }
+}
+
 /// The button at the right of a set's title.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SetButton {

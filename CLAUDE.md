@@ -224,4 +224,13 @@
   is `ui/reactions.rs` (pills under the text, the strip over a message's menu). Reaction
   icons are documents downloaded like custom emoji (`known_docs` in the bridge) and drawn
   with `custom_emoji::paint_still` (first frame). Demo: Alice and the groups have reactions.
+- Reaction animations: `ReactionFx` in `ui/reactions.rs` (`diff_reactions` from
+  `update_list`: pills grow, go away keeping their place until gone, counts slide; `Fly`
+  is `ReactionFlyAnimation`, painted by a `deferred` canvas). One-shot document
+  animations are `Clip` (`custom_emoji::paint_frame`/`timeline` at a fixed side, drawn
+  scaled: never re-render per hover size). The strip grows with the menu
+  (`PopupMenu::appear_state`) and unrolls into the full panel (`expand_strip`,
+  `render_strip_panel`); the corner button is `ui/corner_reaction.rs` (`Manager`/`Button`
+  states, shown 300 ms after the mouse rests on a bubble). `TDR_DEMO_REACTIONS=anim`
+  gives the demo's first reactions the demo animations (strip/fly checks).
 

@@ -22,5 +22,8 @@ a `tdr patch` comment.
 3. `src/taffy.rs`: `0.0_f32` / `1.0_f32` literals (a future-incompatibility
    warning of newer compilers).
 
+4. `src/window.rs`: `Window::with_element_opacity` is public (a canvas paints
+   fading parts, as reactions flying to their place).
+
 To update GPUI: copy the new release here, drop its examples the same way and
 apply the patches again.

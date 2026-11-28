@@ -427,6 +427,24 @@ impl PopupMenu {
         if self.icons { &WITH_ICONS } else { &PLAIN }
     }
 
+    /// How far it has unrolled (`PanelAnimation`'s width times height progress)
+    /// and its opacity (fading out when hiding): a reaction strip over it
+    /// appears with it (`Selector::updateShowState`).
+    pub fn appear_state(&self) -> (f32, f32) {
+        let dt = (self.shown.elapsed().as_secs_f32() * 1000. / SHOW_MS).min(1.);
+        let mut opacity = if dt < OPACITY_DURATION {
+            ease_out_circ(dt / OPACITY_DURATION)
+        } else {
+            1.
+        };
+        if let Some(h) = self.hiding {
+            opacity *= 1. - (h.elapsed().as_secs_f32() * 1000. / HIDE_MS).min(1.);
+        }
+        let w = START_WIDTH + (1. - START_WIDTH) * ease_out_circ(dt / WIDTH_DURATION);
+        let h = START_HEIGHT + (1. - START_HEIGHT) * ease_out_circ(dt / HEIGHT_DURATION);
+        (w * h, opacity)
+    }
+
     pub fn hide(&mut self) {
         if self.hiding.is_none() {
             self.hiding = Some(Instant::now());

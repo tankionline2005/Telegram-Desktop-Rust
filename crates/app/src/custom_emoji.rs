@@ -957,9 +957,57 @@ pub fn paint_still(id: i64, origin: Point<Pixels>, side: u32, window: &mut Windo
         side,
         gpui::Hsla::default(),
         Loading::Silhouette,
-        true,
+        Some(0),
+        None,
         window,
     )
+}
+
+/// Frame `frame` of `id` rendered at `side` device pixels, drawn into `bounds`
+/// (any size: one-shot animations that grow and shrink keep their frames;
+/// `AnimatedIcon::frame` drawn scaled). False while it is not ready.
+pub fn paint_frame(
+    id: i64,
+    side: u32,
+    frame: usize,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+) -> bool {
+    paint_inner(
+        id,
+        bounds.origin,
+        side,
+        gpui::Hsla::default(),
+        Loading::Silhouette,
+        Some(frame),
+        Some(bounds),
+        window,
+    )
+}
+
+/// The durations of `id`'s frames at `side` once all are rendered (asked for
+/// otherwise): one-shot animations play them on their own clock.
+pub fn timeline(id: i64, side: u32) -> Option<Vec<u16>> {
+    with(|s| {
+        want_in(s, id);
+        let has_file = matches!(s.docs.get(&id), Some(Doc::File { .. }));
+        let key = (id, side);
+        let i = s
+            .instances
+            .entry(key)
+            .or_insert_with(|| from_disk(key).unwrap_or_else(|| Instance::new(side)));
+        i.painted = Instant::now();
+        if i.finished {
+            return Some(i.durations.clone());
+        }
+        if has_file && i.job == Job::Idle {
+            queue(s, key);
+        } else if matches!(s.docs.get(&id), Some(Doc::Dropped)) {
+            s.docs.insert(id, Doc::Requested);
+            s.wanted.push(id);
+        }
+        None
+    })
 }
 
 /// `paint` with what to draw while it loads.
@@ -971,18 +1019,23 @@ pub fn paint_ex(
     loading: Loading,
     window: &mut Window,
 ) -> bool {
-    paint_inner(id, origin, side, color, loading, false, window)
+    paint_inner(id, origin, side, color, loading, None, None, window)
 }
 
+/// `frame`: a fixed frame (else the shared playback); `draw`: where to draw it
+/// (else `side` device pixels at `origin`).
+#[allow(clippy::too_many_arguments)]
 fn paint_inner(
     id: i64,
     origin: Point<Pixels>,
     side: u32,
     color: gpui::Hsla,
     loading: Loading,
-    still: bool,
+    fixed: Option<usize>,
+    draw: Option<Bounds<Pixels>>,
     window: &mut Window,
 ) -> bool {
+    let still = fixed.is_some();
     let _timer = crate::profile::Timer::new("custom_emoji::paint");
     let paused = crate::repaint::paused();
     let image = with(|s| {
@@ -1018,7 +1071,10 @@ fn paint_inner(
         if !still && let Some(due) = i.next_due() {
             crate::repaint::at(due.max(now + Duration::from_millis(8)));
         }
-        let frame = if still { 0 } else { i.frame };
+        let frame = match fixed {
+            Some(k) => k.min(i.frames().saturating_sub(1)),
+            None => i.frame,
+        };
         let color_key = if text_color && i.alpha_only {
             let c = gpui::Rgba::from(color);
             let to = |v: f32| (v.clamp(0., 1.) * 255.).round() as u32;
@@ -1026,7 +1082,8 @@ fn paint_inner(
         } else {
             0
         };
-        let shown_key = (id, side, color_key);
+        // Fixed frames keep their own image (the shared playback goes on).
+        let shown_key = (id, side, color_key | u32::from(still));
         let image = match s.shown.get_mut(&shown_key) {
             Some(v) if v.frame == frame => {
                 v.painted = now;
@@ -1074,7 +1131,8 @@ fn paint_inner(
     let x = (f32::from(origin.x) * scale).round() / scale;
     let y = (f32::from(origin.y) * scale).round() / scale;
     let side_l = side as f32 / scale;
-    let bounds = Bounds::new(point(px(x), px(y)), size(px(side_l), px(side_l)));
+    let bounds =
+        draw.unwrap_or_else(|| Bounds::new(point(px(x), px(y)), size(px(side_l), px(side_l))));
     match image {
         Ok(image) => {
             let _ = window.paint_image(bounds, Corners::default(), image, 0, false);

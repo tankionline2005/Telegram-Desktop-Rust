@@ -33,6 +33,7 @@ pub(crate) use chrome::paint_radial;
 
 mod archive;
 mod chrome;
+mod corner_reaction;
 mod country_box;
 mod emoji_panel;
 mod emoji_preview;
@@ -749,6 +750,8 @@ pub struct MainView {
     /// The held custom emoji's large preview.
     emoji_preview: emoji_preview::EmojiPreview,
     reactions_ui: reactions::ReactionsUi,
+    reaction_fx: reactions::ReactionFx,
+    corner_ui: corner_reaction::CornerUi,
     /// Emoji suggestions over the message field (shared with it).
     emoji_suggest: std::rc::Rc<std::cell::RefCell<crate::emoji_suggest::Suggest>>,
     /// Custom emoji need Premium in the open chat (the field's paste reads it).
@@ -1045,6 +1048,8 @@ impl MainView {
             custom_locked,
             emoji_preview: Default::default(),
             reactions_ui: Default::default(),
+            reaction_fx: Default::default(),
+            corner_ui: Default::default(),
             emoji_set_removing: None,
             columns: Columns::default(),
             columns_path: None,
@@ -2228,6 +2233,9 @@ impl MainView {
     /// messages are re-measured too: grouping and date dividers depend on them.
     fn update_list(&mut self, new: Vec<MessageItem>) {
         let old = std::mem::take(&mut self.messages);
+        if let Some(peer) = self.selected {
+            self.diff_reactions(peer, &old, &new);
+        }
         let same_block = old.first().and_then(|first| {
             let k = new.iter().position(|m| m.id == first.id)?;
             let matches = new.len() >= k + old.len()
@@ -3565,7 +3573,16 @@ impl MainView {
         let measured = self.rich_measured(text_key, &text, entities, window);
         // `refreshInfoSkipBlock`: with reactions the text has no skip block,
         // the reactions take it.
-        let reactions = item.reactions.as_ref().filter(|r| !r.buttons.is_empty());
+        // Pills going away stay until they are gone.
+        let shown_reactions = self.shown_reactions(
+            pane.peer,
+            item.id,
+            item.reactions.as_ref().filter(|r| !r.buttons.is_empty()),
+        );
+        let reactions = shown_reactions.as_ref().map(|(r, _)| r);
+        let reactions_fx: &[reactions::PillFx] = shown_reactions
+            .as_ref()
+            .map_or(&[], |(_, fx)| fx.as_slice());
         let text_skip = if reactions.is_some() {
             (0., 0.)
         } else {
@@ -3814,11 +3831,16 @@ impl MainView {
                 div()
                     .w(gpui::px(inner))
                     .pt(gpui::px(lg(reactions::MEDIA_IN_BUBBLE_SKIP)))
-                    .child(
-                        self.render_reactions(
-                            pane.peer, item.id, r, layout, item.out, pane.live, view,
-                        ),
-                    )
+                    .child(self.render_reactions(
+                        pane.peer,
+                        item.id,
+                        r,
+                        reactions_fx,
+                        layout,
+                        item.out,
+                        pane.live,
+                        view,
+                    ))
             }))
             .child(info)
             .when(comments_h > 0., |d| d.pb(gpui::px(pad_y + comments_h)))
@@ -3958,7 +3980,23 @@ impl MainView {
             .flatten();
         let menu_view = view.clone();
         let live = pane.live;
+        // The reaction button at the bubble's corner (`reactionButtonParameters`).
+        let corner = self.render_corner(
+            pane.peer.filter(|_| live),
+            item.id,
+            (inner + 2. * pad_x, bubble_h),
+            right_side,
+            original.is_some() || post.is_some(),
+            view,
+        );
+        let (move_view, leave_view) = (view.clone(), view.clone());
+        let corner_peer = pane.peer;
+        let msg_id = item.id;
         let bubble = div()
+            .id(SharedString::from(format!(
+                "bubble-{}-{}-{}",
+                text_key.0.id, item.id, live as u8
+            )))
             .relative()
             .flex_none()
             .child(bubble)
@@ -3966,6 +4004,22 @@ impl MainView {
             .children(go_to)
             .children(share)
             .children(code_pill)
+            .children(corner)
+            .when(live, |d| {
+                d.on_mouse_move(move |_, _, cx| {
+                    if let Some(peer) = corner_peer {
+                        let _ = move_view.update(cx, |this, _| this.corner_moved(peer, msg_id));
+                    }
+                })
+                .on_hover(move |over, _, cx| {
+                    if !*over && let Some(peer) = corner_peer {
+                        let _ = leave_view.update(cx, |this, cx| {
+                            this.corner_left(peer, msg_id);
+                            cx.notify();
+                        });
+                    }
+                })
+            })
             // The message's menu (over the text the text answers it, with links).
             .on_mouse_down(MouseButton::Right, move |e, _, cx| {
                 if live {
@@ -4846,7 +4900,8 @@ impl MainView {
         self.hide_spoilers_on_chat_change();
         #[cfg(windows)]
         crate::tray_menu::DARK.store(self.dark, std::sync::atomic::Ordering::Relaxed);
-        if self.tick_code_hint() | self.tick_ripple() {
+        if self.tick_code_hint() | self.tick_ripple() | self.tick_reaction_fx() | self.tick_corner()
+        {
             window.request_animation_frame();
         }
         self.tick_chrome(window);

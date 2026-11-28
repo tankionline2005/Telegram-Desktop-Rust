@@ -701,19 +701,29 @@ impl MainView {
 
     /// A reaction of the strip was chosen (`Selector::chosen`): the menu goes and
     /// the reaction is toggled; the expand button waits for the full panel.
-    pub(super) fn strip_chosen(&mut self, key: Option<tdr_data::describe::ReactionKey>) {
+    pub(super) fn strip_chosen(&mut self, key: Option<tdr_data::describe::ReactionKey>, k: usize) {
         let Some(open) = &mut self.text_ui.menu else {
             return;
         };
         let (Some(key), Some(strip)) = (key, &open.strip) else {
             return;
         };
-        let _ = self.commands.send(Command::ToggleReaction {
-            peer: strip.peer,
-            msg_id: strip.msg_id,
-            key,
-        });
+        let (peer, msg_id) = (strip.peer, strip.msg_id);
+        let from = strip.image_bounds(k);
         open.menu.hide();
+        // A reaction we add flies from its cell to its pill.
+        let chosen = self
+            .messages
+            .iter()
+            .find(|m| m.id == msg_id)
+            .and_then(|m| m.reactions.as_ref())
+            .is_some_and(|r| r.buttons.iter().any(|b| b.key == key && b.chosen));
+        if !chosen {
+            self.start_fly(peer, msg_id, key.clone(), from);
+        }
+        let _ = self
+            .commands
+            .send(Command::ToggleReaction { peer, msg_id, key });
     }
 
     fn menu_area(window: &Window) -> Bounds<Pixels> {
@@ -737,18 +747,34 @@ impl MainView {
             let natural = open.menu.geometry(area, window).w;
             open.menu.min_width = strip.fit(natural);
         }
-        let open = self.text_ui.menu.as_ref()?;
-        let strip = open
-            .strip
+        // The strip grows and fades with the menu (`Selector::updateShowState`),
+        // its cells start their appear animations as they are revealed.
+        let (progress, opacity) = self
+            .text_ui
+            .menu
             .as_ref()
-            .filter(|_| !open.menu.hiding())
-            .map(|strip| {
-                if strip.animating() {
-                    window.request_animation_frame();
-                }
-                let g = open.menu.geometry(area, window);
-                self.render_strip(strip, (g.x, g.y, g.w), window, &cx.entity().downgrade())
-            });
+            .map_or((1., 1.), |m| m.menu.appear_state());
+        if let Some(mut strip) = self.text_ui.menu.as_mut().and_then(|m| m.strip.take()) {
+            self.prepare_strip_cells(&mut strip, super::reactions::STRIP_IMAGE, false);
+            Self::reveal_strip(&mut strip, progress);
+            if let Some(open) = self.text_ui.menu.as_mut() {
+                open.strip = Some(strip);
+            }
+        }
+        let open = self.text_ui.menu.as_ref()?;
+        let strip = open.strip.as_ref().map(|strip| {
+            if strip.animating() || progress < 1. || open.menu.hiding() {
+                window.request_animation_frame();
+            }
+            let g = open.menu.geometry(area, window);
+            self.render_strip(
+                strip,
+                (g.x, g.y, g.w, g.h),
+                (progress, opacity),
+                window,
+                &cx.entity().downgrade(),
+            )
+        });
         let colors = MenuColors::from(self.palette());
         let userpic = open.phone_author.as_ref().map(|a| {
             self.userpic(

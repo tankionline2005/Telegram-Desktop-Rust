@@ -4467,17 +4467,31 @@ pub fn start_demo(
                         "😮",
                     ]
                     .iter()
-                    .map(|e| tdr_data::reactions::Available {
-                        emoticon: (*e).to_string(),
-                        title: String::new(),
-                        premium: false,
-                        inactive: false,
-                        center: None,
-                        select: None,
-                        appear: None,
-                        activate: None,
-                        effect: None,
-                        around: None,
+                    .enumerate()
+                    .map(|(i, e)| {
+                        // `TDR_DEMO_REACTIONS=anim`: the first ones get the demo
+                        // animations as their select, appear and effect ones.
+                        let doc = |k: usize| {
+                            let anim = std::env::var("TDR_DEMO_REACTIONS").as_deref() == Ok("anim");
+                            match demo_custom_emoji(
+                                DEMO_CUSTOM_EMOJI[k % DEMO_CUSTOM_EMOJI.len()].0,
+                            ) {
+                                Some(Update::CustomEmoji { doc, .. }) if anim && i < 6 => Some(doc),
+                                _ => None,
+                            }
+                        };
+                        tdr_data::reactions::Available {
+                            emoticon: (*e).to_string(),
+                            title: String::new(),
+                            premium: false,
+                            inactive: false,
+                            center: None,
+                            select: doc(i),
+                            appear: doc(i + 1),
+                            activate: None,
+                            effect: None,
+                            around: doc(1),
+                        }
                     })
                     .collect();
                     *REACTION_ORDER.lock().unwrap() =
