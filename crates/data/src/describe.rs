@@ -826,6 +826,55 @@ pub fn peer_info(row: &PeerRow) -> PeerInfo {
     }
 }
 
+/// The reactions a group or channel allows (`Data::AllowedReactions`, from
+/// its full info's `available_reactions`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllowedKind {
+    /// These only (`chatReactionsSome`; empty: none at all).
+    Some(Vec<ReactionKey>),
+    /// The server's reactions, no custom emoji (`chatReactionsAll`).
+    Default,
+    /// Custom emoji too (`allow_custom`).
+    All,
+}
+
+impl Default for AllowedKind {
+    fn default() -> Self {
+        AllowedKind::Some(Vec::new())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AllowedReactions {
+    pub kind: AllowedKind,
+    /// `reactions_limit`: how many different ones a message may have.
+    pub max: Option<i32>,
+    /// `paid_reactions_available`.
+    pub paid: bool,
+}
+
+impl AllowedReactions {
+    /// Private chats allow everything.
+    pub fn all() -> Self {
+        Self {
+            kind: AllowedKind::All,
+            ..Default::default()
+        }
+    }
+
+    fn parse(value: Option<&enums::ChatReactions>, max: Option<i32>, paid: bool) -> Self {
+        let kind = match value {
+            Some(enums::ChatReactions::All(a)) if a.allow_custom => AllowedKind::All,
+            Some(enums::ChatReactions::All(_)) => AllowedKind::Default,
+            Some(enums::ChatReactions::Some(s)) => {
+                AllowedKind::Some(s.reactions.iter().filter_map(ReactionKey::of).collect())
+            }
+            Some(enums::ChatReactions::None) | None => AllowedKind::Some(Vec::new()),
+        };
+        Self { kind, max, paid }
+    }
+}
+
 /// What the full info of a group or channel says (`channelFull`), as far as the
 /// window uses it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -841,6 +890,7 @@ pub struct FullInfo {
     pub online: Option<i32>,
     /// `canViewMembers`.
     pub can_view_participants: bool,
+    pub reactions: AllowedReactions,
 }
 
 /// The cached full info (`Storage::peer_full`).
@@ -854,9 +904,19 @@ pub fn full_info(raw: &Option<(i32, Vec<u8>)>) -> Option<FullInfo> {
             pinned_msg_id: c.pinned_msg_id,
             online: c.online_count,
             can_view_participants: c.can_view_participants,
+            reactions: AllowedReactions::parse(
+                c.available_reactions.as_ref(),
+                c.reactions_limit,
+                c.paid_reactions_available,
+            ),
         }),
         enums::ChatFull::ChatFull(c) => Some(FullInfo {
             pinned_msg_id: c.pinned_msg_id,
+            reactions: AllowedReactions::parse(
+                c.available_reactions.as_ref(),
+                c.reactions_limit,
+                false,
+            ),
             ..Default::default()
         }),
         enums::ChatFull::CommunityFull(_) => Some(FullInfo::default()),

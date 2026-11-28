@@ -353,9 +353,9 @@ impl MainView {
         if let Some((peer, msg_id, at)) = self.corner_ui.pending {
             if now >= at + SHOW_DELAY {
                 self.corner_ui.pending = None;
-                let keys = self.strip_reactions();
-                if !keys.is_empty() && self.text_ui.menu.is_none() {
-                    let mut strip = StripState::column(peer, msg_id, keys);
+                let possible = self.possible_reactions(peer, msg_id);
+                if !possible.keys.is_empty() && self.text_ui.menu.is_none() {
+                    let mut strip = StripState::column(peer, msg_id, possible);
                     self.prepare_strip_cells(&mut strip, IMAGE, true);
                     let mut corner = Corner::new(strip);
                     corner.apply_state(State::Shown);
@@ -416,9 +416,12 @@ impl MainView {
         let Some(key) = corner.strip.keys.get(k).cloned() else {
             return;
         };
-        let (peer, msg_id) = (corner.peer, corner.msg_id);
+        let (peer, msg_id, tags) = (corner.peer, corner.msg_id, corner.strip.tags);
         let from = corner.strip.image_bounds(k);
         self.corner_hide();
+        if self.react_premium_error(msg_id, &key, tags) {
+            return;
+        }
         let chosen = self
             .messages
             .iter()
@@ -431,6 +434,9 @@ impl MainView {
         let _ = self
             .commands
             .send(Command::ToggleReaction { peer, msg_id, key });
+        if tags {
+            let _ = self.commands.send(Command::LoadSavedTags);
+        }
     }
 
     /// The buttons of message `msg_id` beside its bubble (`bubble` wide and

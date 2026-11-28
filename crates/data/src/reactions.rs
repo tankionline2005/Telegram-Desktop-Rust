@@ -139,3 +139,46 @@ pub async fn send(
         })
         .await?)
 }
+
+/// One of our Saved Messages tags (`savedReactionTag`): its name, if given,
+/// and how many messages have it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedTag {
+    pub key: ReactionKey,
+    pub title: Option<String>,
+    pub count: i32,
+}
+
+/// `messages.getSavedReactionTags`: the tags we used, most used first.
+pub async fn saved_tags(client: &Client) -> Result<Vec<SavedTag>> {
+    let answer = client
+        .invoke(&functions::messages::GetSavedReactionTags {
+            peer: None,
+            hash: 0,
+        })
+        .await?;
+    Ok(match answer {
+        enums::messages::SavedReactionTags::SavedReactionTags(t) => t
+            .tags
+            .iter()
+            .filter_map(|t| {
+                let enums::SavedReactionTag::SavedReactionTag(t) = t;
+                Some(SavedTag {
+                    key: ReactionKey::of(&t.reaction)?,
+                    title: t.title.clone().filter(|t| !t.is_empty()),
+                    count: t.count,
+                })
+            })
+            .collect(),
+        enums::messages::SavedReactionTags::NotModified => Vec::new(),
+    })
+}
+
+/// `messages.getDefaultTagReactions`: the tags offered to everyone.
+pub async fn default_tags(client: &Client) -> Result<Vec<ReactionKey>> {
+    Ok(keys(
+        client
+            .invoke(&functions::messages::GetDefaultTagReactions { hash: 0 })
+            .await?,
+    ))
+}

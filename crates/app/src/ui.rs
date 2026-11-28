@@ -44,6 +44,7 @@ mod main_menu;
 mod menus;
 mod message_text;
 mod reactions;
+mod reactions_panel;
 mod settings;
 mod threads;
 
@@ -1996,8 +1997,18 @@ impl MainView {
                 crate::emoji_suggest::apply_difference(remote, &lang, version, changes);
                 self.emoji_keywords_came(cx);
             }
-            Update::AvailableReactions { list, top } => {
-                self.reactions_came(list, top);
+            Update::AvailableReactions {
+                list,
+                top,
+                recent,
+                tags,
+                my_tags,
+            } => {
+                self.reactions_came(list, top, recent, (tags, my_tags));
+                cx.notify();
+            }
+            Update::SavedTags(tags) => {
+                self.reactions_ui.my_tags = tags;
                 cx.notify();
             }
             Update::EmojiGroups(groups) => {

@@ -1334,22 +1334,29 @@ impl Sync {
     /// is opened: `channels.getFullChannel`): stored with the peers that came with
     /// it (the channel itself, its discussion group). Returns it.
     pub async fn load_full(&mut self, peer: PeerKey) -> Result<Option<describe::FullInfo>> {
-        if peer.kind != PeerKind::Channel {
-            return Ok(None);
-        }
-        let Some(access_hash) = self.store.access_hash(peer)? else {
-            return Ok(None);
+        let enums::messages::ChatFull::ChatFull(full) = match peer.kind {
+            PeerKind::Channel => {
+                let Some(access_hash) = self.store.access_hash(peer)? else {
+                    return Ok(None);
+                };
+                self.client
+                    .invoke(&functions::channels::GetFullChannel {
+                        channel: types::InputChannel {
+                            channel_id: peer.id,
+                            access_hash,
+                        }
+                        .into(),
+                    })
+                    .await?
+            }
+            // A basic group (`messages.getFullChat`): its reactions.
+            PeerKind::Chat => {
+                self.client
+                    .invoke(&functions::messages::GetFullChat { chat_id: peer.id })
+                    .await?
+            }
+            _ => return Ok(None),
         };
-        let enums::messages::ChatFull::ChatFull(full) = self
-            .client
-            .invoke(&functions::channels::GetFullChannel {
-                channel: types::InputChannel {
-                    channel_id: peer.id,
-                    access_hash,
-                }
-                .into(),
-            })
-            .await?;
         let peer_rows: Vec<_> = full
             .users
             .iter()

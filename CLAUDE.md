@@ -233,4 +233,12 @@
   `render_strip_panel`); the corner button is `ui/corner_reaction.rs` (`Manager`/`Button`
   states, shown 300 ms after the mouse rests on a bubble). `TDR_DEMO_REACTIONS=anim`
   gives the demo's first reactions the demo animations (strip/fly checks).
+- What a message may get is `MainView::possible_reactions` (`LookupPossibleReactions`:
+  Saved Messages tags, the limited case, the chat's `DialogItem.reactions` from its full
+  info, `describe::AllowedReactions`; basic groups load `messages.getFullChat` on open).
+  The full panel is `ui/reactions_panel.rs` (`RecentReactions` grid, or with
+  `custom_allowed` the categories row, search and sets; reactions loop as custom emoji of
+  their select animation). Tags: `ReactionsUi.tags/my_tags`, tag pills drawn from
+  `icons::tag_shape_images`, the about text over the strip (`strip_about`). Demo: the
+  channel allows five reactions, Saved Messages (`--open=3`) has tags.
 

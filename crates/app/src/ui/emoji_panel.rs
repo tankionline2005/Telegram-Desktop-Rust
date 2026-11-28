@@ -153,6 +153,11 @@ impl SetSection {
     pub(super) fn title(&self) -> &str {
         &self.info.title
     }
+
+    /// The document of its icon (`thumb_document_id`).
+    pub(super) fn thumb(&self) -> Option<i64> {
+        self.info.thumb_document_id
+    }
 }
 
 /// The button at the right of a set's title.

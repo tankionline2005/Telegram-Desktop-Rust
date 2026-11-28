@@ -565,13 +565,13 @@ impl MainView {
         // `AttachSelectorToMenu`: reactions over the menu of a message that
         // takes them (not service messages).
         if !service {
-            let keys = self.strip_reactions();
+            let possible = self.possible_reactions(key.0, key.1);
             if let Some(open) = self.text_ui.menu.as_mut()
-                && !keys.is_empty()
+                && !possible.keys.is_empty()
             {
                 let [_, et, _, _] = super::reactions::STRIP_EXTEND.map(crate::scale::lg);
                 open.menu.reserve_top = et + crate::scale::lg(super::reactions::STRIP_SHADOW[1]);
-                open.strip = Some(super::reactions::StripState::new(key.0, key.1, keys));
+                open.strip = Some(super::reactions::StripState::new(key.0, key.1, possible));
             }
         }
     }
@@ -708,9 +708,12 @@ impl MainView {
         let (Some(key), Some(strip)) = (key, &open.strip) else {
             return;
         };
-        let (peer, msg_id) = (strip.peer, strip.msg_id);
+        let (peer, msg_id, tags) = (strip.peer, strip.msg_id, strip.tags);
         let from = strip.image_bounds(k);
         open.menu.hide();
+        if self.react_premium_error(msg_id, &key, tags) {
+            return;
+        }
         // A reaction we add flies from its cell to its pill.
         let chosen = self
             .messages
@@ -724,6 +727,9 @@ impl MainView {
         let _ = self
             .commands
             .send(Command::ToggleReaction { peer, msg_id, key });
+        if tags {
+            let _ = self.commands.send(Command::LoadSavedTags);
+        }
     }
 
     fn menu_area(window: &Window) -> Bounds<Pixels> {
@@ -746,6 +752,29 @@ impl MainView {
             open.menu.min_width = 0.;
             let natural = open.menu.geometry(area, window).w;
             open.menu.min_width = strip.fit(natural);
+        }
+        // Room over the menu for the strip, its about text and (custom emoji
+        // allowed) the categories row it unrolls to (`fullTop`).
+        let extra = self
+            .text_ui
+            .menu
+            .as_ref()
+            .and_then(|m| m.strip.as_ref())
+            .map(|strip| {
+                let w = 2. * strip.skip_x()
+                    + strip.columns as f32 * crate::scale::lg(super::reactions::STRIP_SIZE);
+                let about = self.strip_about(strip, w, window).map_or(0., |a| a.height);
+                let footer = if strip.custom_allowed {
+                    crate::scale::lg(36.)
+                } else {
+                    0.
+                };
+                about.max(footer)
+            });
+        if let (Some(extra), Some(open)) = (extra, self.text_ui.menu.as_mut()) {
+            let [_, et, _, _] = super::reactions::STRIP_EXTEND.map(crate::scale::lg);
+            open.menu.reserve_top =
+                et + crate::scale::lg(super::reactions::STRIP_SHADOW[1]) + extra;
         }
         // The strip grows and fades with the menu (`Selector::updateShowState`),
         // its cells start their appear animations as they are revealed.

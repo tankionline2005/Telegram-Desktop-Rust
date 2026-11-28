@@ -46,6 +46,18 @@ const IN_NON_CHOSEN: f32 = 0.12;
 const OUT_NON_CHOSEN: f32 = 0.18;
 /// `semiboldFont`.
 const COUNT_FONT: f32 = 13.;
+/// `reactionInlineTagSkip`, `reactionInlineTagLeftRadius`,
+/// `reactionInlineTagRightRadius`, `reactionInlineTagArrow`,
+/// `reactionInlineTagDot`, `reactionInlineTagDotSkip`, `reactionInlineTagFont`,
+/// `reactionInlineTagNamePosition`.
+const TAG_SKIP: f32 = 6.;
+const TAG_LEFT_RADIUS: f32 = 6.;
+const TAG_RIGHT_RADIUS: f32 = 3.;
+const TAG_ARROW: f32 = 5.;
+const TAG_DOT: f32 = 5.;
+const TAG_DOT_SKIP: f32 = 2.;
+const TAG_FONT: f32 = 12.;
+const TAG_NAME_POSITION: (f32, f32) = (26., 2.);
 /// `mediaInBubbleSkip`: between the text and the reactions.
 pub(super) const MEDIA_IN_BUBBLE_SKIP: f32 = 5.;
 /// A pill appearing, going away, a count changing (ours: tdesktop changes
@@ -67,9 +79,38 @@ pub(super) struct ReactionsUi {
     pub(super) available: Vec<tdr_data::reactions::Available>,
     /// Our top reactions (`messages.getTopReactions`): the strip's first ones.
     pub(super) top: Vec<ReactionKey>,
+    /// `messages.getRecentReactions`: after the top ones.
+    pub(super) recent: Vec<ReactionKey>,
+    /// Saved Messages: the tags offered to everyone and ours (with names).
+    pub(super) tags: Vec<ReactionKey>,
+    pub(super) my_tags: Vec<tdr_data::reactions::SavedTag>,
     /// The account has Premium (set each frame).
     pub(super) premium: bool,
     asked: bool,
+    /// The full panel's search field and its text.
+    pub(super) search: Option<gpui::Entity<crate::text_input::TextInput>>,
+    pub(super) query: String,
+}
+
+/// `kReactionsUniqMax`'s default (`reactions_uniq_max`): how many different
+/// reactions a message may have when the chat does not say.
+const UNIQUE_LIMIT: i32 = 11;
+
+/// What a message's selector offers (`PossibleItemReactionsRef`).
+#[derive(Clone, Debug, Default)]
+pub(super) struct Possible {
+    pub(super) keys: Vec<ReactionKey>,
+    /// Custom emoji too: the full panel has the search and the sets
+    /// (`customAllowed`).
+    pub(super) custom_allowed: bool,
+    /// Saved Messages tags (`reactionsAreTags`).
+    pub(super) tags: bool,
+}
+
+fn push_new(keys: &mut Vec<ReactionKey>, key: &ReactionKey) {
+    if !keys.contains(key) {
+        keys.push(key.clone());
+    }
 }
 
 type PillKey = (PeerKey, i32, ReactionKey);
@@ -167,8 +208,13 @@ impl MainView {
         &mut self,
         list: Vec<tdr_data::reactions::Available>,
         top: Vec<ReactionKey>,
+        recent: Vec<ReactionKey>,
+        (tags, my_tags): (Vec<ReactionKey>, Vec<tdr_data::reactions::SavedTag>),
     ) {
         self.reactions_ui.top = top;
+        self.reactions_ui.recent = recent;
+        self.reactions_ui.tags = tags;
+        self.reactions_ui.my_tags = my_tags;
         self.reactions_ui.icons.clear();
         for r in &list {
             for doc in r.documents() {
@@ -367,18 +413,150 @@ impl MainView {
         if buttons.is_empty() {
             return None;
         }
-        Some((
-            MessageReactions {
-                buttons,
-                tags: r.is_some_and(|r| r.tags),
-            },
-            pills,
-        ))
+        let tags = r.is_some_and(|r| r.tags);
+        if tags {
+            // `myTagTitle`.
+            for b in &mut buttons {
+                b.title = self
+                    .reactions_ui
+                    .my_tags
+                    .iter()
+                    .find(|t| t.key == b.key)
+                    .and_then(|t| t.title.clone());
+            }
+        }
+        Some((MessageReactions { buttons, tags }, pills))
+    }
+
+    /// `LookupPossibleReactions`: Saved Messages tags (ours, then the default
+    /// ones); only the reactions a message already has when it has as many
+    /// as the chat allows; else the top, recent and server's ones the chat
+    /// allows, custom emoji only where all are allowed.
+    pub(super) fn possible_reactions(&self, peer: PeerKey, msg_id: i32) -> Possible {
+        use tdr_data::describe::AllowedKind;
+        let ui = &self.reactions_ui;
+        let Some(item) = self.messages.iter().find(|m| m.id == msg_id) else {
+            return Possible::default();
+        };
+        if item.service.is_some() {
+            return Possible::default();
+        }
+        let chat = self.chat_item(peer);
+        let saved = chat.is_some_and(|c| c.is_saved);
+        let existing: Vec<ReactionKey> = item
+            .reactions
+            .as_ref()
+            .map(|r| r.buttons.iter().map(|b| b.key.clone()).collect())
+            .unwrap_or_default();
+        let tags = item
+            .reactions
+            .as_ref()
+            .map_or(saved, |r| r.tags || (r.buttons.is_empty() && saved));
+        let mut keys = Vec::new();
+        if tags {
+            for key in ui.my_tags.iter().map(|t| &t.key).chain(&ui.tags) {
+                push_new(&mut keys, key);
+            }
+            return Possible {
+                keys,
+                custom_allowed: true,
+                tags: true,
+            };
+        }
+        let full: Vec<ReactionKey> = ui
+            .available
+            .iter()
+            .filter(|r| !r.inactive)
+            .map(|r| ReactionKey::Emoji(r.emoticon.clone()))
+            .collect();
+        let all: Vec<&ReactionKey> = ui.top.iter().chain(&ui.recent).chain(&full).collect();
+        let allowed = chat.and_then(|c| c.reactions.clone()).unwrap_or_default();
+        let limit = allowed.max.filter(|m| *m > 0).unwrap_or(UNIQUE_LIMIT) as usize;
+        if existing.len() >= limit {
+            for key in all.iter().copied().filter(|k| existing.contains(k)) {
+                push_new(&mut keys, key);
+            }
+            for key in existing.iter().filter(|k| **k != ReactionKey::Paid) {
+                push_new(&mut keys, key);
+            }
+            return Possible {
+                keys,
+                ..Default::default()
+            };
+        }
+        for key in all {
+            let ok = match (&allowed.kind, key) {
+                (_, ReactionKey::Paid) => false,
+                (AllowedKind::Some(list), key) => list.contains(key),
+                (AllowedKind::Default, ReactionKey::Custom(_)) => false,
+                _ => true,
+            };
+            if ok {
+                push_new(&mut keys, key);
+            }
+        }
+        if let AllowedKind::Some(list) = &allowed.kind {
+            for key in list.iter().filter(|k| **k != ReactionKey::Paid) {
+                push_new(&mut keys, key);
+            }
+        }
+        Possible {
+            keys,
+            custom_allowed: allowed.kind == AllowedKind::All,
+            tags: false,
+        }
+    }
+
+    /// `Window::ShowReactPremiumError`: tags need Premium, so do custom
+    /// emoji reactions out of channels (a toast in place of the Premium box).
+    pub(super) fn react_premium_error(
+        &mut self,
+        msg_id: i32,
+        key: &ReactionKey,
+        tags: bool,
+    ) -> bool {
+        if self.reactions_ui.premium {
+            return false;
+        }
+        if tags {
+            self.show_long_toast(
+                "Tags for Messages. Organize your Saved Messages with tags for quicker access.",
+                4000.,
+            );
+            return true;
+        }
+        let item = self.messages.iter().find(|m| m.id == msg_id);
+        let chosen = item
+            .and_then(|m| m.reactions.as_ref())
+            .is_some_and(|r| r.buttons.iter().any(|b| b.key == *key && b.chosen));
+        let broadcast = self
+            .selected
+            .and_then(|p| self.chat_item(p))
+            .is_some_and(|c| c.kind == tdr_data::describe::PeerKind::Channel);
+        if chosen || broadcast || !matches!(key, ReactionKey::Custom(_)) {
+            return false;
+        }
+        self.show_long_toast(
+            "Infinite Reactions. React with thousands of emoji \u{2014} with multiple reactions per message.",
+            4000.,
+        );
+        true
     }
 
     /// The width of one pill (`InlineList::countOptimalSize`).
-    fn pill_width(b: &ReactionButton, window: &Window) -> f32 {
+    fn pill_width(b: &ReactionButton, tags: bool, window: &Window) -> f32 {
         let [pl, _, pr, _] = PADDING;
+        if tags {
+            let text = b.title.as_deref().map_or(0., |t| {
+                text_width(window, t, TAG_FONT, FontWeight::NORMAL).ceil()
+            });
+            return lg(pl)
+                + lg(SIZE)
+                + lg(TAG_SKIP)
+                + lg(pr)
+                + text
+                + if text > 0. { lg(SKIP) } else { 0. };
+        }
         match &b.userpics {
             Some(pics) => {
                 let n = pics.len().max(1) as f32;
@@ -406,7 +584,7 @@ impl MainView {
     pub(super) fn reactions_max_width(r: &MessageReactions, skip_w: f32, window: &Window) -> f32 {
         let mut x = lg(IN_BUBBLE_LEFT);
         for b in &r.buttons {
-            x += Self::pill_width(b, window) + lg(BETWEEN);
+            x += Self::pill_width(b, r.tags, window) + lg(BETWEEN);
         }
         x - lg(BETWEEN) + skip_w
     }
@@ -424,7 +602,7 @@ impl MainView {
         let (mut x, mut y) = (left, 0.);
         let mut pills = Vec::with_capacity(r.buttons.len());
         for b in &r.buttons {
-            let w = Self::pill_width(b, window);
+            let w = Self::pill_width(b, r.tags, window);
             if x > left && x + w > left + width {
                 x = left;
                 y += h + lg(BETWEEN);
@@ -484,6 +662,8 @@ impl MainView {
             };
             let mut bg = file_bg;
             bg.a *= opacity;
+            // `bubbleSkip`: a growing pill is a circle widening to its size.
+            let fill_w = h + (w - h) * bubble;
             // What the pill shows over the bubble (the userpics' rings).
             let shown = blend(bubble_bg, file_bg, opacity / bubble.max(0.01));
             let text_fg = if chosen {
@@ -515,12 +695,24 @@ impl MainView {
                 .as_ref()
                 .map(|pics| self.render_userpics_row(pics, shown));
             let key = b.key.clone();
+            let tags = r.tags;
+            // A tag's name after its icon.
+            let title = b.title.clone().filter(|_| tags).map(|t| {
+                div()
+                    .absolute()
+                    .left(gpui::px(lg(TAG_NAME_POSITION.0)))
+                    .top(gpui::px(lg(TAG_NAME_POSITION.1)))
+                    .text_size(scale::font(TAG_FONT).size)
+                    .line_height(scale::font(TAG_FONT).line_height())
+                    .text_color(text_fg)
+                    .whitespace_nowrap()
+                    .child(t)
+            });
+            let tag_shape = tags.then(|| Self::render_tag_shape(file_bg, opacity, fill_w, h));
             let ripple_id = id.clone();
             // The pill's place on screen (the ripple starts at the press).
             let pill_bounds = std::rc::Rc::new(std::cell::Cell::new(None));
             let bounds_out = pill_bounds.clone();
-            // `bubbleSkip`: a growing pill is a circle widening to its size.
-            let fill_w = h + (w - h) * bubble;
             let count_el = count.map(|n| {
                 let left = lg(PADDING[0]) + lg(SIZE) + lg(SKIP);
                 let text = |value: i32, dy: f32, alpha: f32| {
@@ -575,9 +767,10 @@ impl MainView {
                             .top_0()
                             .w(gpui::px(fill_w))
                             .h(gpui::px(h))
-                            .rounded_full()
+                            .when(!tags, |d| d.rounded_full().bg(bg))
+                            .when(tags, |d| d.rounded(gpui::px(lg(TAG_LEFT_RADIUS))))
                             .overflow_hidden()
-                            .bg(bg)
+                            .children(tag_shape)
                             .children(self.ripple_layer_rgba(&id, w, h, ripple_color, false))
                             .child(
                                 canvas(
@@ -598,7 +791,8 @@ impl MainView {
                                     .h(gpui::px(h))
                                     .opacity(if chosen { 1. } else { bubble })
                                     .children(icon)
-                                    .children(count_el)
+                                    .children(title)
+                                    .children(count_el.filter(|_| !tags))
                                     .children(pics.map(|pics| {
                                         div()
                                             .absolute()
@@ -651,6 +845,12 @@ impl MainView {
                             let key = key.clone();
                             let _ = click.update(cx, |this, cx| {
                                 if let Some(peer) = peer {
+                                    // Tags filter the chat in tdesktop (not here
+                                    // yet); custom emoji may need Premium.
+                                    if tags || this.react_premium_error(msg_id, &key, false) {
+                                        cx.notify();
+                                        return;
+                                    }
                                     // Adding ours plays its effect in place.
                                     if !was_chosen {
                                         this.start_fly(peer, msg_id, key.clone(), None);
@@ -668,6 +868,91 @@ impl MainView {
             );
         }
         row.children(effects).into_any_element()
+    }
+
+    /// `InlineList::paintSingleBg` for a tag `fill_w` x `h`: its left end,
+    /// a plain middle, its right end with the arrow and the dot.
+    fn render_tag_shape(color: gpui::Rgba, opacity: f32, fill_w: f32, h: f32) -> AnyElement {
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                let s = scale::get();
+                let base_w = lg(PADDING[0]) + lg(SIZE) + lg(TAG_SKIP) + lg(PADDING[2]);
+                let left = lg(TAG_LEFT_RADIUS);
+                let rgba = (((color.r * 255.).round() as u32) << 24)
+                    | (((color.g * 255.).round() as u32) << 16)
+                    | (((color.b * 255.).round() as u32) << 8)
+                    | ((color.a * 255.).round() as u32);
+                let (left_img, right_img) = crate::icons::tag_shape_images(
+                    rgba,
+                    ((base_w * s).round() as u32, (h * s).round() as u32),
+                    (left * s).round() as u32,
+                    (
+                        lg(TAG_LEFT_RADIUS) * s,
+                        lg(TAG_RIGHT_RADIUS) * s,
+                        lg(TAG_ARROW) * s,
+                    ),
+                    (lg(TAG_DOT) * s, lg(TAG_DOT_SKIP) * s),
+                );
+                let o = bounds.origin;
+                let right_w = base_w - left;
+                window.with_element_opacity(Some(opacity), |window| {
+                    let use_left = fill_w.min(left);
+                    window.with_content_mask(
+                        Some(gpui::ContentMask {
+                            bounds: Bounds::new(o, gpui::size(gpui::px(use_left), gpui::px(h))),
+                        }),
+                        |window| {
+                            let _ = window.paint_image(
+                                Bounds::new(o, gpui::size(gpui::px(left), gpui::px(h))),
+                                gpui::Corners::default(),
+                                left_img,
+                                0,
+                                false,
+                            );
+                        },
+                    );
+                    let middle = fill_w - left - right_w;
+                    if middle > 0. {
+                        window.paint_quad(gpui::fill(
+                            Bounds::new(
+                                point(o.x + gpui::px(left), o.y),
+                                gpui::size(gpui::px(middle), gpui::px(h)),
+                            ),
+                            color,
+                        ));
+                    }
+                    let use_right = fill_w - left;
+                    if use_right > 0. {
+                        let clip = Bounds::new(
+                            point(o.x + gpui::px(fill_w - use_right), o.y),
+                            gpui::size(gpui::px(use_right), gpui::px(h)),
+                        );
+                        window.with_content_mask(
+                            Some(gpui::ContentMask { bounds: clip }),
+                            |window| {
+                                let _ = window.paint_image(
+                                    Bounds::new(
+                                        point(o.x + gpui::px(fill_w - right_w), o.y),
+                                        gpui::size(gpui::px(right_w), gpui::px(h)),
+                                    ),
+                                    gpui::Corners::default(),
+                                    right_img,
+                                    0,
+                                    false,
+                                );
+                            },
+                        );
+                    }
+                });
+            },
+        )
+        .absolute()
+        .left_0()
+        .top_0()
+        .w(gpui::px(fill_w))
+        .h(gpui::px(h))
+        .into_any_element()
     }
 
     /// `ReactionFlyAnimation::paintGetArea` over a pill at (`x`, `y`): the
@@ -911,27 +1196,30 @@ fn blend(under: gpui::Rgba, color: gpui::Rgba, opacity: f32) -> gpui::Rgba {
 /// `reactionCornerShadow`, `kHoverScale`, `kHoverScaleDuration`,
 /// `kMinNonTransparentColumns`.
 pub(super) const STRIP_EXTEND: [f32; 4] = [21., 49., 39., 0.];
-const STRIP_HEIGHT: f32 = 40.;
-const STRIP_SIZE: f32 = 32.;
+pub(super) const STRIP_HEIGHT: f32 = 40.;
+pub(super) const STRIP_SIZE: f32 = 32.;
 pub(super) const STRIP_IMAGE: f32 = 26.;
-const STRIP_SKIP: f32 = 7.;
+pub(super) const STRIP_SKIP: f32 = 7.;
 const STRIP_MIN_WIDTH: f32 = 60.;
 const STRIP_BUBBLE_RIGHT: f32 = 20.;
 pub(super) const STRIP_SHADOW: [f32; 4] = [4., 8., 4., 8.];
 pub(super) const HOVER_SCALE: f32 = 1.24;
 const HOVER_SCALE_MS: f32 = 200.;
 const MIN_COLUMNS: usize = 7;
+/// `defaultEmojiPan.aboutPadding` and `defaultEmojiPanAbout`'s font.
+const ABOUT_PADDING: [f32; 4] = [12., 3., 12., 2.];
+const ABOUT_FONT: f32 = 11.;
+
+/// The about text over a strip, in lines of words (true: the link).
+pub(super) struct StripAbout {
+    lines: Vec<Vec<(String, bool)>>,
+    pub(super) height: f32,
+}
 /// `kExpandDuration`, `kScaleDuration`, `emojiPanMinHeight`,
 /// `emojiPanMaxHeight`, `emojiPanRadius`, the list's `header`, `headerLeft`
 /// less its margin and `headerTop`.
-const EXPAND_MS: f32 = 300.;
-const SCALE_MS: f32 = 120.;
-const PAN_MIN_HEIGHT: f32 = 278.;
-const PAN_MAX_HEIGHT: f32 = 640.;
-const PAN_RADIUS: f32 = 8.;
-const PANEL_HEADER: f32 = 33.;
-const PANEL_HEADER_LEFT: f32 = 7.;
-const PANEL_HEADER_TOP: f32 = 10.;
+pub(super) const EXPAND_MS: f32 = 300.;
+pub(super) const SCALE_MS: f32 = 120.;
 
 /// A one-shot animation of a document (`AnimatedIcon::animate`): its frames
 /// on its own clock, from the first; the first frame before and after.
@@ -1014,25 +1302,43 @@ pub(super) struct StripState {
     pub(super) unhovered: Option<(usize, std::time::Instant)>,
     /// Where the cells are on screen (the fly animation starts there).
     pub(super) cell_bounds: std::rc::Rc<std::cell::RefCell<Vec<gpui::Bounds<gpui::Pixels>>>>,
+    /// Custom emoji allowed (the expand button is always there) and Saved
+    /// Messages tags (the about text over the strip).
+    pub(super) custom_allowed: bool,
+    pub(super) tags: bool,
     /// The expand button was pressed: the strip unrolls into the full panel
     /// (`Selector::expand`).
     pub(super) expanded: Option<std::time::Instant>,
     pub(super) panel_scroll: gpui::ScrollHandle,
 }
 
+impl StripCell {
+    /// A cell shown at once (no appear animation to play).
+    pub(super) fn new(appear: Option<Clip>, select: Option<Clip>) -> Self {
+        Self {
+            appear,
+            select,
+            appeared: true,
+            select_played: false,
+        }
+    }
+}
+
 impl StripState {
-    /// A column of all `keys` (the corner button's).
-    pub(super) fn column(peer: PeerKey, msg_id: i32, keys: Vec<ReactionKey>) -> Self {
-        let mut strip = Self::new(peer, msg_id, keys);
+    /// A column of all the reactions (the corner button's).
+    pub(super) fn column(peer: PeerKey, msg_id: i32, possible: Possible) -> Self {
+        let mut strip = Self::new(peer, msg_id, possible);
         strip.columns = strip.keys.len();
         strip
     }
 
-    pub(super) fn new(peer: PeerKey, msg_id: i32, keys: Vec<ReactionKey>) -> Self {
+    pub(super) fn new(peer: PeerKey, msg_id: i32, possible: Possible) -> Self {
         Self {
             peer,
             msg_id,
-            keys,
+            keys: possible.keys,
+            custom_allowed: possible.custom_allowed,
+            tags: possible.tags,
             columns: 0,
             expand: false,
             cells: Vec::new(),
@@ -1055,15 +1361,15 @@ impl StripState {
         let max_width = lg(crate::popup_menu::WIDTH_MAX) + added;
         let desired_columns = (((desired - 2. * skip) / size).ceil() as usize).max(MIN_COLUMNS);
         let possible = desired_columns.min(((max_width - 2. * skip) / size).floor() as usize);
-        let max = self.keys.len();
+        let max = self.keys.len() + self.custom_allowed as usize;
         self.columns = possible.min(max).max(1);
-        self.expand = self.columns < max;
+        self.expand = self.columns < max || self.custom_allowed;
         (2. * skip + self.columns as f32 * size).max(desired) - added
     }
 
     /// `countSkipLeft`.
-    fn skip_x(&self) -> f32 {
-        let n = self.keys.len() as f32;
+    pub(super) fn skip_x(&self) -> f32 {
+        let n = (self.keys.len() + self.custom_allowed as usize) as f32;
         ((lg(STRIP_MIN_WIDTH) - n * lg(STRIP_SIZE)) / 2.).max(lg(STRIP_SKIP))
     }
 
@@ -1151,7 +1457,7 @@ impl StripState {
 
 impl ReactionsUi {
     /// An emoji reaction's appear and select animations.
-    fn strip_clips(&self, emoticon: &str, side: u32) -> (Option<Clip>, Option<Clip>) {
+    pub(super) fn strip_clips(&self, emoticon: &str, side: u32) -> (Option<Clip>, Option<Clip>) {
         let Some(r) = self.available.iter().find(|r| r.emoticon == emoticon) else {
             return (None, None);
         };
@@ -1163,37 +1469,6 @@ impl ReactionsUi {
 }
 
 impl MainView {
-    /// The reactions a message's strip offers (`LookupPossibleReactions`): the
-    /// top ones the server keeps for us, then the rest of its list; premium
-    /// ones only with Premium.
-    pub(super) fn strip_reactions(&self) -> Vec<ReactionKey> {
-        let premium = self.reactions_ui.premium;
-        let allowed = |k: &ReactionKey| match k {
-            ReactionKey::Emoji(e) => self
-                .reactions_ui
-                .available
-                .iter()
-                .find(|r| &r.emoticon == e)
-                .is_some_and(|r| !r.inactive && (premium || !r.premium)),
-            ReactionKey::Custom(_) => premium,
-            ReactionKey::Paid => false,
-        };
-        let mut keys: Vec<ReactionKey> = self
-            .reactions_ui
-            .top
-            .iter()
-            .filter(|k| allowed(k))
-            .cloned()
-            .collect();
-        for r in &self.reactions_ui.available {
-            let k = ReactionKey::Emoji(r.emoticon.clone());
-            if allowed(&k) && !keys.contains(&k) {
-                keys.push(k);
-            }
-        }
-        keys
-    }
-
     /// The cells' animations, once the strip's columns are known.
     pub(super) fn prepare_strip_cells(&self, strip: &mut StripState, image: f32, appeared: bool) {
         if strip.cells.len() >= strip.columns {
@@ -1266,21 +1541,25 @@ impl MainView {
         let size = lg(STRIP_SIZE);
         let skip = strip.skip_x();
         let inner_w = 2. * skip + strip.columns as f32 * size;
-        let inner_h = lg(STRIP_HEIGHT);
+        let strip_h = lg(STRIP_HEIGHT);
+        // Saved Messages: the about text over the cells, in the same round.
+        let about = self.strip_about(strip, inner_w, window);
+        let about_h = about.as_ref().map_or(0., |a| a.height);
+        let inner_h = strip_h + about_h;
         // Right-aligned with the menu's extended right edge, `et` above its box.
         let right = mx + mw + er;
-        let (x, y) = (right - inner_w, my - et);
+        let (x, y) = (right - inner_w, my - et - about_h);
         let shown_w = Self::strip_appeared_width(strip, progress);
-        let radius = inner_h / 2.;
+        let radius = strip_h / 2.;
         let bubble_w = icon_width(Icon::ReactionsBubble, window);
         let bubble_right = lg(STRIP_BUBBLE_RIGHT).min((shown_w - bubble_w) / 2.);
         let tail_x = shown_w - bubble_right - bubble_w;
         let mut cells = div()
             .absolute()
             .left_0()
-            .top_0()
+            .top(gpui::px(about_h))
             .w(gpui::px(shown_w))
-            .h(gpui::px(inner_h))
+            .h(gpui::px(strip_h))
             .overflow_hidden();
         for k in 0..strip.columns {
             let expand = strip.expand && k + 1 == strip.columns;
@@ -1315,7 +1594,7 @@ impl MainView {
                     .id(("strip-cell", k))
                     .absolute()
                     .left(gpui::px(skip + k as f32 * size))
-                    .top(gpui::px((inner_h - size) / 2.))
+                    .top(gpui::px((strip_h - size) / 2.))
                     .size(gpui::px(size))
                     .cursor_pointer()
                     .children(image)
@@ -1343,11 +1622,11 @@ impl MainView {
                             cx.notify();
                         });
                     })
-                    .on_click(move |_, _, cx| {
+                    .on_click(move |_, window, cx| {
                         let key = key.clone();
                         let _ = click.update(cx, |this, cx| {
                             if expand {
-                                this.expand_strip();
+                                this.expand_strip(window, cx);
                             } else {
                                 this.strip_chosen(key, k);
                             }
@@ -1401,7 +1680,118 @@ impl MainView {
                     }]),
             )
             .child(cells)
+            .children(
+                about.map(|a| {
+                    Self::render_strip_about(a, shown_w, p, window, view).into_any_element()
+                }),
+            )
             .into_any_element()
+    }
+
+    /// `ItemReactionsAbout` laid out at the strip's width (`aboutPadding`,
+    /// 11 px words wrapped and centered).
+    pub(super) fn strip_about(
+        &self,
+        strip: &StripState,
+        width: f32,
+        window: &Window,
+    ) -> Option<StripAbout> {
+        if !strip.tags {
+            return None;
+        }
+        let words: Vec<(String, bool)> = if self.reactions_ui.premium {
+            "Tag this message with an emoji for quick search."
+                .split(' ')
+                .map(|w| (w.to_string(), false))
+                .collect()
+        } else {
+            "Organize your Saved Messages with tags."
+                .split(' ')
+                .map(|w| (w.to_string(), false))
+                .chain([("Learn".to_string(), true), ("More...".to_string(), true)])
+                .collect()
+        };
+        let available = width - lg(ABOUT_PADDING[0]) - lg(ABOUT_PADDING[2]);
+        let space = text_width(window, " ", ABOUT_FONT, FontWeight::NORMAL);
+        let mut lines: Vec<Vec<(String, bool)>> = vec![Vec::new()];
+        let mut x = 0.;
+        for (word, link) in words {
+            let w = text_width(window, &word, ABOUT_FONT, FontWeight::NORMAL);
+            let line = lines.last_mut().unwrap();
+            if !line.is_empty() && x + space + w > available {
+                lines.push(vec![(word, link)]);
+                x = w;
+            } else {
+                x += if line.is_empty() { w } else { space + w };
+                line.push((word, link));
+            }
+        }
+        let line_h = scale::font(ABOUT_FONT).height;
+        Some(StripAbout {
+            height: lg(ABOUT_PADDING[1]) + lines.len() as f32 * line_h + lg(ABOUT_PADDING[3]),
+            lines,
+        })
+    }
+
+    /// The about text: grey, its link in the link color (Premium's page is
+    /// not here: a toast says what it is about).
+    pub(super) fn render_strip_about(
+        about: StripAbout,
+        width: f32,
+        p: &tdr_theme::Palette,
+        _window: &Window,
+        view: &WeakEntity<Self>,
+    ) -> impl IntoElement {
+        let line_h = scale::font(ABOUT_FONT).line_height();
+        let mut column = div()
+            .absolute()
+            .left_0()
+            .top(gpui::px(lg(ABOUT_PADDING[1])))
+            .w(gpui::px(width))
+            .flex()
+            .flex_col()
+            .items_center()
+            .text_size(scale::font(ABOUT_FONT).size)
+            .line_height(line_h);
+        for (n, line) in about.lines.into_iter().enumerate() {
+            let mut row = div().flex().whitespace_nowrap();
+            let mut text = String::new();
+            let mut link = String::new();
+            for (word, is_link) in line {
+                let target = if is_link { &mut link } else { &mut text };
+                if !target.is_empty() {
+                    target.push(' ');
+                }
+                target.push_str(&word);
+            }
+            if !text.is_empty() {
+                let space = if link.is_empty() { "" } else { " " };
+                row = row.child(
+                    div()
+                        .text_color(c(p.window_sub_text_fg))
+                        .child(format!("{text}{space}")),
+                );
+            }
+            if !link.is_empty() {
+                let view = view.clone();
+                row = row.child(
+                    div()
+                        .id(("strip-about-link", n))
+                        .cursor_pointer()
+                        .text_color(c(p.window_active_text_fg))
+                        .child(link)
+                        .on_click(move |_, _, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.react_premium_error(0, &ReactionKey::Paid, true);
+                                this.hide_menu();
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+            column = column.child(row);
+        }
+        column
     }
 }
 
@@ -1446,276 +1836,5 @@ pub(super) fn paint_reaction_icon(
             }
         }
         (ReactionKey::Paid, None) => {}
-    }
-}
-
-impl MainView {
-    /// The strip's expand button (`Selector::expand`): all the reactions, and
-    /// with Premium the custom emoji sets.
-    pub(super) fn expand_strip(&mut self) {
-        if self.reactions_ui.premium {
-            self.ensure_emoji_sets();
-        }
-        let Some(mut strip) = self.text_ui.menu.as_mut().and_then(|m| m.strip.take()) else {
-            return;
-        };
-        if strip.expanded.is_none() {
-            strip.expanded = Some(std::time::Instant::now());
-            strip.hovered = None;
-            strip.unhovered = None;
-            // The reactions the strip had no room for.
-            let side = (lg(STRIP_IMAGE) * HOVER_SCALE * scale::get()).round() as u32;
-            for k in strip.cells.len()..strip.keys.len() {
-                let (appear, select) = match &strip.keys[k] {
-                    ReactionKey::Emoji(e) => self.reactions_ui.strip_clips(e, side),
-                    _ => (None, None),
-                };
-                strip.cells.push(StripCell {
-                    appear,
-                    select,
-                    appeared: true,
-                    select_played: false,
-                });
-            }
-        }
-        if let Some(open) = self.text_ui.menu.as_mut() {
-            open.strip = Some(strip);
-        }
-    }
-
-    /// The full panel the strip unrolled into (`Selector::paintExpanding`,
-    /// `EmojiListWidget` in `FullReactions` mode): it grows down over the
-    /// menu from the strip, its first row where the strip's cells were, the
-    /// expand button fading away; scrolled when it does not fit.
-    fn render_strip_panel(
-        &self,
-        strip: &StripState,
-        start: std::time::Instant,
-        (mx, my, mw, mh): (f32, f32, f32, f32),
-        opacity: f32,
-        window: &Window,
-        view: &WeakEntity<Self>,
-    ) -> AnyElement {
-        use crate::icons::{Icon, icon};
-        let p = self.palette();
-        let [_, et, er, _] = STRIP_EXTEND.map(lg);
-        let size = lg(STRIP_SIZE);
-        let skip = strip.skip_x();
-        let w = 2. * skip + strip.columns as f32 * size;
-        let strip_h = lg(STRIP_HEIGHT);
-        let (x, y) = (mx + mw + er - w, my - et);
-        let skip_y = (strip_h - size) / 2.;
-        let custom_allowed = self.reactions_ui.premium;
-        // The reactions' grid (`_columnCount` of the list).
-        let columns = (((w - 2. * skip) / size).floor() as usize).max(1);
-        let keys = &strip.keys;
-        let rows = keys.len().div_ceil(columns);
-        let grid_h = rows as f32 * size;
-        // With Premium: the custom emoji sets below, each under its title.
-        let sets: Vec<(String, Vec<i64>)> = if custom_allowed {
-            self.emoji_panel
-                .sets
-                .iter()
-                .filter(|s| s.installed)
-                .map(|s| (s.title().to_string(), s.emoji.clone()))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let sets_h: f32 = sets
-            .iter()
-            .map(|(_, e)| lg(PANEL_HEADER) + e.len().div_ceil(columns) as f32 * size)
-            .sum();
-        let content_h = skip_y + grid_h + sets_h + lg(STRIP_SKIP);
-        // `minimalHeight`, and the limit the menu's height gives.
-        let minimal = skip_y + grid_h.min(lg(PAN_MIN_HEIGHT)) + lg(PAN_RADIUS) + lg(STRIP_SKIP);
-        let limit = if custom_allowed {
-            lg(PAN_MAX_HEIGHT)
-        } else {
-            minimal
-        };
-        let below = f32::from(window.viewport_size().height) - y - lg(STRIP_SHADOW[3]);
-        let final_h = limit
-            .min((my + mh - y).max(minimal))
-            .min(below)
-            .max(strip_h);
-        // `updateExpandingRects`.
-        let ms = start.elapsed().as_secs_f32() * 1000.;
-        let t = (ms / EXPAND_MS).min(1.);
-        let expanding = crate::anim::ease_out_circ(t);
-        let h = strip_h + (final_h - strip_h) * expanding;
-        let radius = if custom_allowed {
-            strip_h / 2. + (lg(PAN_RADIUS) - strip_h / 2.) * t
-        } else {
-            strip_h / 2.
-        };
-        let full = (ms / (EXPAND_MS + SCALE_MS)).min(1.);
-        let header_fg = c(p.emoji_pan_header_fg);
-        let mut content = div().relative().w(gpui::px(w)).h(gpui::px(content_h));
-        let cell = |id: usize, left: f32, top: f32, body: AnyElement| {
-            div()
-                .id(("panel-cell", id))
-                .absolute()
-                .left(gpui::px(left))
-                .top(gpui::px(top))
-                .size(gpui::px(size))
-                .cursor_pointer()
-                .child(body)
-        };
-        for (k, key) in keys.iter().enumerate() {
-            let (col, row) = (k % columns, k / columns);
-            let item = strip.cells.get(k).cloned();
-            let bounds_out = strip.cell_bounds.clone();
-            let paint_key = key.clone();
-            let click = view.clone();
-            let key = key.clone();
-            content = content.child(
-                cell(
-                    k,
-                    skip + col as f32 * size,
-                    skip_y + row as f32 * size,
-                    canvas(
-                        move |bounds, _, _| {
-                            let mut all = bounds_out.borrow_mut();
-                            if all.len() <= k {
-                                all.resize(k + 1, gpui::Bounds::default());
-                            }
-                            all[k] = bounds;
-                        },
-                        move |bounds, _, window, _| {
-                            paint_reaction_icon(
-                                &paint_key,
-                                item.as_ref(),
-                                bounds,
-                                lg(STRIP_IMAGE),
-                                window,
-                            );
-                        },
-                    )
-                    .size_full()
-                    .into_any_element(),
-                )
-                .on_click(move |_, _, cx| {
-                    let key = key.clone();
-                    let _ = click.update(cx, |this, cx| {
-                        this.strip_chosen(Some(key), k);
-                        cx.notify();
-                    });
-                }),
-            );
-        }
-        let mut top = skip_y + grid_h;
-        let custom_side = crate::custom_emoji::size_large();
-        for (s, (title, emoji)) in sets.into_iter().enumerate() {
-            content = content.child(
-                div()
-                    .absolute()
-                    .left(gpui::px(lg(PANEL_HEADER_LEFT)))
-                    .top(gpui::px(top + lg(PANEL_HEADER_TOP)))
-                    .w(gpui::px(w - 2. * lg(PANEL_HEADER_LEFT)))
-                    .text_size(scale::font(13.).size)
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(header_fg)
-                    .child(crate::one_line::one_line(title)),
-            );
-            top += lg(PANEL_HEADER);
-            let count = emoji.len();
-            for (i, id) in emoji.into_iter().enumerate() {
-                let (col, row) = (i % columns, i / columns);
-                let click = view.clone();
-                content = content.child(
-                    cell(
-                        100_000 * (s + 1) + i,
-                        skip + col as f32 * size,
-                        top + row as f32 * size,
-                        canvas(
-                            |_, _, _| {},
-                            move |bounds, _, window, _| {
-                                let side = custom_side as f32 / scale::get();
-                                let at = point(
-                                    bounds.origin.x + gpui::px(((size - side) / 2.).floor()),
-                                    bounds.origin.y + gpui::px(((size - side) / 2.).floor()),
-                                );
-                                crate::custom_emoji::paint(
-                                    id,
-                                    at,
-                                    custom_side,
-                                    gpui::Hsla::default(),
-                                    window,
-                                );
-                            },
-                        )
-                        .size_full()
-                        .into_any_element(),
-                    )
-                    .on_click(move |_, _, cx| {
-                        let _ = click.update(cx, |this, cx| {
-                            this.strip_chosen(Some(ReactionKey::Custom(id)), usize::MAX);
-                            cx.notify();
-                        });
-                    }),
-                );
-            }
-            top += count.div_ceil(columns) as f32 * size;
-        }
-        // `paintFadingExpandIcon`: where the strip's last cell was, shrinking.
-        let fading = (full < 1.).then(|| {
-            let sub = size / 3. * full;
-            div()
-                .absolute()
-                .left(gpui::px(w - size - skip + sub))
-                .top(gpui::px(skip_y + sub))
-                .size(gpui::px(size - 2. * sub))
-                .opacity(1. - full)
-                .bg(c(p.emoji_pan_bg))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(icon(
-                    Icon::ReactionsExpandPanel,
-                    p.window_sub_text_fg,
-                    window,
-                ))
-        });
-        div()
-            .id("reaction-panel")
-            .absolute()
-            .left(gpui::px(x))
-            .top(gpui::px(y))
-            .w(gpui::px(w))
-            .h(gpui::px(h))
-            .opacity(opacity)
-            .occlude()
-            .rounded(gpui::px(radius))
-            .bg(c(p.emoji_pan_bg))
-            .shadow(vec![gpui::BoxShadow {
-                color: c(p.shadow_fg).into(),
-                offset: point(gpui::px(0.), gpui::px(lg(1.))),
-                blur_radius: gpui::px(lg(STRIP_SHADOW[0])),
-                spread_radius: gpui::px(0.),
-            }])
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .size_full()
-                    .rounded(gpui::px(radius))
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .id("reaction-panel-scroll")
-                            .absolute()
-                            .left_0()
-                            .top_0()
-                            .w(gpui::px(w))
-                            .h(gpui::px(final_h))
-                            .overflow_y_scroll()
-                            .track_scroll(&strip.panel_scroll)
-                            .child(content),
-                    )
-                    .children(fading),
-            )
-            .into_any_element()
     }
 }

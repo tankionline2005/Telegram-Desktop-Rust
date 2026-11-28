@@ -958,3 +958,108 @@ pub fn round_edge_image(outer: gpui::Rgba, h: u32) -> (Arc<RenderImage>, u32) {
     EDGES.lock().unwrap().insert(key, image.clone());
     (image, PAD)
 }
+
+/// `InlineList::PrepareTagBg` cut in two (`paintSingleBg`): a Saved Messages
+/// tag's shape `w` x `h` device pixels in `rgba` (`PaintTagShape`: filled and
+/// stroked `right_radius * 2` wide with round joins, so the corners are round;
+/// the arrow `arrow` deep at the right), its dot `dot` wide a hole at 0.6 of
+/// the color, `dot_skip` from the right. Returns its `left` columns and the
+/// rest (the middle is a plain fill). No transparent border: the halves meet.
+#[allow(clippy::too_many_arguments)]
+pub fn tag_shape_images(
+    rgba: u32,
+    (w, h): (u32, u32),
+    left: u32,
+    (left_radius, right_radius, arrow): (f32, f32, f32),
+    (dot, dot_skip): (f32, f32),
+) -> (Arc<RenderImage>, Arc<RenderImage>) {
+    use resvg::tiny_skia::{
+        BlendMode, FillRule, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform,
+    };
+    type Tags = HashMap<(u32, u32, u32, u32), (Arc<RenderImage>, Arc<RenderImage>)>;
+    static TAGS: LazyLock<Mutex<Tags>> = LazyLock::new(Default::default);
+    let key = (rgba, w, h, left);
+    if let Some(images) = TAGS.lock().unwrap().get(&key) {
+        return images.clone();
+    }
+    let (w, h) = (w.max(2), h.max(2));
+    let left = left.clamp(1, w - 1);
+    let mut pixmap = Pixmap::new(w, h).expect("tag pixmap");
+    let color = |alpha: f32| {
+        let mut paint = Paint {
+            anti_alias: true,
+            ..Paint::default()
+        };
+        paint.set_color_rgba8(
+            (rgba >> 24) as u8,
+            (rgba >> 16) as u8,
+            (rgba >> 8) as u8,
+            ((rgba & 0xff) as f32 * alpha).round() as u8,
+        );
+        paint
+    };
+    let rr = right_radius;
+    let radius = left_radius - rr;
+    let (x, y) = (rr, rr);
+    let (right, bottom) = (w as f32 - rr, h as f32 - rr);
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + radius, y);
+    pb.line_to(right - arrow, y);
+    pb.line_to(right, (y + bottom) / 2.);
+    pb.line_to(right - arrow, bottom);
+    pb.line_to(x + radius, bottom);
+    pb.quad_to(x, bottom, x, bottom - radius);
+    pb.line_to(x, y + radius);
+    pb.quad_to(x, y, x + radius, y);
+    pb.close();
+    if let Some(path) = pb.finish() {
+        let paint = color(1.);
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+        let stroke = Stroke {
+            width: rr * 2.,
+            line_join: LineJoin::Round,
+            ..Stroke::default()
+        };
+        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    }
+    // The dot: the color at 0.6 in place of the shape (`CompositionMode_Source`).
+    let cx = right - dot_skip - dot / 2.;
+    let cy = h as f32 / 2.;
+    if let Some(circle) = PathBuilder::from_circle(cx, cy, dot / 2.) {
+        let mut paint = color(0.6);
+        paint.blend_mode = BlendMode::Source;
+        pixmap.fill_path(
+            &circle,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+    let cut = |from: u32, to: u32| {
+        let mut out = image::RgbaImage::new(to - from, h);
+        for yy in 0..h {
+            for xx in from..to {
+                let p = pixmap.pixel(xx, yy).unwrap().demultiply();
+                // GPUI expects BGRA.
+                out.put_pixel(
+                    xx - from,
+                    yy,
+                    image::Rgba([p.blue(), p.green(), p.red(), p.alpha()]),
+                );
+            }
+        }
+        Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+            out
+        )]))
+    };
+    let images = (cut(0, left), cut(left, w));
+    TAGS.lock().unwrap().insert(key, images.clone());
+    images
+}

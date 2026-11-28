@@ -80,6 +80,8 @@ pub enum Command {
     LoadEmojiGroups,
     /// The server's reactions (`messages.getAvailableReactions`), once.
     LoadReactions,
+    /// Our Saved Messages tags again (they changed).
+    LoadSavedTags,
     /// Our reaction to a message is chosen or taken back
     /// (`HistoryItem::toggleReaction`).
     ToggleReaction {
@@ -190,7 +192,12 @@ pub enum Update {
     AvailableReactions {
         list: Vec<tdr_data::reactions::Available>,
         top: Vec<describe::ReactionKey>,
+        recent: Vec<describe::ReactionKey>,
+        /// The tags offered to everyone and ours.
+        tags: Vec<describe::ReactionKey>,
+        my_tags: Vec<tdr_data::reactions::SavedTag>,
     },
+    SavedTags(Vec<tdr_data::reactions::SavedTag>),
     /// The installed emoji sets (the user's order) and the featured ones.
     EmojiSets {
         installed: Vec<EmojiSet>,
@@ -319,6 +326,9 @@ pub struct DialogItem {
     pub mute_until: Option<i32>,
     /// What the chat's "⋮" menu needs to know.
     pub rights: ChatRights,
+    /// The reactions it allows (`PeerAllowedReactions`): everything in private
+    /// chats, a group's or channel's from its full info (none until it came).
+    pub reactions: Option<describe::AllowedReactions>,
 }
 
 /// Our place in a chat, for its menu (`Window::Filler`'s checks).
@@ -719,6 +729,8 @@ pub struct ReactionButton {
     pub chosen: bool,
     /// Their userpics instead of the count (`InlineListData::recent`).
     pub userpics: Option<Vec<Author>>,
+    /// A Saved Messages tag's name (set by the window from our tags).
+    pub title: Option<String>,
 }
 
 /// The order of the server's emoji reactions (`Reactions::list(Type::All)`),
@@ -789,6 +801,7 @@ fn reaction_buttons(
                 count: c.count,
                 chosen: mine,
                 userpics,
+                title: None,
             }
         })
         .collect();
@@ -1182,8 +1195,9 @@ fn dialog_item(store: &Storage, d: &DialogView, ctx: &Context) -> DialogItem {
         .filter(|m| m.out && !is_saved && !is_channel)
         .map(|m| m.id <= d.dialog.read_outbox_max_id);
     let muted = muted(d, kind, ctx);
-    // The full info of a supergroup or channel, when loaded (gifts, discussion).
-    let full = (peer.kind == PeerKind::Channel)
+    // The full info of a group or channel, when loaded (gifts, discussion,
+    // reactions).
+    let full = matches!(peer.kind, PeerKind::Channel | PeerKind::Chat)
         .then(|| store.peer_full(peer).ok().flatten())
         .flatten()
         .and_then(|raw| describe::full_info(&Some(raw)));
@@ -1259,6 +1273,11 @@ fn dialog_item(store: &Storage, d: &DialogView, ctx: &Context) -> DialogItem {
             discussion: full.as_ref().is_some_and(|f| f.linked_chat.is_some()),
             can_post: info.can_post,
             forum: info.forum,
+        },
+        reactions: if peer.kind == PeerKind::User {
+            Some(describe::AllowedReactions::all())
+        } else {
+            full.as_ref().map(|f| f.reactions.clone())
         },
     }
 }
@@ -1964,7 +1983,8 @@ async fn load_full(
     folders: &mut Folders,
     tx: &mpsc::UnboundedSender<Update>,
 ) -> anyhow::Result<()> {
-    // A basic group: its participants' online state only.
+    // A basic group: its participants' online state and its full info (the
+    // reactions it allows).
     if peer.kind == PeerKind::Chat {
         let members = sync
             .store()
@@ -1974,6 +1994,15 @@ async fn load_full(
             .and_then(|p| describe::peer_info(&p).members)
             .unwrap_or(0);
         send_online(sync, peer, members, tx).await;
+        match sync.load_full(peer).await {
+            Ok(Some(_)) => {
+                if let Some(item) = chat_info(sync.store(), peer) {
+                    let _ = tx.send(Update::ChatInfo(Box::new(item)));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => error!("full chat: {e}"),
+        }
         return Ok(());
     }
     match sync.load_full(peer).await {
@@ -2856,7 +2885,25 @@ async fn run(
                                         .await
                                         .map_err(|e| tracing::debug!("top reactions: {e}"))
                                         .unwrap_or_default();
-                                    let _ = tx.send(Update::AvailableReactions { list, top });
+                                    let recent = tdr_data::reactions::recent(&client)
+                                        .await
+                                        .map_err(|e| tracing::debug!("recent reactions: {e}"))
+                                        .unwrap_or_default();
+                                    let tags = tdr_data::reactions::default_tags(&client)
+                                        .await
+                                        .map_err(|e| tracing::debug!("default tags: {e}"))
+                                        .unwrap_or_default();
+                                    let my_tags = tdr_data::reactions::saved_tags(&client)
+                                        .await
+                                        .map_err(|e| tracing::debug!("saved tags: {e}"))
+                                        .unwrap_or_default();
+                                    let _ = tx.send(Update::AvailableReactions {
+                                        list,
+                                        top,
+                                        recent,
+                                        tags,
+                                        my_tags,
+                                    });
                                 }
                                 Err(e) => tracing::debug!("available reactions: {e}"),
                             }
@@ -3240,6 +3287,18 @@ async fn run(
                         };
                         let _ = tx.send(Update::BankCard { number, data });
                     }
+                    Command::LoadSavedTags => {
+                        let client = client.clone();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            match tdr_data::reactions::saved_tags(&client).await {
+                                Ok(tags) => {
+                                    let _ = tx.send(Update::SavedTags(tags));
+                                }
+                                Err(e) => tracing::debug!("saved tags: {e}"),
+                            }
+                        });
+                    }
                     Command::ToggleReaction { peer, msg_id, key } => {
                         match sync.toggle_reaction(peer, msg_id, &key).await {
                             Ok(_) => {
@@ -3585,8 +3644,29 @@ fn demo_formatted(date: i32) -> Vec<(bool, String, Vec<TextEntity>)> {
 /// (counts, a custom emoji) and the channel.
 fn demo_reactions(chat: i64, m: &MessageItem) -> Option<MessageReactions> {
     use describe::ReactionKey as K;
-    if m.service.is_some() || chat == 3 {
+    if m.service.is_some() {
         return None;
+    }
+    // Saved Messages: tags.
+    if chat == 3 {
+        let tag = |e: &str| ReactionButton {
+            key: K::Emoji(e.into()),
+            count: 1,
+            chosen: true,
+            userpics: None,
+            title: None,
+        };
+        return match m.id % 3 {
+            0 => Some(MessageReactions {
+                buttons: vec![tag("❤"), tag("👍")],
+                tags: true,
+            }),
+            1 => Some(MessageReactions {
+                buttons: vec![tag("🔥")],
+                tags: true,
+            }),
+            _ => None,
+        };
     }
     let private = chat == 1;
     let button = |key: K, count: i32, chosen: bool, pics: &[bool]| ReactionButton {
@@ -3594,6 +3674,7 @@ fn demo_reactions(chat: i64, m: &MessageItem) -> Option<MessageReactions> {
         count,
         chosen,
         userpics: private.then(|| pics.iter().map(|out| demo_author(*out)).collect()),
+        title: None,
     };
     match m.id % 4 {
         1 => Some(MessageReactions {
@@ -3647,10 +3728,34 @@ fn demo_toggle(
                 count: 1,
                 chosen: true,
                 userpics: private.then(|| vec![demo_author(true)]),
+                title: None,
             }),
         }
     }
     r.buttons.retain(|b| b.count > 0);
+    (!r.buttons.is_empty()).then_some(r)
+}
+
+/// A tag of the demo's Saved Messages put on or taken off.
+fn demo_toggle_tag(
+    reactions: Option<MessageReactions>,
+    key: &describe::ReactionKey,
+) -> Option<MessageReactions> {
+    let mut r = reactions.unwrap_or(MessageReactions {
+        buttons: Vec::new(),
+        tags: true,
+    });
+    if r.buttons.iter().any(|b| b.key == *key) {
+        r.buttons.retain(|b| b.key != *key);
+    } else {
+        r.buttons.push(ReactionButton {
+            key: key.clone(),
+            count: 1,
+            chosen: true,
+            userpics: None,
+            title: None,
+        });
+    }
     (!r.buttons.is_empty()).then_some(r)
 }
 
@@ -3841,6 +3946,20 @@ pub fn start_demo(
                     forum: *name == "Design Team",
                     ..ChatRights::default()
                 },
+                // The channel allows a few (`chatReactionsSome`).
+                reactions: Some(if *kind == ChatKind::Channel {
+                    describe::AllowedReactions {
+                        kind: describe::AllowedKind::Some(
+                            ["👍", "❤", "🔥", "🎉", "😁"]
+                                .iter()
+                                .map(|e| describe::ReactionKey::Emoji((*e).to_string()))
+                                .collect(),
+                        ),
+                        ..Default::default()
+                    }
+                } else {
+                    describe::AllowedReactions::all()
+                }),
                 status: match kind {
                     ChatKind::Group => "906 members".into(),
                     ChatKind::Channel => "8 subscribers".into(),
@@ -3880,6 +3999,7 @@ pub fn start_demo(
             compose: Compose::Field,
             mute_until: None,
             rights: ChatRights::default(),
+            reactions: Some(describe::AllowedReactions::all()),
         });
     }
     let _ = up_tx.send(Update::Dialogs {
@@ -3931,6 +4051,7 @@ pub fn start_demo(
             compose: Compose::Field,
             mute_until: Some(i32::MAX),
             rights: ChatRights::default(),
+            reactions: Some(describe::AllowedReactions::all()),
         }
     })
     .collect();
@@ -4502,9 +4623,26 @@ pub fn start_demo(
                     .iter()
                     .map(|e| describe::ReactionKey::Emoji((*e).to_string()))
                     .collect();
-                    let _ = up_tx.send(Update::AvailableReactions { list, top });
+                    // Saved Messages: the default tags and one of ours named.
+                    let tags: Vec<describe::ReactionKey> = ["❤", "👍", "🔥", "🎉", "⭐", "👀"]
+                        .iter()
+                        .map(|e| describe::ReactionKey::Emoji((*e).to_string()))
+                        .collect();
+                    let my_tags = vec![tdr_data::reactions::SavedTag {
+                        key: describe::ReactionKey::Emoji("❤".into()),
+                        title: Some("Important".into()),
+                        count: 3,
+                    }];
+                    let _ = up_tx.send(Update::AvailableReactions {
+                        list,
+                        top,
+                        recent: Vec::new(),
+                        tags,
+                        my_tags,
+                    });
                     continue;
                 }
+                Command::LoadSavedTags => {}
                 Command::ToggleReaction { peer, msg_id, key } => {
                     let current = demo_reacted
                         .get(&(peer.id, msg_id))
@@ -4515,8 +4653,12 @@ pub fn start_demo(
                                 .find(|m| m.id == msg_id)
                                 .and_then(|m| demo_reactions(peer.id, m))
                         });
-                    demo_reacted
-                        .insert((peer.id, msg_id), demo_toggle(current, &key, peer.id == 1));
+                    let toggled = if peer.id == 3 {
+                        demo_toggle_tag(current, &key)
+                    } else {
+                        demo_toggle(current, &key, peer.id == 1)
+                    };
+                    demo_reacted.insert((peer.id, msg_id), toggled);
                 }
                 Command::LoadEmojiGroups => {
                     let group = |title: &str, icon: usize, emoticons: &[&str]| {
